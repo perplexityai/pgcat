@@ -37,10 +37,11 @@ extern crate tokio_rustls;
 extern crate toml;
 extern crate trust_dns_resolver;
 
-#[cfg(not(target_env = "msvc"))]
+// Only use jemalloc on x86_64 - it has issues on ARM64 when cross-compiled with zig
+#[cfg(all(not(target_env = "msvc"), target_arch = "x86_64"))]
 use jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
