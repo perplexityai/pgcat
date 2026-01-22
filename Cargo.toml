@@ -28,7 +28,7 @@ sha2 = "0.10"
 base64 = "0.21"
 stringprep = "0.1"
 tokio-rustls = "0.24"
-rustls-pemfile = "1"
+rustls-pemfile = "2"
 http-body-util = "0.1.2"
 hyper = { version = "1.4.1", features = ["full"] }
 hyper-util = { version = "0.1.7", features = ["tokio"] }
