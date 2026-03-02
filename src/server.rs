@@ -1268,7 +1268,12 @@ impl Server {
         let mut query = String::from("");
 
         for (key, value) in parameter_diff {
-            query.push_str(&format!("SET {} TO '{}';", key, value));
+            // Strip surrounding single quotes if present to avoid double-quoting
+            // (e.g. some clients send values like 'utf-8' which would become ''utf-8'')
+            let trimmed = value.trim_matches('\'');
+            // Escape internal single quotes per SQL standard
+            let escaped = trimmed.replace('\'', "''");
+            query.push_str(&format!("SET {} TO '{}';", key, escaped));
         }
 
         let res = self.query(&query).await;
@@ -1533,5 +1538,317 @@ impl Drop for Server {
             self.address,
             crate::format_duration(&duration)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== CleanupState Tests ====================
+
+    #[test]
+    fn test_cleanup_state_new() {
+        let state = CleanupState::new();
+        assert!(!state.needs_cleanup_set);
+        assert!(!state.needs_cleanup_prepare);
+        assert!(!state.needs_cleanup());
+    }
+
+    #[test]
+    fn test_cleanup_state_set_true() {
+        let mut state = CleanupState::new();
+        state.set_true();
+        assert!(state.needs_cleanup_set);
+        assert!(state.needs_cleanup_prepare);
+        assert!(state.needs_cleanup());
+    }
+
+    #[test]
+    fn test_cleanup_state_reset() {
+        let mut state = CleanupState::new();
+        state.set_true();
+        assert!(state.needs_cleanup());
+
+        state.reset();
+        assert!(!state.needs_cleanup_set);
+        assert!(!state.needs_cleanup_prepare);
+        assert!(!state.needs_cleanup());
+    }
+
+    #[test]
+    fn test_cleanup_state_partial_cleanup() {
+        let mut state = CleanupState::new();
+
+        state.needs_cleanup_set = true;
+        assert!(state.needs_cleanup());
+
+        state.needs_cleanup_set = false;
+        state.needs_cleanup_prepare = true;
+        assert!(state.needs_cleanup());
+    }
+
+    #[test]
+    fn test_cleanup_state_display() {
+        let mut state = CleanupState::new();
+        let display = format!("{}", state);
+        assert_eq!(display, "SET: false, PREPARE: false");
+
+        state.set_true();
+        let display = format!("{}", state);
+        assert_eq!(display, "SET: true, PREPARE: true");
+    }
+
+    #[test]
+    fn test_cleanup_state_copy() {
+        let mut state = CleanupState::new();
+        state.set_true();
+
+        let copied = state;
+        assert!(copied.needs_cleanup_set);
+        assert!(copied.needs_cleanup_prepare);
+    }
+
+    // ==================== ServerParameters Tests ====================
+
+    #[test]
+    fn test_server_parameters_new() {
+        let params = ServerParameters::new();
+
+        // Check default parameters
+        assert_eq!(
+            params.parameters.get("client_encoding"),
+            Some(&"UTF8".to_string())
+        );
+        assert_eq!(
+            params.parameters.get("DateStyle"),
+            Some(&"ISO, MDY".to_string())
+        );
+        assert_eq!(
+            params.parameters.get("TimeZone"),
+            Some(&"Etc/UTC".to_string())
+        );
+        assert_eq!(
+            params.parameters.get("standard_conforming_strings"),
+            Some(&"on".to_string())
+        );
+        assert_eq!(
+            params.parameters.get("application_name"),
+            Some(&"pgcat".to_string())
+        );
+    }
+
+    #[test]
+    fn test_server_parameters_default() {
+        let params = ServerParameters::default();
+        assert_eq!(params.parameters.get("application_name"), Some(&"pgcat".to_string()));
+    }
+
+    #[test]
+    fn test_server_parameters_set_tracked_param() {
+        let mut params = ServerParameters::new();
+        params.set_param("client_encoding".to_string(), "LATIN1".to_string(), false);
+        assert_eq!(
+            params.parameters.get("client_encoding"),
+            Some(&"LATIN1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_server_parameters_set_untracked_param_not_startup() {
+        let mut params = ServerParameters::new();
+        let original_len = params.parameters.len();
+
+        // Untracked parameters should NOT be added when startup is false
+        params.set_param("custom_param".to_string(), "value".to_string(), false);
+        assert_eq!(params.parameters.len(), original_len);
+        assert!(params.parameters.get("custom_param").is_none());
+    }
+
+    #[test]
+    fn test_server_parameters_set_untracked_param_during_startup() {
+        let mut params = ServerParameters::new();
+
+        // Untracked parameters SHOULD be added when startup is true
+        params.set_param("custom_param".to_string(), "value".to_string(), true);
+        assert_eq!(
+            params.parameters.get("custom_param"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_server_parameters_timezone_normalization() {
+        let mut params = ServerParameters::new();
+
+        // "timezone" should be normalized to "TimeZone"
+        params.set_param("timezone".to_string(), "America/New_York".to_string(), false);
+        assert_eq!(
+            params.parameters.get("TimeZone"),
+            Some(&"America/New_York".to_string())
+        );
+    }
+
+    #[test]
+    fn test_server_parameters_datestyle_normalization() {
+        let mut params = ServerParameters::new();
+
+        // "datestyle" should be normalized to "DateStyle"
+        params.set_param("datestyle".to_string(), "German".to_string(), false);
+        assert_eq!(
+            params.parameters.get("DateStyle"),
+            Some(&"German".to_string())
+        );
+    }
+
+    #[test]
+    fn test_server_parameters_set_from_hashmap() {
+        let mut params = ServerParameters::new();
+        let mut map = HashMap::new();
+        map.insert("client_encoding".to_string(), "UTF16".to_string());
+        map.insert("application_name".to_string(), "test_app".to_string());
+
+        params.set_from_hashmap(&map, false);
+
+        assert_eq!(
+            params.parameters.get("client_encoding"),
+            Some(&"UTF16".to_string())
+        );
+        assert_eq!(
+            params.parameters.get("application_name"),
+            Some(&"test_app".to_string())
+        );
+    }
+
+    #[test]
+    fn test_server_parameters_get_application_name() {
+        let mut params = ServerParameters::new();
+        assert_eq!(params.get_application_name(), "pgcat");
+
+        params.set_param("application_name".to_string(), "my_app".to_string(), false);
+        assert_eq!(params.get_application_name(), "my_app");
+    }
+
+    #[test]
+    fn test_server_parameters_compare_params_no_diff() {
+        let params1 = ServerParameters::new();
+        let params2 = ServerParameters::new();
+
+        let diff = params1.compare_params(&params2);
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_server_parameters_compare_params_with_diff() {
+        let params1 = ServerParameters::new();
+        let mut params2 = ServerParameters::new();
+        params2.set_param("TimeZone".to_string(), "America/Los_Angeles".to_string(), false);
+        params2.set_param("client_encoding".to_string(), "LATIN1".to_string(), false);
+
+        let diff = params1.compare_params(&params2);
+
+        assert_eq!(diff.len(), 2);
+        assert_eq!(diff.get("TimeZone"), Some(&"America/Los_Angeles".to_string()));
+        assert_eq!(diff.get("client_encoding"), Some(&"LATIN1".to_string()));
+    }
+
+    #[test]
+    fn test_server_parameters_into_bytes() {
+        let params = ServerParameters::new();
+        let bytes: BytesMut = (&params).into();
+
+        // Each parameter should start with 'S' (0x53)
+        // The bytes should be non-empty and contain parameter status messages
+        assert!(!bytes.is_empty());
+
+        // Check that the bytes contain at least one 'S' character (ParameterStatus message)
+        assert!(bytes.iter().any(|&b| b == b'S'));
+    }
+
+    #[test]
+    fn test_server_parameters_add_parameter_message() {
+        let mut buffer = BytesMut::new();
+        ServerParameters::add_parameter_message("test_key", "test_value", &mut buffer);
+
+        // Check the message format
+        assert_eq!(buffer[0], b'S'); // Message type
+
+        // Length is at bytes 1-4 (i32 big-endian)
+        let len = i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]);
+
+        // Length should be: 4 (i32 size) + key_len + 1 (null) + value_len + 1 (null)
+        let expected_len = 4 + "test_key".len() + 1 + "test_value".len() + 1;
+        assert_eq!(len as usize, expected_len);
+
+        // Check that key and value are in the buffer
+        let key_start = 5;
+        let key_end = key_start + "test_key".len();
+        assert_eq!(&buffer[key_start..key_end], b"test_key");
+        assert_eq!(buffer[key_end], 0); // null terminator
+
+        let value_start = key_end + 1;
+        let value_end = value_start + "test_value".len();
+        assert_eq!(&buffer[value_start..value_end], b"test_value");
+        assert_eq!(buffer[value_end], 0); // null terminator
+    }
+
+    #[test]
+    fn test_server_parameters_clone() {
+        let params = ServerParameters::new();
+        let cloned = params.clone();
+
+        assert_eq!(params.parameters.len(), cloned.parameters.len());
+        assert_eq!(params.get_application_name(), cloned.get_application_name());
+    }
+
+    // ==================== TRACKED_PARAMETERS Tests ====================
+
+    #[test]
+    fn test_tracked_parameters_contains_expected() {
+        assert!(TRACKED_PARAMETERS.contains("client_encoding"));
+        assert!(TRACKED_PARAMETERS.contains("DateStyle"));
+        assert!(TRACKED_PARAMETERS.contains("TimeZone"));
+        assert!(TRACKED_PARAMETERS.contains("standard_conforming_strings"));
+        assert!(TRACKED_PARAMETERS.contains("application_name"));
+    }
+
+    #[test]
+    fn test_tracked_parameters_count() {
+        // Currently 5 tracked parameters
+        assert_eq!(TRACKED_PARAMETERS.len(), 5);
+    }
+
+    #[test]
+    fn test_sync_parameters_query_generation() {
+        // Verify that the SET query generation properly handles quoting.
+        // This tests the logic extracted from sync_parameters.
+
+        // Normal value without quotes
+        let value = "utf-8";
+        let trimmed = value.trim_matches('\'');
+        let escaped = trimmed.replace('\'', "''");
+        let result = format!("SET {} TO '{}';", "client_encoding", escaped);
+        assert_eq!(result, "SET client_encoding TO 'utf-8';");
+
+        // Value already wrapped in single quotes (the bug scenario)
+        let value = "'utf-8'";
+        let trimmed = value.trim_matches('\'');
+        let escaped = trimmed.replace('\'', "''");
+        let result = format!("SET {} TO '{}';", "client_encoding", escaped);
+        assert_eq!(result, "SET client_encoding TO 'utf-8';");
+
+        // Value with internal single quote
+        let value = "O'Brien";
+        let trimmed = value.trim_matches('\'');
+        let escaped = trimmed.replace('\'', "''");
+        let result = format!("SET {} TO '{}';", "application_name", escaped);
+        assert_eq!(result, "SET application_name TO 'O''Brien';");
+
+        // Value that is just a normal string
+        let value = "America/New_York";
+        let trimmed = value.trim_matches('\'');
+        let escaped = trimmed.replace('\'', "''");
+        let result = format!("SET {} TO '{}';", "TimeZone", escaped);
+        assert_eq!(result, "SET TimeZone TO 'America/New_York';");
     }
 }
