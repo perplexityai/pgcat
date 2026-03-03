@@ -32,7 +32,7 @@ rustls-pemfile = "1"
 http-body-util = "0.1.2"
 hyper = { version = "1.4.1", features = ["full"] }
 hyper-util = { version = "0.1.7", features = ["tokio"] }
-phf = { version = "0.11.1", features = ["macros"] }
+phf = { version = "0.13.1", features = ["macros"] }
 exitcode = "1.1.2"
 futures = "0.3"
 socket2 = { version = "0.4.7", features = ["all"] }
