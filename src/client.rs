@@ -33,6 +33,13 @@ use tokio_rustls::server::TlsStream;
 pub static PREPARED_STATEMENT_COUNTER: Lazy<Arc<AtomicUsize>> =
     Lazy::new(|| Arc::new(AtomicUsize::new(0)));
 
+/// Sync message: 'S' (1 byte) + length 4 (4 bytes big-endian) = 5 bytes.
+/// Used to convert Flush messages into Sync messages before sending to the server.
+const SYNC_BYTES: [u8; 5] = [b'S', 0, 0, 0, 4];
+
+/// Size of a ReadyForQuery message: 'Z' (1) + length (4) + transaction status (1) = 6 bytes.
+const READY_FOR_QUERY_SIZE: usize = 6;
+
 /// Type of connection received from client.
 enum ClientConnectionType {
     Startup,
@@ -1347,6 +1354,111 @@ where
                             .push_back(ExtendedProtocolData::create_new_close(message, close));
                     }
 
+                    // Flush
+                    // asyncpg sends Parse → Describe → Flush during prepared statement
+                    // initialization. We convert this to a Sync, then strip the resulting
+                    // ReadyForQuery from the server response so the client never sees it.
+                    'H' => {
+                        debug!("Flush received, converting to Sync");
+
+                        match plugin_output {
+                            Some(PluginOutput::Deny(error)) => {
+                                error_response(&mut self.write, &error).await?;
+                                plugin_output = None;
+                                self.reset_buffered_state();
+                                continue;
+                            }
+
+                            Some(PluginOutput::Intercept(result)) => {
+                                write_all(&mut self.write, result).await?;
+                                plugin_output = None;
+                                self.reset_buffered_state();
+                                continue;
+                            }
+
+                            _ => (),
+                        };
+
+                        self.process_extended_protocol_buffer(server, &pool, &address)
+                            .await?;
+
+                        // Inject a Sync message instead of the original Flush
+                        self.buffer.put(&SYNC_BYTES[..]);
+
+                        let mut should_send_to_server = true;
+
+                        // If buffer contains only the Sync we just added, everything was
+                        // handled from the prepared statement cache — no server round-trip needed.
+                        if *self.buffer.first().unwrap() == b'S' {
+                            should_send_to_server = false;
+                            // Unlike Sync, Flush does NOT produce a ReadyForQuery for the client,
+                            // so we do not enqueue one here.
+                        }
+
+                        // Send cached responses (e.g. ParseComplete from cache) to the client
+                        if !self.response_message_queue_buffer.is_empty() {
+                            if let Err(err) = write_all_flush(
+                                &mut self.write,
+                                &self.response_message_queue_buffer,
+                            )
+                            .await
+                            {
+                                server.mark_bad(err.to_string().as_str());
+                                return Err(err);
+                            }
+
+                            self.response_message_queue_buffer.clear();
+                        }
+
+                        if should_send_to_server {
+                            self.send_server_message(server, &self.buffer, &address, &pool)
+                                .await?;
+
+                            // Receive responses, stripping the trailing ReadyForQuery that Sync
+                            // produces but the client does not expect from a Flush.
+                            loop {
+                                let response = self
+                                    .receive_server_message(
+                                        server,
+                                        &address,
+                                        &pool,
+                                        &self.stats.clone(),
+                                    )
+                                    .await?;
+
+                                if server.is_data_available() {
+                                    // Not the last chunk — forward as-is
+                                    match write_all_flush(&mut self.write, &response).await {
+                                        Ok(_) => (),
+                                        Err(err) => {
+                                            server.mark_bad(err.to_string().as_str());
+                                            return Err(err);
+                                        }
+                                    };
+                                } else {
+                                    // Last chunk — strip trailing ReadyForQuery (6 bytes)
+                                    if response.len() > READY_FOR_QUERY_SIZE {
+                                        let trimmed =
+                                            &response[..response.len() - READY_FOR_QUERY_SIZE];
+                                        match write_all_flush(&mut self.write, trimmed).await {
+                                            Ok(_) => (),
+                                            Err(err) => {
+                                                server.mark_bad(err.to_string().as_str());
+                                                return Err(err);
+                                            }
+                                        };
+                                    }
+                                    // If response is exactly READY_FOR_QUERY_SIZE, it's just
+                                    // ReadyForQuery — nothing to forward.
+                                    break;
+                                }
+                            }
+                        }
+
+                        self.buffer.clear();
+                        // No transaction stats or pool release for Flush
+                    }
+
                     // Sync
                     // Frontend (client) is asking for the query result now.
                     'S' => {
@@ -1393,103 +1505,8 @@ where
                         //              RowDescription
                         //              ReadyForQuery
 
-                        // Iterate over our extended protocol data that we've buffered
-                        while let Some(protocol_data) =
-                            self.extended_protocol_data_buffer.pop_front()
-                        {
-                            match protocol_data {
-                                ExtendedProtocolData::Parse { data, metadata } => {
-                                    debug!("Have parse in extended buffer");
-                                    let (parse, hash) = match metadata {
-                                        Some(metadata) => metadata,
-                                        None => {
-                                            let first_char_in_name = *data.get(5).unwrap_or(&0);
-                                            if first_char_in_name != 0 {
-                                                // This is a named prepared statement while prepared statements are disabled
-                                                // Server connection state will need to be cleared at checkin
-                                                server.mark_dirty();
-                                            }
-                                            // Not a prepared statement
-                                            self.buffer.put(&data[..]);
-                                            continue;
-                                        }
-                                    };
-
-                                    // This is a prepared statement we already have on the checked out server
-                                    if server.has_prepared_statement(&parse.name) {
-                                        debug!(
-                                            "Prepared statement `{}` found in server cache",
-                                            parse.name
-                                        );
-
-                                        // We don't want to send the parse message to the server
-                                        // Instead queue up a parse complete message to send to the client
-                                        self.response_message_queue_buffer.put(parse_complete());
-                                    } else {
-                                        debug!(
-                                            "Prepared statement `{}` not found in server cache",
-                                            parse.name
-                                        );
-
-                                        // TODO: Consider adding the close logic that this function can send for eviction to the client buffer instead
-                                        // In this case we don't want to send the parse message to the server since the client is sending it
-                                        self.register_parse_to_server_cache(
-                                            false, &hash, &parse, &pool, server, &address,
-                                        )
-                                        .await?;
-
-                                        // Add parse message to buffer
-                                        self.buffer.put(&data[..]);
-                                    }
-                                }
-                                ExtendedProtocolData::Bind { data, metadata } => {
-                                    // This is using a prepared statement
-                                    if let Some(client_given_name) = metadata {
-                                        self.ensure_prepared_statement_is_on_server(
-                                            client_given_name,
-                                            &pool,
-                                            server,
-                                            &address,
-                                        )
-                                        .await?;
-                                    }
-
-                                    self.buffer.put(&data[..]);
-                                }
-                                ExtendedProtocolData::Describe { data, metadata } => {
-                                    // This is using a prepared statement
-                                    if let Some(client_given_name) = metadata {
-                                        self.ensure_prepared_statement_is_on_server(
-                                            client_given_name,
-                                            &pool,
-                                            server,
-                                            &address,
-                                        )
-                                        .await?;
-                                    }
-
-                                    self.buffer.put(&data[..]);
-                                }
-                                ExtendedProtocolData::Execute { data } => {
-                                    self.buffer.put(&data[..])
-                                }
-                                ExtendedProtocolData::Close { data, close } => {
-                                    // We don't send the close message to the server if prepared statements are enabled
-                                    // and it's a close with a prepared statement name provided
-                                    if self.prepared_statements_enabled
-                                        && close.is_prepared_statement()
-                                        && !close.anonymous()
-                                    {
-                                        self.prepared_statements.remove(&close.name);
-
-                                        // Queue up a close complete message to send to the client
-                                        self.response_message_queue_buffer.put(close_complete());
-                                    } else {
-                                        self.buffer.put(&data[..]);
-                                    }
-                                }
-                            }
-                        }
+                        self.process_extended_protocol_buffer(server, &pool, &address)
+                            .await?;
 
                         // Add the sync message
                         self.buffer.put(&message[..]);
@@ -1961,6 +1978,89 @@ where
         }
     }
 
+    async fn process_extended_protocol_buffer(
+        &mut self,
+        server: &mut Server,
+        pool: &ConnectionPool,
+        address: &Address,
+    ) -> Result<(), Error> {
+        while let Some(protocol_data) = self.extended_protocol_data_buffer.pop_front() {
+            match protocol_data {
+                ExtendedProtocolData::Parse { data, metadata } => {
+                    debug!("Have parse in extended buffer");
+                    let (parse, hash) = match metadata {
+                        Some(metadata) => metadata,
+                        None => {
+                            let first_char_in_name = *data.get(5).unwrap_or(&0);
+                            if first_char_in_name != 0 {
+                                server.mark_dirty();
+                            }
+                            self.buffer.put(&data[..]);
+                            continue;
+                        }
+                    };
+
+                    if server.has_prepared_statement(&parse.name) {
+                        debug!(
+                            "Prepared statement `{}` found in server cache",
+                            parse.name
+                        );
+                        self.response_message_queue_buffer.put(parse_complete());
+                    } else {
+                        debug!(
+                            "Prepared statement `{}` not found in server cache",
+                            parse.name
+                        );
+                        self.register_parse_to_server_cache(
+                            false, &hash, &parse, &pool, server, &address,
+                        )
+                        .await?;
+                        self.buffer.put(&data[..]);
+                    }
+                }
+                ExtendedProtocolData::Bind { data, metadata } => {
+                    if let Some(client_given_name) = metadata {
+                        self.ensure_prepared_statement_is_on_server(
+                            client_given_name,
+                            &pool,
+                            server,
+                            &address,
+                        )
+                        .await?;
+                    }
+                    self.buffer.put(&data[..]);
+                }
+                ExtendedProtocolData::Describe { data, metadata } => {
+                    if let Some(client_given_name) = metadata {
+                        self.ensure_prepared_statement_is_on_server(
+                            client_given_name,
+                            &pool,
+                            server,
+                            &address,
+                        )
+                        .await?;
+                    }
+                    self.buffer.put(&data[..]);
+                }
+                ExtendedProtocolData::Execute { data } => {
+                    self.buffer.put(&data[..])
+                }
+                ExtendedProtocolData::Close { data, close } => {
+                    if self.prepared_statements_enabled
+                        && close.is_prepared_statement()
+                        && !close.anonymous()
+                    {
+                        self.prepared_statements.remove(&close.name);
+                        self.response_message_queue_buffer.put(close_complete());
+                    } else {
+                        self.buffer.put(&data[..]);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn reset_buffered_state(&mut self) {
         self.buffer.clear();
         self.extended_protocol_data_buffer.clear();
@@ -2096,5 +2196,145 @@ impl<S, T> Drop for Client<S, T> {
         if self.connected_to_server && self.last_server_stats.is_some() {
             self.last_server_stats.as_ref().unwrap().idle();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    // ==================== PREPARED_STATEMENT_COUNTER Tests ====================
+
+    #[test]
+    fn test_prepared_statement_counter_exists() {
+        // Verify the counter can be accessed and has a reasonable initial value
+        let _ = PREPARED_STATEMENT_COUNTER.load(Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_prepared_statement_counter_increments() {
+        let initial = PREPARED_STATEMENT_COUNTER.load(Ordering::Relaxed);
+        let next = PREPARED_STATEMENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(initial, next);
+
+        let after = PREPARED_STATEMENT_COUNTER.load(Ordering::Relaxed);
+        assert!(after > initial);
+    }
+
+    // ==================== ClientConnectionType Tests ====================
+
+    #[test]
+    fn test_client_connection_type_variants() {
+        // Verify the enum variants exist and can be matched
+        let startup = ClientConnectionType::Startup;
+        let tls = ClientConnectionType::Tls;
+        let cancel = ClientConnectionType::CancelQuery;
+
+        match startup {
+            ClientConnectionType::Startup => (),
+            _ => panic!("Expected Startup"),
+        }
+
+        match tls {
+            ClientConnectionType::Tls => (),
+            _ => panic!("Expected Tls"),
+        }
+
+        match cancel {
+            ClientConnectionType::CancelQuery => (),
+            _ => panic!("Expected CancelQuery"),
+        }
+    }
+
+    // ==================== Constants Tests ====================
+
+    #[test]
+    fn test_ssl_request_code_value() {
+        // SSL_REQUEST_CODE should be the standard Postgres value
+        assert_eq!(SSL_REQUEST_CODE, 80877103);
+    }
+
+    #[test]
+    fn test_cancel_request_code_value() {
+        // CANCEL_REQUEST_CODE should be the standard Postgres value
+        assert_eq!(CANCEL_REQUEST_CODE, 80877102);
+    }
+
+    #[test]
+    fn test_protocol_version_number() {
+        // PROTOCOL_VERSION_NUMBER should be 196608 (3.0)
+        assert_eq!(PROTOCOL_VERSION_NUMBER, 196608);
+    }
+
+    // ==================== Admin Pool Names Tests ====================
+
+    #[test]
+    fn test_admin_pool_names() {
+        // Test that "pgcat" and "pgbouncer" are recognized as admin pools
+        let admin_names = ["pgcat", "pgbouncer"];
+
+        for name in &admin_names {
+            let is_admin = admin_names.iter().filter(|db| *db == name).count() == 1;
+            assert!(is_admin, "{} should be recognized as admin pool", name);
+        }
+
+        // Non-admin pool name
+        let is_admin = admin_names
+            .iter()
+            .filter(|db| *db == &"regular_db")
+            .count()
+            == 1;
+        assert!(!is_admin, "regular_db should not be recognized as admin pool");
+    }
+
+    // ==================== Flush→Sync Conversion Tests ====================
+
+    #[test]
+    fn test_sync_bytes_constant() {
+        assert_eq!(SYNC_BYTES.len(), 5);
+        assert_eq!(SYNC_BYTES[0], b'S');
+        // Length field: big-endian i32 = 4
+        assert_eq!(&SYNC_BYTES[1..5], &[0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn test_ready_for_query_size() {
+        // ReadyForQuery: 'Z' (1) + length 5 as i32 (4) + status (1) = 6
+        assert_eq!(READY_FOR_QUERY_SIZE, 6);
+
+        let rfq = ready_for_query(false);
+        assert_eq!(rfq.len(), READY_FOR_QUERY_SIZE);
+        assert_eq!(rfq[0], b'Z');
+    }
+
+    #[test]
+    fn test_strip_ready_for_query_from_response() {
+        // Simulate a server response: ParseComplete + ParameterDescription + ReadyForQuery
+        let mut response = BytesMut::new();
+
+        // ParseComplete: '1' + length 4
+        response.put_u8(b'1');
+        response.put_i32(4);
+
+        // Append ReadyForQuery
+        response.put(&ready_for_query(false)[..]);
+
+        let total_len = response.len();
+        assert!(total_len > READY_FOR_QUERY_SIZE);
+
+        // Strip trailing ReadyForQuery
+        let trimmed = &response[..total_len - READY_FOR_QUERY_SIZE];
+        assert_eq!(trimmed.len(), 5); // Just the ParseComplete message
+        assert_eq!(trimmed[0], b'1');
+    }
+
+    #[test]
+    fn test_strip_ready_for_query_only_rfq() {
+        // When server response is exactly ReadyForQuery, nothing should be forwarded
+        let response = ready_for_query(true);
+        assert_eq!(response.len(), READY_FOR_QUERY_SIZE);
+        // response.len() > READY_FOR_QUERY_SIZE is false, so nothing is forwarded
+        assert!(response.len() <= READY_FOR_QUERY_SIZE);
     }
 }

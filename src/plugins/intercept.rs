@@ -18,17 +18,17 @@ use crate::{
 };
 
 // TODO: use these structs for deserialization
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Rule {
-    query: String,
-    schema: Vec<Column>,
-    result: Vec<Vec<String>>,
+    pub query: String,
+    pub schema: Vec<Column>,
+    pub result: Vec<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Column {
-    name: String,
-    data_type: String,
+    pub name: String,
+    pub data_type: String,
 }
 
 /// The intercept plugin.
@@ -116,5 +116,150 @@ impl<'a> Plugin for Intercept<'a> {
         } else {
             Ok(PluginOutput::Allow)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== Rule Tests ====================
+
+    #[test]
+    fn test_rule_struct() {
+        let rule = Rule {
+            query: "SELECT 1".to_string(),
+            schema: vec![Column {
+                name: "column1".to_string(),
+                data_type: "text".to_string(),
+            }],
+            result: vec![vec!["value1".to_string()]],
+        };
+
+        assert_eq!(rule.query, "SELECT 1");
+        assert_eq!(rule.schema.len(), 1);
+        assert_eq!(rule.result.len(), 1);
+    }
+
+    #[test]
+    fn test_rule_clone() {
+        let rule = Rule {
+            query: "SELECT 1".to_string(),
+            schema: vec![],
+            result: vec![],
+        };
+        let cloned = rule.clone();
+        assert_eq!(rule, cloned);
+    }
+
+    // ==================== Column Tests ====================
+
+    #[test]
+    fn test_column_struct() {
+        let column = Column {
+            name: "id".to_string(),
+            data_type: "int4".to_string(),
+        };
+
+        assert_eq!(column.name, "id");
+        assert_eq!(column.data_type, "int4");
+    }
+
+    #[test]
+    fn test_column_clone() {
+        let column = Column {
+            name: "name".to_string(),
+            data_type: "text".to_string(),
+        };
+        let cloned = column.clone();
+        assert_eq!(column, cloned);
+    }
+
+    #[test]
+    fn test_column_equality() {
+        let col1 = Column {
+            name: "test".to_string(),
+            data_type: "text".to_string(),
+        };
+        let col2 = Column {
+            name: "test".to_string(),
+            data_type: "text".to_string(),
+        };
+        let col3 = Column {
+            name: "other".to_string(),
+            data_type: "text".to_string(),
+        };
+
+        assert_eq!(col1, col2);
+        assert_ne!(col1, col3);
+    }
+
+    // ==================== Intercept Tests ====================
+
+    #[test]
+    fn test_intercept_struct_disabled() {
+        let config = InterceptConfig::default();
+        let intercept = Intercept {
+            enabled: false,
+            config: &config,
+        };
+
+        assert!(!intercept.enabled);
+    }
+
+    #[test]
+    fn test_intercept_struct_enabled() {
+        let config = InterceptConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let intercept = Intercept {
+            enabled: true,
+            config: &config,
+        };
+
+        assert!(intercept.enabled);
+    }
+
+    // ==================== Serialization Tests ====================
+
+    #[test]
+    fn test_column_serialization() {
+        let column = Column {
+            name: "id".to_string(),
+            data_type: "int4".to_string(),
+        };
+
+        let serialized = serde_json::to_string(&column).unwrap();
+        assert!(serialized.contains("id"));
+        assert!(serialized.contains("int4"));
+
+        let deserialized: Column = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, column);
+    }
+
+    #[test]
+    fn test_rule_serialization() {
+        let rule = Rule {
+            query: "SELECT * FROM users".to_string(),
+            schema: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: "int4".to_string(),
+                },
+                Column {
+                    name: "name".to_string(),
+                    data_type: "text".to_string(),
+                },
+            ],
+            result: vec![
+                vec!["1".to_string(), "Alice".to_string()],
+                vec!["2".to_string(), "Bob".to_string()],
+            ],
+        };
+
+        let serialized = serde_json::to_string(&rule).unwrap();
+        let deserialized: Rule = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, rule);
     }
 }
