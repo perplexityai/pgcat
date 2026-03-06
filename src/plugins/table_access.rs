@@ -32,7 +32,7 @@ impl<'a> Plugin for TableAccess<'a> {
 
         let mut found = None;
 
-        visit_relations(ast, |relation| {
+        let _ = visit_relations(ast, |relation| {
             let relation = relation.to_string();
             let parts = relation.split('.').collect::<Vec<&str>>();
             let table_name = parts.last().unwrap();
@@ -55,5 +55,58 @@ impl<'a> Plugin for TableAccess<'a> {
         } else {
             Ok(PluginOutput::Allow)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_table_access_struct_creation() {
+        let tables = vec!["secret_table".to_string()];
+        let ta = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        assert!(ta.enabled);
+        assert_eq!(ta.tables.len(), 1);
+    }
+
+    #[test]
+    fn test_table_access_disabled() {
+        let tables = vec!["secret_table".to_string()];
+        let ta = TableAccess {
+            enabled: false,
+            tables: &tables,
+        };
+        assert!(!ta.enabled);
+    }
+
+    #[test]
+    fn test_table_access_with_multiple_tables() {
+        let tables = vec![
+            "users".to_string(),
+            "passwords".to_string(),
+            "secrets".to_string(),
+        ];
+        let ta = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        assert_eq!(ta.tables.len(), 3);
+        assert!(ta.tables.contains(&"users".to_string()));
+        assert!(ta.tables.contains(&"passwords".to_string()));
+        assert!(ta.tables.contains(&"secrets".to_string()));
+    }
+
+    #[test]
+    fn test_table_access_empty_tables() {
+        let tables: Vec<String> = vec![];
+        let ta = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        assert!(ta.tables.is_empty());
     }
 }
