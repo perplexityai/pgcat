@@ -482,3 +482,106 @@ class TestExtendedProtocol:
                 await conn.close()
 
         asyncio.run(run())
+
+
+# ==================== asyncpg-Specific Protocol Paths ====================
+
+
+class TestAsyncpgProtocolPaths:
+    def test_executemany(self):
+        """executemany uses bind_execute_many after the initial prepare/Flush."""
+        async def run():
+            conn = await connect()
+            try:
+                async with conn.transaction():
+                    await conn.execute("DROP TABLE IF EXISTS test_em")
+                    await conn.execute("CREATE TEMPORARY TABLE test_em (id int, val text) ON COMMIT DROP")
+                    await conn.executemany(
+                        "INSERT INTO test_em VALUES ($1, $2)",
+                        [(i, f"val_{i}") for i in range(100)],
+                    )
+                    count = await conn.fetchval("SELECT count(*) FROM test_em")
+                    assert count == 100
+                    row = await conn.fetchrow("SELECT * FROM test_em WHERE id = 50")
+                    assert row["val"] == "val_50"
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
+
+    def test_execute_with_params(self):
+        """conn.execute() with parameters triggers an implicit prepare/Flush,
+        unlike conn.execute() without parameters which uses simple query protocol."""
+        async def run():
+            conn = await connect()
+            try:
+                async with conn.transaction():
+                    await conn.execute("DROP TABLE IF EXISTS test_exec_params")
+                    await conn.execute("CREATE TEMPORARY TABLE test_exec_params (id int, val text) ON COMMIT DROP")
+                    # This goes through _get_statement -> prepare -> Flush
+                    status = await conn.execute(
+                        "INSERT INTO test_exec_params VALUES ($1, $2)", 1, "hello"
+                    )
+                    assert status == "INSERT 0 1"
+                    status = await conn.execute(
+                        "INSERT INTO test_exec_params VALUES ($1, $2)", 2, "world"
+                    )
+                    assert status == "INSERT 0 1"
+                    count = await conn.fetchval("SELECT count(*) FROM test_exec_params")
+                    assert count == 2
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
+
+    def test_multiple_prepares_interleaved_execution(self):
+        """Prepare multiple statements (each triggers Flush), then interleave
+        execution (each triggers Bind/Execute/Sync) to verify pgcat tracks
+        the prepared statement state correctly across Flush boundaries."""
+        async def run():
+            conn = await connect()
+            try:
+                stmt_a = await conn.prepare("SELECT $1::int + 100")
+                stmt_b = await conn.prepare("SELECT $1::text || ' world'")
+                stmt_c = await conn.prepare("SELECT $1::int * $2::int")
+
+                # Interleave: A, B, C, A, C, B, A, B, C
+                assert await stmt_a.fetchval(1) == 101
+                assert await stmt_b.fetchval("hello") == "hello world"
+                assert await stmt_c.fetchval(6, 7) == 42
+                assert await stmt_a.fetchval(2) == 102
+                assert await stmt_c.fetchval(3, 3) == 9
+                assert await stmt_b.fetchval("foo") == "foo world"
+                assert await stmt_a.fetchval(0) == 100
+                assert await stmt_b.fetchval("bar") == "bar world"
+                assert await stmt_c.fetchval(10, 10) == 100
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
+
+    def test_reprepare_after_cache_clear(self):
+        """When asyncpg's client-side statement cache is cleared, the next
+        query triggers a fresh prepare (another Flush cycle on the same
+        connection). Verify pgcat handles this re-prepare correctly."""
+        async def run():
+            conn = await connect()
+            try:
+                # First query: triggers prepare via Flush, caches in asyncpg
+                result1 = await conn.fetchval("SELECT $1::int + 1", 10)
+                assert result1 == 11
+
+                # Clear asyncpg's client-side cache, forcing re-prepare
+                conn._drop_local_statement_cache()
+
+                # Same query again: must re-prepare via Flush since cache was cleared
+                result2 = await conn.fetchval("SELECT $1::int + 1", 20)
+                assert result2 == 21
+
+                # Different query after cache clear
+                result3 = await conn.fetchval("SELECT $1::text || '!'", "hello")
+                assert result3 == "hello!"
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
