@@ -36,3 +36,42 @@ impl<'a> Plugin for QueryLogger<'a> {
         Ok(PluginOutput::Allow)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_logger_struct_creation() {
+        let ql = QueryLogger {
+            enabled: true,
+            user: "test_user",
+            db: "test_db",
+        };
+        assert!(ql.enabled);
+        assert_eq!(ql.user, "test_user");
+        assert_eq!(ql.db, "test_db");
+    }
+
+    #[test]
+    fn test_query_logger_disabled() {
+        let ql = QueryLogger {
+            enabled: false,
+            user: "user",
+            db: "db",
+        };
+        assert!(!ql.enabled);
+    }
+
+    #[test]
+    fn test_query_logger_user_and_db_strings() {
+        let ql = QueryLogger {
+            enabled: true,
+            user: "admin",
+            db: "production",
+        };
+        // Verify the strings are stored correctly
+        assert_eq!(ql.user, "admin");
+        assert_eq!(ql.db, "production");
+    }
+}

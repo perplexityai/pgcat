@@ -12,7 +12,7 @@ class PgcatProcess
   def self.finalize(pid, log_filename, config_filename)
     if pid
       Process.kill("TERM", pid)
-      Process.wait(pid)
+      Process.wait(pid) rescue Errno::ECHILD
     end
 
     File.delete(config_filename) if File.exist?(config_filename)
@@ -108,7 +108,7 @@ class PgcatProcess
     return unless @pid
 
     Process.kill("TERM", @pid)
-    Process.wait(@pid)
+    Process.wait(@pid) rescue Errno::ECHILD
     @pid = nil
   end
 

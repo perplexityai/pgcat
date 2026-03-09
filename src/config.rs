@@ -1693,4 +1693,502 @@ mod test {
         parse("pgcat.toml").await.unwrap();
         print!("{}", toml::to_string(&get_config()).unwrap());
     }
+
+    // ==================== Role Tests ====================
+
+    #[test]
+    fn test_role_display() {
+        assert_eq!(format!("{}", Role::Primary), "primary");
+        assert_eq!(format!("{}", Role::Replica), "replica");
+        assert_eq!(format!("{}", Role::Mirror), "mirror");
+    }
+
+    #[test]
+    fn test_role_partial_eq_with_option() {
+        // Role == Some(Role)
+        assert!(Role::Primary == Some(Role::Primary));
+        assert!(Role::Replica == Some(Role::Replica));
+        assert!(Role::Primary != Some(Role::Replica));
+
+        // Role == None should be true (any role matches)
+        assert!(Role::Primary == None);
+        assert!(Role::Replica == None);
+    }
+
+    #[test]
+    fn test_role_option_partial_eq_with_role() {
+        // Some(Role) == Role
+        assert!(Some(Role::Primary) == Role::Primary);
+        assert!(Some(Role::Replica) == Role::Replica);
+
+        // None == Role should be true (any role matches)
+        let none_role: Option<Role> = None;
+        assert!(none_role == Role::Primary);
+        assert!(none_role == Role::Replica);
+    }
+
+    // ==================== Address Tests ====================
+
+    #[test]
+    fn test_address_default() {
+        let addr = Address::default();
+        assert_eq!(addr.host, "127.0.0.1");
+        assert_eq!(addr.port, 5432);
+        assert_eq!(addr.shard, 0);
+        assert_eq!(addr.role, Role::Replica);
+    }
+
+    #[test]
+    fn test_address_display() {
+        let addr = Address {
+            host: "localhost".to_string(),
+            port: 5433,
+            database: "mydb".to_string(),
+            username: "myuser".to_string(),
+            ..Default::default()
+        };
+        let display = format!("{}", addr);
+        assert!(display.contains("localhost:5433"));
+        assert!(display.contains("mydb"));
+        assert!(display.contains("myuser"));
+    }
+
+    #[test]
+    fn test_address_name_primary() {
+        let addr = Address {
+            pool_name: "mypool".to_string(),
+            shard: 0,
+            role: Role::Primary,
+            ..Default::default()
+        };
+        assert_eq!(addr.name(), "mypool_shard_0_primary");
+    }
+
+    #[test]
+    fn test_address_name_replica() {
+        let addr = Address {
+            pool_name: "mypool".to_string(),
+            shard: 1,
+            role: Role::Replica,
+            replica_number: 2,
+            ..Default::default()
+        };
+        assert_eq!(addr.name(), "mypool_shard_1_replica_2");
+    }
+
+    #[test]
+    fn test_address_name_mirror() {
+        let addr = Address {
+            pool_name: "mypool".to_string(),
+            shard: 0,
+            role: Role::Mirror,
+            replica_number: 0,
+            ..Default::default()
+        };
+        assert_eq!(addr.name(), "mypool_shard_0_mirror_0");
+    }
+
+    #[test]
+    fn test_address_error_count() {
+        let addr = Address::default();
+        assert_eq!(addr.error_count(), 0);
+
+        addr.increment_error_count();
+        assert_eq!(addr.error_count(), 1);
+
+        addr.increment_error_count();
+        addr.increment_error_count();
+        assert_eq!(addr.error_count(), 3);
+
+        addr.reset_error_count();
+        assert_eq!(addr.error_count(), 0);
+    }
+
+    // ==================== User Tests ====================
+
+    #[test]
+    fn test_user_default() {
+        let user = User::default();
+        assert_eq!(user.username, "postgres");
+        assert!(user.password.is_none());
+        assert_eq!(user.auth_type, AuthType::MD5);
+        assert_eq!(user.pool_size, 15);
+    }
+
+    #[test]
+    fn test_user_validate_valid() {
+        let user = User {
+            pool_size: 10,
+            min_pool_size: Some(5),
+            ..Default::default()
+        };
+        assert!(user.validate().is_ok());
+    }
+
+    #[test]
+    fn test_user_validate_min_greater_than_max() {
+        let user = User {
+            pool_size: 5,
+            min_pool_size: Some(10),
+            ..Default::default()
+        };
+        assert!(user.validate().is_err());
+    }
+
+    // ==================== General Tests ====================
+
+    #[test]
+    fn test_general_default() {
+        let general = General::default();
+        assert_eq!(general.host, "0.0.0.0");
+        assert_eq!(general.port, 5432);
+        assert_eq!(general.ban_time, 60);
+        assert_eq!(general.healthcheck_timeout, 1000);
+        assert_eq!(general.healthcheck_delay, 30000);
+        assert_eq!(general.shutdown_timeout, 60000);
+        assert_eq!(general.worker_threads, 4);
+        assert!(general.validate_config);
+    }
+
+    #[test]
+    fn test_general_default_methods() {
+        assert_eq!(General::default_host(), "0.0.0.0");
+        assert_eq!(General::default_port(), 5432);
+        assert_eq!(General::default_connect_timeout(), 1000);
+        assert_eq!(General::default_idle_timeout(), 600000);
+        assert_eq!(General::default_ban_time(), 60);
+        assert_eq!(General::default_healthcheck_timeout(), 1000);
+        assert_eq!(General::default_healthcheck_delay(), 30000);
+        assert_eq!(General::default_shutdown_timeout(), 60000);
+        assert_eq!(General::default_worker_threads(), 4);
+        assert_eq!(General::default_server_lifetime(), 3600000);
+        assert!(General::default_validate_config());
+        assert!(General::default_server_round_robin());
+    }
+
+    // ==================== PoolMode Tests ====================
+
+    #[test]
+    fn test_pool_mode_display() {
+        assert_eq!(format!("{}", PoolMode::Transaction), "transaction");
+        assert_eq!(format!("{}", PoolMode::Session), "session");
+    }
+
+    #[test]
+    fn test_pool_mode_equality() {
+        assert_eq!(PoolMode::Transaction, PoolMode::Transaction);
+        assert_ne!(PoolMode::Transaction, PoolMode::Session);
+    }
+
+    // ==================== LoadBalancingMode Tests ====================
+
+    #[test]
+    fn test_load_balancing_mode_display() {
+        assert_eq!(format!("{}", LoadBalancingMode::Random), "random");
+        assert_eq!(
+            format!("{}", LoadBalancingMode::LeastOutstandingConnections),
+            "least_outstanding_connections"
+        );
+    }
+
+    // ==================== DefaultShard Tests ====================
+
+    #[test]
+    fn test_default_shard_default() {
+        let ds = DefaultShard::default();
+        assert_eq!(ds, DefaultShard::Shard(0));
+    }
+
+    #[test]
+    fn test_default_shard_variants() {
+        let shard = DefaultShard::Shard(5);
+        let random = DefaultShard::Random;
+        let random_healthy = DefaultShard::RandomHealthy;
+
+        match shard {
+            DefaultShard::Shard(n) => assert_eq!(n, 5),
+            _ => panic!("Expected Shard variant"),
+        }
+
+        assert_eq!(random, DefaultShard::Random);
+        assert_eq!(random_healthy, DefaultShard::RandomHealthy);
+    }
+
+    // ==================== Shard Tests ====================
+
+    #[test]
+    fn test_shard_default() {
+        let shard = Shard::default();
+        assert_eq!(shard.database, "postgres");
+        assert_eq!(shard.servers.len(), 1);
+        assert_eq!(shard.servers[0].host, "localhost");
+        assert_eq!(shard.servers[0].port, 5432);
+        assert_eq!(shard.servers[0].role, Role::Primary);
+    }
+
+    #[test]
+    fn test_shard_validate_valid() {
+        let shard = Shard::default();
+        assert!(shard.validate().is_ok());
+    }
+
+    #[test]
+    fn test_shard_validate_empty_servers() {
+        let shard = Shard {
+            database: "test".to_string(),
+            mirrors: None,
+            servers: vec![],
+        };
+        assert!(shard.validate().is_err());
+    }
+
+    #[test]
+    fn test_shard_validate_multiple_primaries() {
+        let shard = Shard {
+            database: "test".to_string(),
+            mirrors: None,
+            servers: vec![
+                ServerConfig {
+                    host: "host1".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                },
+                ServerConfig {
+                    host: "host2".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                },
+            ],
+        };
+        assert!(shard.validate().is_err());
+    }
+
+    #[test]
+    fn test_shard_validate_duplicate_servers() {
+        let shard = Shard {
+            database: "test".to_string(),
+            mirrors: None,
+            servers: vec![
+                ServerConfig {
+                    host: "host1".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                },
+                ServerConfig {
+                    host: "host1".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                },
+            ],
+        };
+        assert!(shard.validate().is_err());
+    }
+
+    // ==================== Pool Tests ====================
+
+    #[test]
+    fn test_pool_default() {
+        let pool = Pool::default();
+        assert_eq!(pool.pool_mode, PoolMode::Transaction);
+        assert_eq!(pool.load_balancing_mode, LoadBalancingMode::Random);
+        assert_eq!(pool.default_role, "any");
+        assert!(!pool.query_parser_enabled);
+    }
+
+    #[test]
+    fn test_pool_default_methods() {
+        assert_eq!(Pool::default_pool_mode(), PoolMode::Transaction);
+        assert_eq!(Pool::default_load_balancing_mode(), LoadBalancingMode::Random);
+        assert_eq!(Pool::default_default_role(), "any");
+        assert!(Pool::default_automatic_sharding_key().is_none());
+        assert!(Pool::default_cleanup_server_connections());
+        assert_eq!(Pool::default_prepared_statements_cache_size(), 0);
+        assert!(!Pool::default_db_activity_based_routing());
+    }
+
+    #[test]
+    fn test_pool_is_auth_query_configured() {
+        let mut pool = Pool::default();
+
+        // Not configured initially
+        assert!(!pool.is_auth_query_configured());
+
+        // Partially configured
+        pool.auth_query = Some("SELECT".to_string());
+        assert!(!pool.is_auth_query_configured());
+
+        // Fully configured
+        pool.auth_query_user = Some("user".to_string());
+        pool.auth_query_password = Some("password".to_string());
+        assert!(pool.is_auth_query_configured());
+    }
+
+    #[test]
+    fn test_pool_hash_value() {
+        let pool1 = Pool::default();
+        let pool2 = Pool::default();
+        let mut pool3 = Pool::default();
+        pool3.pool_mode = PoolMode::Session;
+
+        // Same config should have same hash
+        assert_eq!(pool1.hash_value(), pool2.hash_value());
+
+        // Different config should have different hash
+        assert_ne!(pool1.hash_value(), pool3.hash_value());
+    }
+
+    // ==================== Plugin Tests ====================
+
+    #[test]
+    fn test_intercept_is_enabled() {
+        let mut intercept = Intercept::default();
+        assert!(!intercept.is_enabled());
+
+        intercept.enabled = true;
+        assert!(intercept.is_enabled());
+    }
+
+    #[test]
+    fn test_table_access_is_enabled() {
+        let mut table_access = TableAccess::default();
+        assert!(!table_access.is_enabled());
+
+        table_access.enabled = true;
+        assert!(table_access.is_enabled());
+    }
+
+    #[test]
+    fn test_query_logger_is_enabled() {
+        let mut query_logger = QueryLogger::default();
+        assert!(!query_logger.is_enabled());
+
+        query_logger.enabled = true;
+        assert!(query_logger.is_enabled());
+    }
+
+    #[test]
+    fn test_prewarmer_is_enabled() {
+        let mut prewarmer = Prewarmer::default();
+        assert!(!prewarmer.is_enabled());
+
+        prewarmer.enabled = true;
+        assert!(prewarmer.is_enabled());
+    }
+
+    #[test]
+    fn test_plugins_display() {
+        let plugins = Plugins::default();
+        let display = format!("{}", plugins);
+        assert!(display.contains("interceptor: false"));
+        assert!(display.contains("table_access: false"));
+        assert!(display.contains("query_logger: false"));
+        assert!(display.contains("prewarmer: false"));
+    }
+
+    // ==================== Query Tests ====================
+
+    #[test]
+    fn test_query_substitute() {
+        let mut query = Query {
+            query: "SELECT * FROM users".to_string(),
+            schema: vec![],
+            result: vec![
+                vec!["${USER}".to_string(), "${DATABASE}".to_string()],
+                vec!["prefix_${USER}_suffix".to_string()],
+            ],
+        };
+
+        query.substitute("mydb", "myuser");
+
+        assert_eq!(query.result[0][0], "myuser");
+        assert_eq!(query.result[0][1], "mydb");
+        assert_eq!(query.result[1][0], "prefix_myuser_suffix");
+    }
+
+    // ==================== Config Tests ====================
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.path, "pgcat.toml");
+        assert!(config.pools.is_empty());
+        assert!(config.plugins.is_none());
+    }
+
+    #[test]
+    fn test_config_default_path() {
+        assert_eq!(Config::default_path(), "pgcat.toml");
+    }
+
+    #[test]
+    fn test_config_is_auth_query_configured() {
+        let mut config = Config::default();
+        assert!(!config.is_auth_query_configured());
+
+        // Add a pool with auth query configured
+        let mut pool = Pool::default();
+        pool.auth_query = Some("SELECT".to_string());
+        pool.auth_query_user = Some("user".to_string());
+        pool.auth_query_password = Some("password".to_string());
+
+        config.pools.insert("test".to_string(), pool);
+        assert!(config.is_auth_query_configured());
+    }
+
+    #[test]
+    fn test_config_fill_up_auth_query_config() {
+        let mut config = Config::default();
+        config.general.auth_query = Some("SELECT hash FROM users WHERE name = $1".to_string());
+        config.general.auth_query_user = Some("admin".to_string());
+        config.general.auth_query_password = Some("secret".to_string());
+
+        let mut pool = Pool::default();
+        pool.auth_query = None;
+        pool.auth_query_user = None;
+        pool.auth_query_password = None;
+        config.pools.insert("test".to_string(), pool);
+
+        config.fill_up_auth_query_config();
+
+        let pool = config.pools.get("test").unwrap();
+        assert_eq!(
+            pool.auth_query,
+            Some("SELECT hash FROM users WHERE name = $1".to_string())
+        );
+        assert_eq!(pool.auth_query_user, Some("admin".to_string()));
+        assert_eq!(pool.auth_query_password, Some("secret".to_string()));
+    }
+
+    // ==================== AuthType Tests ====================
+
+    #[test]
+    fn test_auth_type_equality() {
+        assert_eq!(AuthType::Trust, AuthType::Trust);
+        assert_eq!(AuthType::MD5, AuthType::MD5);
+        assert_ne!(AuthType::Trust, AuthType::MD5);
+    }
+
+    // ==================== ServerConfig Tests ====================
+
+    #[test]
+    fn test_server_config_equality() {
+        let sc1 = ServerConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            role: Role::Primary,
+        };
+        let sc2 = ServerConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            role: Role::Primary,
+        };
+        let sc3 = ServerConfig {
+            host: "localhost".to_string(),
+            port: 5433,
+            role: Role::Primary,
+        };
+
+        assert_eq!(sc1, sc2);
+        assert_ne!(sc1, sc3);
+    }
 }

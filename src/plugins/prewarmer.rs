@@ -26,3 +26,7 @@ impl<'a> Prewarmer<'a> {
         Ok(())
     }
 }
+
+// Note: Prewarmer tests require a Server instance which needs network connectivity.
+// The plugin struct itself doesn't have any testable logic without the async run method.
+// Integration tests for prewarmer should be done with a real PostgreSQL connection.

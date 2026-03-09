@@ -1251,3 +1251,400 @@ pub fn get_pool(db: &str, user: &str) -> Option<ConnectionPool> {
 pub fn get_all_pools() -> HashMap<PoolIdentifier, ConnectionPool> {
     (*(*POOLS.load())).clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Address;
+    use crate::messages::Parse;
+    use bytes::{BufMut, BytesMut};
+    use std::convert::TryFrom;
+
+    /// Helper function to create a Parse message from raw components
+    fn create_parse(name: &str, query: &str) -> Parse {
+        let mut buf = BytesMut::new();
+
+        // Build the Parse message format:
+        // code (1 byte) + len (4 bytes) + name (null-terminated) + query (null-terminated) + num_params (2 bytes)
+        let name_bytes = format!("{}\0", name);
+        let query_bytes = format!("{}\0", query);
+        let len = 4 + name_bytes.len() + query_bytes.len() + 2;
+
+        buf.put_u8(b'P'); // Parse message code
+        buf.put_i32(len as i32);
+        buf.put_slice(name_bytes.as_bytes());
+        buf.put_slice(query_bytes.as_bytes());
+        buf.put_i16(0); // num_params = 0
+
+        Parse::try_from(&buf).expect("Failed to create Parse")
+    }
+
+    // ==================== PreparedStatementCache Tests ====================
+
+    #[test]
+    fn test_prepared_statement_cache_new_with_zero_size() {
+        // Size 0 should be converted to 1 internally
+        let cache = PreparedStatementCache::new(0);
+        assert!(cache.cache.cap().get() >= 1);
+    }
+
+    #[test]
+    fn test_prepared_statement_cache_new_with_valid_size() {
+        let cache = PreparedStatementCache::new(10);
+        assert_eq!(cache.cache.cap().get(), 10);
+    }
+
+    #[test]
+    fn test_prepared_statement_cache_get_or_insert_new() {
+        let mut cache = PreparedStatementCache::new(5);
+        let parse = create_parse("test_stmt", "SELECT 1");
+        let hash = 12345u64;
+
+        let result = cache.get_or_insert(&parse, hash);
+
+        // The returned parse should have a rewritten name (PGCAT_ prefixed)
+        assert!(result.name.starts_with("PGCAT_"));
+    }
+
+    #[test]
+    fn test_prepared_statement_cache_get_or_insert_existing() {
+        let mut cache = PreparedStatementCache::new(5);
+        let parse = create_parse("test_stmt", "SELECT 1");
+        let hash = 12345u64;
+
+        // Insert first time
+        let first_result = cache.get_or_insert(&parse, hash);
+        let first_name = first_result.name.clone();
+
+        // Insert second time with same hash
+        let second_result = cache.get_or_insert(&parse, hash);
+
+        // Should return the same cached parse
+        assert_eq!(first_name, second_result.name);
+    }
+
+    #[test]
+    fn test_prepared_statement_cache_eviction() {
+        let mut cache = PreparedStatementCache::new(2);
+
+        let parse1 = create_parse("stmt1", "SELECT 1");
+        let parse2 = create_parse("stmt2", "SELECT 2");
+        let parse3 = create_parse("stmt3", "SELECT 3");
+
+        // Insert 3 items into cache with size 2
+        cache.get_or_insert(&parse1, 1);
+        cache.get_or_insert(&parse2, 2);
+        cache.get_or_insert(&parse3, 3);
+
+        // Cache should still have size 2
+        assert_eq!(cache.cache.len(), 2);
+    }
+
+    #[test]
+    fn test_prepared_statement_cache_promote() {
+        let mut cache = PreparedStatementCache::new(3);
+
+        let parse1 = create_parse("stmt1", "SELECT 1");
+        let parse2 = create_parse("stmt2", "SELECT 2");
+
+        cache.get_or_insert(&parse1, 1);
+        cache.get_or_insert(&parse2, 2);
+
+        // Promote hash 1 to make it most recently used
+        cache.promote(&1);
+
+        // After promotion, hash 1 should be considered more recently used
+        // This is mainly testing that promote doesn't panic
+        assert_eq!(cache.cache.len(), 2);
+    }
+
+    // ==================== PoolIdentifier Tests ====================
+
+    #[test]
+    fn test_pool_identifier_new() {
+        let identifier = PoolIdentifier::new("test_db", "test_user");
+        assert_eq!(identifier.db, "test_db");
+        assert_eq!(identifier.user, "test_user");
+    }
+
+    #[test]
+    fn test_pool_identifier_default() {
+        let identifier = PoolIdentifier::default();
+        assert_eq!(identifier.db, "");
+        assert_eq!(identifier.user, "");
+    }
+
+    #[test]
+    fn test_pool_identifier_display() {
+        let identifier = PoolIdentifier::new("mydb", "myuser");
+        assert_eq!(format!("{}", identifier), "myuser@mydb");
+    }
+
+    #[test]
+    fn test_pool_identifier_equality() {
+        let id1 = PoolIdentifier::new("db", "user");
+        let id2 = PoolIdentifier::new("db", "user");
+        let id3 = PoolIdentifier::new("db", "other_user");
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_pool_identifier_hash() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        let id1 = PoolIdentifier::new("db", "user");
+        let id2 = PoolIdentifier::new("db", "user");
+        let id3 = PoolIdentifier::new("db", "other_user");
+
+        set.insert(id1.clone());
+        assert!(set.contains(&id2));
+        assert!(!set.contains(&id3));
+    }
+
+    #[test]
+    fn test_pool_identifier_from_address() {
+        let address = Address {
+            database: "my_database".to_string(),
+            username: "my_user".to_string(),
+            ..Default::default()
+        };
+
+        let identifier = PoolIdentifier::from(&address);
+        assert_eq!(identifier.db, "my_database");
+        assert_eq!(identifier.user, "my_user");
+    }
+
+    // ==================== PoolSettings Tests ====================
+
+    #[test]
+    fn test_pool_settings_default() {
+        let settings = PoolSettings::default();
+
+        assert_eq!(settings.pool_mode, PoolMode::Transaction);
+        assert_eq!(settings.load_balancing_mode, LoadBalancingMode::Random);
+        assert_eq!(settings.shards, 1);
+        assert!(settings.query_parser_enabled == false);
+        assert!(settings.primary_reads_enabled == true);
+        assert!(settings.db_activity_based_routing == false);
+        assert_eq!(settings.default_shard, DefaultShard::Shard(0));
+        assert_eq!(settings.regex_search_limit, 1000);
+        assert!(settings.plugins.is_none());
+        assert!(settings.automatic_sharding_key.is_none());
+        assert!(settings.default_role.is_none());
+        assert!(settings.checkout_failure_limit.is_none());
+    }
+
+    // ==================== BanReason Tests ====================
+
+    #[test]
+    fn test_ban_reason_equality() {
+        assert_eq!(BanReason::FailedHealthCheck, BanReason::FailedHealthCheck);
+        assert_eq!(BanReason::MessageSendFailed, BanReason::MessageSendFailed);
+        assert_eq!(BanReason::MessageReceiveFailed, BanReason::MessageReceiveFailed);
+        assert_eq!(BanReason::FailedCheckout, BanReason::FailedCheckout);
+        assert_eq!(BanReason::StatementTimeout, BanReason::StatementTimeout);
+        assert_eq!(BanReason::AdminBan(60), BanReason::AdminBan(60));
+
+        assert_ne!(BanReason::FailedHealthCheck, BanReason::FailedCheckout);
+        assert_ne!(BanReason::AdminBan(60), BanReason::AdminBan(120));
+    }
+
+    #[test]
+    fn test_ban_reason_clone() {
+        let reason = BanReason::AdminBan(300);
+        let cloned = reason.clone();
+        assert_eq!(reason, cloned);
+    }
+
+    #[test]
+    fn test_ban_reason_debug() {
+        let reason = BanReason::FailedHealthCheck;
+        let debug_str = format!("{:?}", reason);
+        assert_eq!(debug_str, "FailedHealthCheck");
+
+        let admin_ban = BanReason::AdminBan(60);
+        let admin_debug = format!("{:?}", admin_ban);
+        assert!(admin_debug.contains("AdminBan"));
+        assert!(admin_debug.contains("60"));
+    }
+
+    // ==================== ConnectionPool Tests ====================
+
+    #[test]
+    fn test_connection_pool_default() {
+        let pool = ConnectionPool::default();
+
+        assert_eq!(pool.shards(), 0);
+        assert!(!pool.validated());
+        assert!(!pool.paused());
+    }
+
+    #[test]
+    fn test_connection_pool_pause_resume() {
+        let pool = ConnectionPool::default();
+
+        assert!(!pool.paused());
+
+        pool.pause();
+        assert!(pool.paused());
+
+        pool.resume();
+        assert!(!pool.paused());
+    }
+
+    #[test]
+    fn test_connection_pool_validated_initial_state() {
+        let pool = ConnectionPool::default();
+        assert!(!pool.validated());
+    }
+
+    #[test]
+    fn test_connection_pool_settings_access() {
+        let pool = ConnectionPool::default();
+        let settings = &pool.settings;
+
+        // Default settings should be applied
+        assert_eq!(settings.pool_mode, PoolMode::Transaction);
+    }
+
+    // ==================== ServerPool Tests ====================
+
+    #[test]
+    fn test_server_pool_new() {
+        let address = Address::default();
+        let user = User::default();
+        let client_server_map: ClientServerMap = Arc::new(Mutex::new(HashMap::new()));
+        let auth_hash = Arc::new(RwLock::new(None));
+
+        let pool = ServerPool::new(
+            address.clone(),
+            user.clone(),
+            "test_db",
+            client_server_map,
+            auth_hash,
+            None,
+            true,
+            false,
+            100,
+        );
+
+        assert_eq!(pool.database, "test_db");
+        assert!(pool.cleanup_connections);
+        assert!(!pool.log_client_parameter_status_changes);
+        assert_eq!(pool.prepared_statement_cache_size, 100);
+    }
+
+    // ==================== Address Error Count Tests ====================
+
+    #[test]
+    fn test_address_error_count_operations() {
+        let address = Address::default();
+
+        assert_eq!(address.error_count(), 0);
+
+        address.increment_error_count();
+        assert_eq!(address.error_count(), 1);
+
+        address.increment_error_count();
+        address.increment_error_count();
+        assert_eq!(address.error_count(), 3);
+
+        address.reset_error_count();
+        assert_eq!(address.error_count(), 0);
+    }
+
+    // ==================== get_pool and get_all_pools Tests ====================
+
+    #[test]
+    fn test_get_pool_nonexistent() {
+        // Getting a pool that doesn't exist should return None
+        let result = get_pool("nonexistent_db", "nonexistent_user");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_all_pools_returns_hashmap() {
+        let pools = get_all_pools();
+        // Should return a HashMap (may be empty in test environment)
+        // Just verify the function doesn't panic and returns a valid HashMap
+        let _ = pools.len();
+    }
+
+    // ==================== Integration-style Tests ====================
+
+    #[test]
+    fn test_pool_identifier_used_as_hashmap_key() {
+        let mut map: HashMap<PoolIdentifier, i32> = HashMap::new();
+
+        let id1 = PoolIdentifier::new("db1", "user1");
+        let id2 = PoolIdentifier::new("db2", "user2");
+
+        map.insert(id1.clone(), 100);
+        map.insert(id2.clone(), 200);
+
+        assert_eq!(map.get(&id1), Some(&100));
+        assert_eq!(map.get(&id2), Some(&200));
+        assert_eq!(map.get(&PoolIdentifier::new("db1", "user1")), Some(&100));
+    }
+
+    #[test]
+    fn test_prepared_statement_cache_different_hashes_same_query() {
+        let mut cache = PreparedStatementCache::new(10);
+
+        let parse = create_parse("same_name", "SELECT 1");
+
+        // Same parse but different hashes should create different entries
+        let result1 = cache.get_or_insert(&parse, 111);
+        let result2 = cache.get_or_insert(&parse, 222);
+
+        // Both should be in cache but with their own entries
+        assert_eq!(cache.cache.len(), 2);
+
+        // The names should be rewritten (PGCAT_ prefixed) and different
+        // due to the internal counter
+        assert!(result1.name.starts_with("PGCAT_"));
+        assert!(result2.name.starts_with("PGCAT_"));
+    }
+
+    #[test]
+    fn test_ban_list_type() {
+        // Verify BanList type can be constructed and used
+        let banlist: BanList = Arc::new(RwLock::new(vec![HashMap::new()]));
+
+        {
+            let mut guard = banlist.write();
+            let address = Address::default();
+            let now = chrono::offset::Utc::now().naive_utc();
+            guard[0].insert(address, (BanReason::FailedHealthCheck, now));
+        }
+
+        {
+            let guard = banlist.read();
+            assert_eq!(guard[0].len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_client_server_map_type() {
+        // Verify ClientServerMap type can be constructed and used
+        let map: ClientServerMap = Arc::new(Mutex::new(HashMap::new()));
+
+        {
+            let mut guard = map.lock();
+            guard.insert((1, 100), (2, 200, "localhost".to_string(), 5432));
+        }
+
+        {
+            let guard = map.lock();
+            assert!(guard.contains_key(&(1, 100)));
+            let value = guard.get(&(1, 100)).unwrap();
+            assert_eq!(value.0, 2);
+            assert_eq!(value.1, 200);
+            assert_eq!(value.2, "localhost");
+            assert_eq!(value.3, 5432);
+        }
+    }
+}
