@@ -188,6 +188,22 @@ static METRIC_HELP_AND_TYPES_LOOKUP: phf::Map<&'static str, MetricHelpType> = ph
         help: "Current number of connections for this database",
         ty: "gauge",
     },
+    "databases_connections_closed_idle_timeout" => MetricHelpType {
+        help: "Total connections closed by idle timeout reaper",
+        ty: "counter",
+    },
+    "databases_connections_closed_max_lifetime" => MetricHelpType {
+        help: "Total connections closed by max lifetime (server_lifetime) reaper",
+        ty: "counter",
+    },
+    "databases_connections_closed_broken" => MetricHelpType {
+        help: "Total connections closed due to broken state",
+        ty: "counter",
+    },
+    "databases_connections_created" => MetricHelpType {
+        help: "Total connections created",
+        ty: "counter",
+    },
 };
 
 struct PrometheusMetric<Value: fmt::Display> {
@@ -239,6 +255,23 @@ impl<Value: fmt::Display> PrometheusMetric<Value> {
         name: &str,
         value: u32,
     ) -> Option<PrometheusMetric<u32>> {
+        let mut labels = HashMap::new();
+        labels.insert("host", address.host.clone());
+        labels.insert("shard", address.shard.to_string());
+        labels.insert("role", address.role.to_string());
+        labels.insert("pool", address.pool_name.clone());
+        labels.insert("index", address.address_index.to_string());
+        labels.insert("database", address.database.to_string());
+        labels.insert("username", address.username.clone());
+
+        Self::from_name(&format!("databases_{}", name), value, labels)
+    }
+
+    fn from_database_info_u64(
+        address: &Address,
+        name: &str,
+        value: u64,
+    ) -> Option<PrometheusMetric<u64>> {
         let mut labels = HashMap::new();
         labels.insert("host", address.host.clone());
         labels.insert("shard", address.shard.to_string());
@@ -384,7 +417,8 @@ fn push_pool_stats(lines: &mut Vec<String>) {
 
 // Adds relevant metrics shown in a SHOW DATABASES admin command.
 fn push_database_stats(lines: &mut Vec<String>) {
-    let mut grouped_metrics: HashMap<String, Vec<PrometheusMetric<u32>>> = HashMap::new();
+    let mut grouped_metrics_u32: HashMap<String, Vec<PrometheusMetric<u32>>> = HashMap::new();
+    let mut grouped_metrics_u64: HashMap<String, Vec<PrometheusMetric<u64>>> = HashMap::new();
     for (_, pool) in get_all_pools() {
         let pool_config = pool.settings.clone();
         for shard in 0..pool.shards() {
@@ -399,7 +433,25 @@ fn push_database_stats(lines: &mut Vec<String>) {
                     if let Some(prometheus_metric) =
                         PrometheusMetric::<u32>::from_database_info(address, key, value)
                     {
-                        grouped_metrics
+                        grouped_metrics_u32
+                            .entry(key.to_string())
+                            .or_default()
+                            .push(prometheus_metric);
+                    } else {
+                        debug!("Metric {} not implemented for {}", key, address.name());
+                    }
+                }
+                let counter_metrics = vec![
+                    ("connections_closed_idle_timeout", pool_state.statistics.connections_closed_idle_timeout),
+                    ("connections_closed_max_lifetime", pool_state.statistics.connections_closed_max_lifetime),
+                    ("connections_closed_broken", pool_state.statistics.connections_closed_broken),
+                    ("connections_created", pool_state.statistics.connections_created),
+                ];
+                for (key, value) in counter_metrics {
+                    if let Some(prometheus_metric) =
+                        PrometheusMetric::<u64>::from_database_info_u64(address, key, value)
+                    {
+                        grouped_metrics_u64
                             .entry(key.to_string())
                             .or_default()
                             .push(prometheus_metric);
@@ -410,7 +462,15 @@ fn push_database_stats(lines: &mut Vec<String>) {
             }
         }
     }
-    for (_key, metrics) in grouped_metrics {
+    for (_key, metrics) in grouped_metrics_u32 {
+        if !metrics.is_empty() {
+            lines.push(metrics[0].get_header());
+            for metric in metrics {
+                lines.push(metric.to_string());
+            }
+        }
+    }
+    for (_key, metrics) in grouped_metrics_u64 {
         if !metrics.is_empty() {
             lines.push(metrics[0].get_header());
             for metric in metrics {
