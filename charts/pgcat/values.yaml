@@ -1,3 +1,6 @@
+## Security PoC marker: a fork-origin PR touching this file triggers
+## .github/workflows/generate-chart-readme.yaml via pull_request_target.
+##
 ## String to partially override aspnet-core.fullname template (will maintain the release name)
 ## @param nameOverride String to partially override common.names.fullname
 ##
