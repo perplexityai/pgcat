@@ -1,7 +1,7 @@
 name: '[CI/CD] Update README metadata'
 
 on:
-  pull_request_target:
+  pull_request:
     branches:
       - main
     paths:
@@ -10,6 +10,7 @@ on:
 permissions: {}
 jobs:
   update-readme-metadata:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,12 +18,12 @@ jobs:
       - name: Install readme-generator-for-helm
         run: npm install -g @bitnami/readme-generator-for-helm
       - name: Checkout
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           path: charts
-          ref: ${{github.event.pull_request.head.ref}}
-          repository: ${{github.event.pull_request.head.repo.full_name}}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ github.repository }}
+          persist-credentials: false
       - name: Execute readme-generator-for-helm
         env:
           DIFF_URL: "${{github.event.pull_request.diff_url}}"
@@ -38,11 +39,15 @@ jobs:
             readme-generator --values "charts/${chart}/values.yaml" --readme "charts/${chart}/README.md" --schema "/tmp/schema.json"
           done
       - name: Push changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           # Push all the changes
           cd charts
           if git status -s | grep pgcat; then
             git config user.name "$GITHUB_ACTOR"
             git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
-            git add . && git commit -am "Update README.md with readme-generator-for-helm" --signoff && git push
+            git add . && git commit -am "Update README.md with readme-generator-for-helm" --signoff
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${PR_HEAD_REF}"
           fi
