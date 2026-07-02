@@ -175,6 +175,15 @@ configuration:
     # Max connection lifetime before it's closed, even if actively used.
     server_lifetime: 86400000  # 24 hours
 
+    # Queue strategy for reusing idle server connections.
+    # false = LIFO (push_front on checkin): a small hot working set absorbs traffic
+    #   while the cold tail ages out and is reaped by idle_timeout.
+    # true  = FIFO / round-robin (push_back on checkin): every connection is rotated
+    #   uniformly, so under sustained traffic no connection ever reaches idle_timeout
+    #   and idle reaping never fires (pool stays pinned at pool_size).
+    # Set to false so idle_timeout-based reaping works under sustained load.
+    server_round_robin: false
+
     # Whether to use TLS for server connections or not.
     server_tls: false
 
