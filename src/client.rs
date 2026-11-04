@@ -2001,10 +2001,7 @@ where
                     };
 
                     if server.has_prepared_statement(&parse.name) {
-                        debug!(
-                            "Prepared statement `{}` found in server cache",
-                            parse.name
-                        );
+                        debug!("Prepared statement `{}` found in server cache", parse.name);
                         self.response_message_queue_buffer.put(parse_complete());
                     } else {
                         debug!(
@@ -2042,9 +2039,7 @@ where
                     }
                     self.buffer.put(&data[..]);
                 }
-                ExtendedProtocolData::Execute { data } => {
-                    self.buffer.put(&data[..])
-                }
+                ExtendedProtocolData::Execute { data } => self.buffer.put(&data[..]),
                 ExtendedProtocolData::Close { data, close } => {
                     if self.prepared_statements_enabled
                         && close.is_prepared_statement()
@@ -2280,12 +2275,11 @@ mod tests {
         }
 
         // Non-admin pool name
-        let is_admin = admin_names
-            .iter()
-            .filter(|db| *db == &"regular_db")
-            .count()
-            == 1;
-        assert!(!is_admin, "regular_db should not be recognized as admin pool");
+        let is_admin = admin_names.iter().filter(|db| *db == &"regular_db").count() == 1;
+        assert!(
+            !is_admin,
+            "regular_db should not be recognized as admin pool"
+        );
     }
 
     // ==================== Flush→Sync Conversion Tests ====================

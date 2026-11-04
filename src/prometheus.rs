@@ -442,10 +442,22 @@ fn push_database_stats(lines: &mut Vec<String>) {
                     }
                 }
                 let counter_metrics = vec![
-                    ("connections_closed_idle_timeout", pool_state.statistics.connections_closed_idle_timeout),
-                    ("connections_closed_max_lifetime", pool_state.statistics.connections_closed_max_lifetime),
-                    ("connections_closed_broken", pool_state.statistics.connections_closed_broken),
-                    ("connections_created", pool_state.statistics.connections_created),
+                    (
+                        "connections_closed_idle_timeout",
+                        pool_state.statistics.connections_closed_idle_timeout,
+                    ),
+                    (
+                        "connections_closed_max_lifetime",
+                        pool_state.statistics.connections_closed_max_lifetime,
+                    ),
+                    (
+                        "connections_closed_broken",
+                        pool_state.statistics.connections_closed_broken,
+                    ),
+                    (
+                        "connections_created",
+                        pool_state.statistics.connections_created,
+                    ),
                 ];
                 for (key, value) in counter_metrics {
                     if let Some(prometheus_metric) =

@@ -16,7 +16,10 @@ async fn test_prepared_statements() {
         let pool = pool.clone();
         let handle = tokio::task::spawn(async move {
             for i in 0..1000 {
-                match sqlx::query(&format!("SELECT {:?}", i % 5)).fetch_all(&pool).await {
+                match sqlx::query(&format!("SELECT {:?}", i % 5))
+                    .fetch_all(&pool)
+                    .await
+                {
                     Ok(_) => (),
                     Err(err) => {
                         panic!("prepared statement error: {}", err);
