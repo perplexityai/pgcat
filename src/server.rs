@@ -1641,7 +1641,10 @@ mod tests {
     #[test]
     fn test_server_parameters_default() {
         let params = ServerParameters::default();
-        assert_eq!(params.parameters.get("application_name"), Some(&"pgcat".to_string()));
+        assert_eq!(
+            params.parameters.get("application_name"),
+            Some(&"pgcat".to_string())
+        );
     }
 
     #[test]
@@ -1682,7 +1685,11 @@ mod tests {
         let mut params = ServerParameters::new();
 
         // "timezone" should be normalized to "TimeZone"
-        params.set_param("timezone".to_string(), "America/New_York".to_string(), false);
+        params.set_param(
+            "timezone".to_string(),
+            "America/New_York".to_string(),
+            false,
+        );
         assert_eq!(
             params.parameters.get("TimeZone"),
             Some(&"America/New_York".to_string())
@@ -1742,13 +1749,20 @@ mod tests {
     fn test_server_parameters_compare_params_with_diff() {
         let params1 = ServerParameters::new();
         let mut params2 = ServerParameters::new();
-        params2.set_param("TimeZone".to_string(), "America/Los_Angeles".to_string(), false);
+        params2.set_param(
+            "TimeZone".to_string(),
+            "America/Los_Angeles".to_string(),
+            false,
+        );
         params2.set_param("client_encoding".to_string(), "LATIN1".to_string(), false);
 
         let diff = params1.compare_params(&params2);
 
         assert_eq!(diff.len(), 2);
-        assert_eq!(diff.get("TimeZone"), Some(&"America/Los_Angeles".to_string()));
+        assert_eq!(
+            diff.get("TimeZone"),
+            Some(&"America/Los_Angeles".to_string())
+        );
         assert_eq!(diff.get("client_encoding"), Some(&"LATIN1".to_string()));
     }
 

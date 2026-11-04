@@ -1443,7 +1443,10 @@ mod tests {
     fn test_ban_reason_equality() {
         assert_eq!(BanReason::FailedHealthCheck, BanReason::FailedHealthCheck);
         assert_eq!(BanReason::MessageSendFailed, BanReason::MessageSendFailed);
-        assert_eq!(BanReason::MessageReceiveFailed, BanReason::MessageReceiveFailed);
+        assert_eq!(
+            BanReason::MessageReceiveFailed,
+            BanReason::MessageReceiveFailed
+        );
         assert_eq!(BanReason::FailedCheckout, BanReason::FailedCheckout);
         assert_eq!(BanReason::StatementTimeout, BanReason::StatementTimeout);
         assert_eq!(BanReason::AdminBan(60), BanReason::AdminBan(60));

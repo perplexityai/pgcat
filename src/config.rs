@@ -1998,7 +1998,10 @@ mod test {
     #[test]
     fn test_pool_default_methods() {
         assert_eq!(Pool::default_pool_mode(), PoolMode::Transaction);
-        assert_eq!(Pool::default_load_balancing_mode(), LoadBalancingMode::Random);
+        assert_eq!(
+            Pool::default_load_balancing_mode(),
+            LoadBalancingMode::Random
+        );
         assert_eq!(Pool::default_default_role(), "any");
         assert!(Pool::default_automatic_sharding_key().is_none());
         assert!(Pool::default_cleanup_server_connections());
