@@ -235,9 +235,16 @@ pub async fn client_entrypoint(
                         }
                     }
 
+                    Ok((ClientConnectionType::CancelQuery, bytes)) => {
+                        let (read, write) = split(stream);
+                        let mut client =
+                            Client::cancel(read, write, addr, bytes, client_server_map, shutdown)
+                                .await?;
+                        client.handle().await
+                    }
+
                     // Client probably disconnected rejecting our plain text connection.
-                    Ok((ClientConnectionType::Tls, _))
-                    | Ok((ClientConnectionType::CancelQuery, _)) => Err(Error::ProtocolSyncError(
+                    Ok((ClientConnectionType::Tls, _)) => Err(Error::ProtocolSyncError(
                         "Bad postgres client (plain)".into(),
                     )),
 
@@ -413,8 +420,13 @@ pub async fn startup_tls(
             .await
         }
 
+        Ok((ClientConnectionType::CancelQuery, bytes)) => {
+            let (read, write) = split(stream);
+            Client::cancel(read, write, addr, bytes, client_server_map, shutdown).await
+        }
+
         // Bad Postgres client.
-        Ok((ClientConnectionType::Tls, _)) | Ok((ClientConnectionType::CancelQuery, _)) => {
+        Ok((ClientConnectionType::Tls, _)) => {
             Err(Error::ProtocolSyncError("Bad postgres client (tls)".into()))
         }
 
