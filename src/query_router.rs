@@ -73,11 +73,13 @@ enum ParameterFormat {
 static TABLE_FREE_UNPARSED_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)^\s*RESET\s+[a-z_][a-z0-9_.]*\s*;?\s*$").unwrap());
 
-/// The first word of a query, after the whitespace and comments before it.
+/// The first word of a query, after the whitespace, comments and empty
+/// statements before it.
 fn first_word(query: &str) -> &str {
     let mut rest = query;
     loop {
-        rest = rest.trim_start();
+        // Postgres drops empty statements, so the first word can follow `;`.
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
         if let Some(comment) = rest.strip_prefix("--") {
             rest = comment.find(['\n', '\r']).map_or("", |end| &comment[end..]);
         } else if rest.starts_with("/*") {
@@ -3656,6 +3658,11 @@ mod test {
             "VACUUM FREEZE VERBOSE",
             "  -- comment\n\tVACUUM VERBOSE ANALYZE",
             "/* a /* nested */ comment */ VACUUM(FULL)",
+            ";VACUUM (FULL)",
+            "; ;VACUUM (FULL)",
+            ";;VACUUM (FULL)",
+            "/* c */;VACUUM (FULL)",
+            "; -- c\nVACUUM (FULL)",
         ];
         qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
         for query in vacuums {
