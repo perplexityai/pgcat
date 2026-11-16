@@ -765,10 +765,11 @@ impl QueryRouter {
 
         match q {
             Insert(i) => {
-                // Not supported in postgres.
-                assert!(i.or.is_none());
-                assert!(i.partitioned.is_none());
-                assert!(i.after_columns.is_empty());
+                // Not supported in postgres, which rejects them; the parser
+                // accepts `INSERT OR ...`.
+                if i.or.is_some() || i.partitioned.is_some() || !i.after_columns.is_empty() {
+                    return None;
+                }
 
                 let TableObject::TableName(table_name) = &i.table else {
                     return None;
@@ -789,8 +790,11 @@ impl QueryRouter {
                     exprs.push(expr.clone());
                 }
 
-                // Multi-tables delete are not supported in postgres.
-                assert!(d.tables.is_empty());
+                // Multi-tables delete are not supported in postgres, which
+                // rejects them.
+                if !d.tables.is_empty() {
+                    return None;
+                }
 
                 if let Some(using_tbl_with_join) = &d.using {
                     Self::process_tables_with_join(
@@ -2739,6 +2743,31 @@ mod test {
             shard_of("SELECT * FROM data LEFT JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
             Some(0)
         );
+    }
+
+    #[test]
+    fn test_writes_postgres_rejects_are_not_inferred() {
+        QueryRouter::setup();
+
+        let mut qr = QueryRouter::new();
+        qr.pool_settings.automatic_sharding_key = Some("data.id".to_string());
+        qr.pool_settings.shards = 3;
+        qr.pool_settings.query_parser_read_write_splitting = true;
+
+        // The parser accepts these, and the server rejects them. Inference
+        // skips them instead of panicking.
+        for sql in [
+            "INSERT OR REPLACE INTO data (id) VALUES (5)",
+            "DELETE data FROM data WHERE id = 5",
+        ] {
+            assert!(
+                qr.infer(&qr.parse(&simple_query(sql)).unwrap()).is_ok(),
+                "{}",
+                sql
+            );
+            assert_eq!(qr.role(), Some(Role::Primary), "{}", sql);
+            assert_eq!(qr.shard(), None, "{}", sql);
+        }
     }
 
     fn auto_shard_wrapper(qry: &str, should_succeed: bool) -> Option<usize> {
