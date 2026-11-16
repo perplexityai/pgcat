@@ -929,7 +929,10 @@ impl QueryRouter {
 
             // We can filter results based on join conditions, e.g.
             // SELECT * FROM t INNER JOIN B ON B.sharding_key = 5;
-            if let JoinOperator::Inner(JoinConstraint::On(expr)) = &join.join_operator {
+            // The parser reads a plain JOIN as `Join`, and INNER JOIN as `Inner`.
+            if let JoinOperator::Join(JoinConstraint::On(expr))
+            | JoinOperator::Inner(JoinConstraint::On(expr)) = &join.join_operator
+            {
                 // Parse the selection criteria later.
                 exprs.push(expr.clone());
             };
@@ -2644,6 +2647,46 @@ mod test {
             )
             .is_ok());
         assert_eq!(qr.shard().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_automatic_sharding_key_in_join_on() {
+        QueryRouter::setup();
+
+        let mut qr = QueryRouter::new();
+        qr.pool_settings.automatic_sharding_key = Some("data.id".to_string());
+        qr.pool_settings.shards = 3;
+        qr.pool_settings.query_parser_read_write_splitting = true;
+
+        let mut shard_of = |sql: &str| {
+            assert!(qr.infer(&qr.parse(&simple_query(sql)).unwrap()).is_ok());
+            qr.shard()
+        };
+
+        // The key is only in ON. Each query moves to a different shard than
+        // the previous one, so a join whose ON isn't read keeps the previous
+        // shard.
+        assert_eq!(shard_of("SELECT * FROM data WHERE id = 6"), Some(0));
+        assert_eq!(
+            shard_of("SELECT * FROM data JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
+            Some(2)
+        );
+        assert_eq!(shard_of("SELECT * FROM data WHERE id = 6"), Some(0));
+        assert_eq!(
+            shard_of("SELECT * FROM data INNER JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
+            Some(2)
+        );
+        assert_eq!(
+            shard_of("SELECT * FROM t2 JOIN data ON data.id = 6 AND t2.data_id = data.id"),
+            Some(0)
+        );
+
+        // An outer join's ON doesn't filter the rows of both tables, so it
+        // still doesn't choose a shard.
+        assert_eq!(
+            shard_of("SELECT * FROM data LEFT JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
+            Some(0)
+        );
     }
 
     fn auto_shard_wrapper(qry: &str, should_succeed: bool) -> Option<usize> {
