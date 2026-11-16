@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufStream};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::{OwnedTrustAnchor, RootCertStore};
+use tokio_rustls::rustls::{pki_types::ServerName, RootCertStore};
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
 use crate::config::{get_config, Address, User};
@@ -435,34 +435,36 @@ impl Server {
                 'S' => {
                     debug!("Connecting to server using TLS");
 
-                    let mut root_store = RootCertStore::empty();
-                    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(
-                        |ta| {
-                            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                                ta.subject,
-                                ta.spki,
-                                ta.name_constraints,
-                            )
-                        },
-                    ));
+                    let root_store = RootCertStore {
+                        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+                    };
 
-                    let mut tls_config = rustls::ClientConfig::builder()
-                        .with_safe_defaults()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
+                    let mut tls_config =
+                        rustls::ClientConfig::builder_with_provider(crate::tls::crypto_provider())
+                            .with_safe_default_protocol_versions()
+                            .map_err(|err| {
+                                Error::SocketError(format!("Server TLS error: {:?}", err))
+                            })?
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth();
 
                     // Equivalent to sslmode=prefer which is fine most places.
                     // If you want verify-full, change `verify_server_certificate` to true.
                     if !config.general.verify_server_certificate {
                         let mut dangerous = tls_config.dangerous();
                         dangerous.set_certificate_verifier(Arc::new(
-                            crate::tls::NoCertificateVerification {},
+                            crate::tls::NoCertificateVerification::new(),
                         ));
                     }
 
                     let connector = TlsConnector::from(Arc::new(tls_config));
                     let stream = match connector
-                        .connect(address.host.as_str().try_into().unwrap(), stream)
+                        .connect(
+                            ServerName::try_from(address.host.as_str())
+                                .unwrap()
+                                .to_owned(),
+                            stream,
+                        )
                         .await
                     {
                         Ok(stream) => stream,

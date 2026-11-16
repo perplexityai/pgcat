@@ -8,7 +8,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
-use sqlparser::ast::{visit_relations, Expr, Ident, SetExpr, Statement, Value};
+use sqlparser::ast::{
+    visit_relations, Expr, Ident, ObjectName, SetExpr, Statement, TableObject, Value, ValueWithSpan,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -177,7 +179,12 @@ impl<'a> Testing<'a> {
 
         let mut found = false;
         let _ = visit_relations(&ast[0], |relation| {
-            found |= relation.0.last().map(|ident| &ident.value) == Some(table);
+            found |= relation
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| &ident.value)
+                == Some(table);
             ControlFlow::<()>::Continue(())
         });
 
@@ -209,14 +216,16 @@ fn plan_copy_param(
         _ => return None,
     };
 
-    if insert.table_name.0.last()?.value != copy.table {
+    let TableObject::TableName(table_name) = &insert.table else {
+        return None;
+    };
+    if table_name.0.last()?.as_ident()?.value != copy.table {
         return None;
     }
 
-    let from = insert
-        .columns
-        .iter()
-        .position(|column| column.value == copy.from)?;
+    let from = insert.columns.iter().position(|column| {
+        matches!(column.0.as_slice(), [part] if part.as_ident().is_some_and(|ident| ident.value == copy.from))
+    })?;
 
     let client_params = ctx.client_param_count(ast);
     let mut sources = Vec::new();
@@ -228,7 +237,10 @@ fn plan_copy_param(
 
     for row in values.rows.iter_mut() {
         let source = match row.get(from)? {
-            Expr::Value(Value::Placeholder(placeholder)) => placeholder
+            Expr::Value(ValueWithSpan {
+                value: Value::Placeholder(placeholder),
+                ..
+            }) => placeholder
                 .strip_prefix('$')?
                 .parse::<usize>()
                 .ok()?
@@ -237,13 +249,15 @@ fn plan_copy_param(
         };
 
         sources.push(source);
-        row.push(Expr::Value(Value::Placeholder(format!(
+        row.push(Expr::value(Value::Placeholder(format!(
             "${}",
             client_params + sources.len()
         ))));
     }
 
-    insert.columns.push(Ident::new(&copy.to));
+    insert
+        .columns
+        .push(ObjectName::from(vec![Ident::new(&copy.to)]));
 
     let appended = vec![TEXT_OID; sources.len()];
 

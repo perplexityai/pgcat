@@ -34,8 +34,8 @@ use log::{info, warn};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use sqlparser::ast::{
-    CopySource, Delete, FromTable, Ident, ObjectName, Query, SetExpr, Statement, Table,
-    TableFactor, Visit, Visitor,
+    CopySource, Delete, FromTable, Ident, ObjectName, Query, Set, SetExpr, Statement, Table,
+    TableFactor, TableObject, Update, Visit, Visitor,
 };
 
 use crate::identity_label::IdentityState;
@@ -255,10 +255,10 @@ impl KeyBuf {
     /// schema is checked like the table name, then dropped.
     fn from_name(name: &ObjectName) -> Option<KeyBuf> {
         match name.0.as_slice() {
-            [table] => KeyBuf::from_ident(table),
+            [table] => KeyBuf::from_ident(table.as_ident()?),
             [schema, table] => {
-                KeyBuf::from_ident(schema)?;
-                KeyBuf::from_ident(table)
+                KeyBuf::from_ident(schema.as_ident()?)?;
+                KeyBuf::from_ident(table.as_ident()?)
             }
             _ => None,
         }
@@ -1068,8 +1068,11 @@ impl Visitor for Run<'_> {
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
         match statement {
             Statement::Query(_) => ControlFlow::Continue(()),
-            Statement::Insert(insert) => self.set_pending(&insert.table_name),
-            Statement::Update { table, .. } => {
+            Statement::Insert(insert) => match &insert.table {
+                TableObject::TableName(name) => self.set_pending(name),
+                _ => self.fail(),
+            },
+            Statement::Update(Update { table, .. }) => {
                 if !table.joins.is_empty() {
                     return self.fail();
                 }
@@ -1096,10 +1099,16 @@ impl Visitor for Run<'_> {
             | Statement::Close { .. }
             | Statement::Deallocate { .. }
             | Statement::Discard { .. }
-            | Statement::SetRole { .. }
-            | Statement::SetVariable { .. }
-            | Statement::SetTimeZone { .. }
-            | Statement::SetTransaction { .. }
+            // SET of a variable, ROLE, TIME ZONE or TRANSACTION; not SET NAMES
+            // or SET SESSION AUTHORIZATION.
+            | Statement::Set(
+                Set::SingleAssignment { .. }
+                | Set::ParenthesizedAssignments { .. }
+                | Set::MultipleAssignments { .. }
+                | Set::SetRole { .. }
+                | Set::SetTimeZone { .. }
+                | Set::SetTransaction { .. },
+            )
             | Statement::ShowVariable { .. } => ControlFlow::Continue(()),
             _ => self.fail(),
         }
@@ -1113,9 +1122,18 @@ impl Visitor for Run<'_> {
                 with_hints,
                 version,
                 partitions,
+                json_path,
+                sample,
+                index_hints,
                 ..
             } => {
-                if !with_hints.is_empty() || version.is_some() || !partitions.is_empty() {
+                if !with_hints.is_empty()
+                    || version.is_some()
+                    || !partitions.is_empty()
+                    || json_path.is_some()
+                    || sample.is_some()
+                    || !index_hints.is_empty()
+                {
                     return self.fail();
                 }
                 if args.is_some() {
@@ -1715,7 +1733,7 @@ mod tests {
         let TableFactor::Table { with_hints, .. } = &mut select.from[0].relation else {
             panic!("table expected");
         };
-        with_hints.push(sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(
+        with_hints.push(sqlparser::ast::Expr::value(sqlparser::ast::Value::Number(
             "1".into(),
             false,
         )));
@@ -1724,7 +1742,7 @@ mod tests {
         // A target that is not a plain table cannot be assigned.
         let mut statements = parse("DELETE FROM public.orders USING public.items");
         if let Statement::Delete(delete) = &mut statements[0] {
-            delete.tables = vec![ObjectName(vec![Ident::new("x")])];
+            delete.tables = vec![ObjectName::from(vec![Ident::new("x")])];
         }
         let snap = Classifier::new().classify(&hub, &statements[0]);
         assert_eq!(snap, RelationSnap::UNKNOWN);
