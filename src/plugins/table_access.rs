@@ -2,7 +2,7 @@
 //! table as part of their query. If they can't, the query will not be routed.
 
 use async_trait::async_trait;
-use sqlparser::ast::{visit_relations, CopySource, ObjectName, Statement};
+use sqlparser::ast::{visit_relations, CopySource, ObjectName, Statement, VacuumStatement};
 
 use crate::{
     errors::Error,
@@ -39,16 +39,31 @@ impl<'a> Plugin for TableAccess<'a> {
             }
         });
 
-        // `visit_relations` doesn't visit the table of `COPY t`.
+        // `visit_relations` doesn't visit the table of `COPY t` or `VACUUM t`.
         let found = found.or_else(|| {
             ast.iter().find_map(|statement| match statement {
                 Statement::Copy {
                     source: CopySource::Table { table_name, .. },
                     ..
                 } => self.forbidden(table_name),
+                Statement::Vacuum(vacuum) => vacuum_target(vacuum).and_then(|t| self.forbidden(t)),
                 _ => None,
             })
         });
+
+        // A VACUUM without a table processes every table, forbidden ones too.
+        if found.is_none()
+            && !self.tables.is_empty()
+            && ast.iter().any(|statement| {
+                matches!(statement, Statement::Vacuum(vacuum) if vacuum_target(vacuum).is_none())
+            })
+        {
+            debug!("Blocking VACUUM of every table");
+
+            return Ok(PluginOutput::Deny(
+                "permission for VACUUM of every table denied".into(),
+            ));
+        }
 
         if let Some(found) = found {
             debug!("Blocking access to table \"{}\"", found);
@@ -61,6 +76,24 @@ impl<'a> Plugin for TableAccess<'a> {
             Ok(PluginOutput::Allow)
         }
     }
+}
+
+/// The table a VACUUM processes, or `None` when it processes every table.
+fn vacuum_target(vacuum: &VacuumStatement) -> Option<&ObjectName> {
+    let name = vacuum.table_name.as_ref()?;
+    // The parser reads an option after VACUUM, as in `VACUUM VERBOSE`, as a
+    // table name. Postgres reads these words there as options, never as an
+    // unquoted table name.
+    if let [part] = name.0.as_slice() {
+        if let Some(ident) = part.as_ident() {
+            let option = ["analyse", "analyze", "freeze", "verbose"]
+                .contains(&ident.value.to_ascii_lowercase().as_str());
+            if ident.quote_style.is_none() && option {
+                return None;
+            }
+        }
+    }
+    Some(name)
 }
 
 impl TableAccess<'_> {
@@ -106,6 +139,60 @@ mod tests {
             assert!(refused(sql).await, "{}", sql);
         }
         assert!(!refused("COPY other TO STDOUT").await);
+    }
+
+    #[tokio::test]
+    async fn test_vacuum_of_a_forbidden_table_is_refused() {
+        for sql in [
+            "VACUUM secrets",
+            "VACUUM FULL secrets",
+            "VACUUM FULL public.secrets",
+            r#"VACUUM "secrets""#,
+            r#"VACUUM FULL "public"."secrets""#,
+            "VACUUM SECRETS",
+            "SELECT 1; VACUUM secrets",
+        ] {
+            assert!(refused(sql).await, "{}", sql);
+        }
+        for sql in [
+            "VACUUM other",
+            "VACUUM FULL public.other",
+            r#"VACUUM "SECRETS""#,
+        ] {
+            assert!(!refused(sql).await, "{}", sql);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vacuum_of_every_table_is_refused() {
+        // Without a table, VACUUM processes every table, so it's refused
+        // while any table is forbidden. The parser reads the options in
+        // `VACUUM VERBOSE` as a table name.
+        for sql in [
+            "VACUUM",
+            "VACUUM FULL",
+            "VACUUM;",
+            "VACUUM VERBOSE",
+            "VACUUM FULL FREEZE",
+            "VACUUM analyze",
+            "SELECT 1; VACUUM",
+        ] {
+            assert!(refused(sql).await, "{}", sql);
+        }
+
+        // A table named like an option is one when it's quoted.
+        assert!(!refused(r#"VACUUM "verbose""#).await);
+
+        let tables = vec![];
+        let mut plugin = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, "VACUUM FULL").unwrap();
+        assert!(matches!(
+            plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
+            PluginOutput::Allow
+        ));
     }
 
     #[test]
