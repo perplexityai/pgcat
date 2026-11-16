@@ -3663,6 +3663,8 @@ mod test {
             ";;VACUUM (FULL)",
             "/* c */;VACUUM (FULL)",
             "; -- c\nVACUUM (FULL)",
+            "/* a */;/* b */VACUUM (FULL)",
+            "\x0c;\x0bVACUUM (FULL)",
         ];
         qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
         for query in vacuums {
