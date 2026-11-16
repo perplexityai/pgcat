@@ -531,15 +531,29 @@ impl QueryRouter {
         }
     }
 
-    /// Determines if a query is a mutation or not.
+    /// Determines if a query is a mutation or not: its body or a query in its
+    /// `WITH` clause writes.
     fn is_mutation_query(q: &sqlparser::ast::Query) -> bool {
-        use sqlparser::ast::*;
+        let cte_mutates = q.with.as_ref().is_some_and(|with| {
+            with.cte_tables
+                .iter()
+                .any(|cte| Self::is_mutation_query(&cte.query))
+        });
+        cte_mutates || Self::is_mutation_set_expr(&q.body)
+    }
 
-        match q.body.as_ref() {
-            SetExpr::Insert(_) => true,
-            SetExpr::Update(_) => true,
+    /// Determines if a query body writes. The match lists every kind of body,
+    /// so a new one has to be classified here.
+    fn is_mutation_set_expr(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
+                true
+            }
             SetExpr::Query(q) => Self::is_mutation_query(q),
-            _ => false,
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::is_mutation_set_expr(left) || Self::is_mutation_set_expr(right)
+            }
+            SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => false,
         }
     }
 
@@ -2108,6 +2122,44 @@ mod test {
         let ast = qr.parse(&query).unwrap();
         assert!(qr.infer(&ast).is_ok());
         assert_eq!(qr.role(), Some(Role::Primary));
+    }
+
+    #[test]
+    fn test_data_modifying_bodies_and_ctes_go_to_primary() {
+        QueryRouter::setup();
+        let role_of = |sql: &str| {
+            let mut qr = QueryRouter::new();
+            qr.pool_settings.query_parser_read_write_splitting = true;
+            qr.pool_settings.primary_reads_enabled = false;
+            assert!(qr.infer(&qr.parse(&simple_query(sql)).unwrap()).is_ok());
+            qr.role()
+        };
+
+        for sql in [
+            // The parser reads these as a query whose body is the DELETE or
+            // MERGE.
+            "WITH x AS (SELECT 1) DELETE FROM data WHERE id = 5",
+            "WITH x AS (SELECT 1) MERGE INTO data USING a ON data.id = a.id \
+             WHEN MATCHED THEN DELETE",
+            // A SELECT over a CTE that writes.
+            "WITH x AS (DELETE FROM data WHERE id = 5 RETURNING *) SELECT * FROM x",
+            "WITH x AS (UPDATE data SET v = 1 RETURNING *) SELECT * FROM x",
+            "WITH x AS (INSERT INTO data VALUES (1) RETURNING *) SELECT * FROM x",
+            "WITH r AS (SELECT 1), x AS (DELETE FROM data RETURNING *) SELECT * FROM r",
+            "WITH x AS (WITH y AS (DELETE FROM data RETURNING *) SELECT * FROM y) \
+             SELECT * FROM x",
+            "SELECT 1 UNION ALL (WITH x AS (DELETE FROM data RETURNING *) SELECT 1)",
+        ] {
+            assert_eq!(role_of(sql), Some(Role::Primary), "{}", sql);
+        }
+
+        for sql in [
+            "WITH x AS (SELECT * FROM data) SELECT * FROM x",
+            "WITH x AS (WITH y AS (SELECT 1) SELECT * FROM y) SELECT * FROM x",
+            "SELECT 1 UNION ALL (WITH x AS (SELECT 1) SELECT * FROM x)",
+        ] {
+            assert_eq!(role_of(sql), Some(Role::Replica), "{}", sql);
+        }
     }
 
     #[test]
