@@ -1800,7 +1800,10 @@ async fn a_plugin_that_checks_rewrites_refuses_another_plugins_but_not_its_own()
     let own = "[guard]\nenabled = true\ntable = \"guarded\"\nrewrite = true";
     match rewritten(&registry, own, false).await {
         PluginOutput::Overwrite(statements) => {
-            assert_eq!(statements_to_sql(&statements), "SELECT 1 FROM guarded WHERE ")
+            assert_eq!(
+                statements_to_sql(&statements),
+                "SELECT 1 FROM guarded WHERE "
+            )
         }
         output => panic!("{:?}", output),
     }
@@ -1816,7 +1819,10 @@ async fn a_rewrite_checked_as_built_isnt_parsed_again() {
     // table_access checks the rewrite as the plugin built it.
     match rewritten(&registry, &format!("{}true", own), true).await {
         PluginOutput::Overwrite(statements) => {
-            assert_eq!(statements_to_sql(&statements), "SELECT 1 FROM guarded WHERE ")
+            assert_eq!(
+                statements_to_sql(&statements),
+                "SELECT 1 FROM guarded WHERE "
+            )
         }
         output => panic!("{:?}", output),
     }
