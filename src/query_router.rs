@@ -73,6 +73,39 @@ enum ParameterFormat {
 static TABLE_FREE_UNPARSED_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)^\s*RESET\s+[a-z_][a-z0-9_.]*\s*;?\s*$").unwrap());
 
+/// The first word of a query, after the whitespace and comments before it.
+fn first_word(query: &str) -> &str {
+    let mut rest = query;
+    loop {
+        rest = rest.trim_start();
+        if let Some(comment) = rest.strip_prefix("--") {
+            rest = comment.find(['\n', '\r']).map_or("", |end| &comment[end..]);
+        } else if rest.starts_with("/*") {
+            // Block comments nest.
+            let bytes = rest.as_bytes();
+            let (mut depth, mut i) = (1, 2);
+            while depth > 0 {
+                match bytes.get(i..i + 2) {
+                    Some(b"/*") => (depth, i) = (depth + 1, i + 2),
+                    Some(b"*/") => (depth, i) = (depth - 1, i + 2),
+                    Some(_) => i += 1,
+                    None => return "",
+                }
+            }
+            rest = &rest[i..];
+        } else {
+            // Postgres reads letters, digits, `_`, `$` and non-ASCII
+            // characters as part of a word.
+            let end = rest
+                .find(|c: char| {
+                    c.is_ascii() && !(c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                })
+                .unwrap_or(rest.len());
+            return &rest[..end];
+        }
+    }
+}
+
 /// Quickly test for match when a query is received.
 static CUSTOM_SQL_REGEX_SET: OnceCell<RegexSet> = OnceCell::new();
 
@@ -667,6 +700,7 @@ impl QueryRouter {
                     let has_mutation = Self::is_mutation_query(query);
 
                     if has_locks || has_mutation {
+                        visited_write_statement = true;
                         self.active_role = Some(Role::Primary);
                     } else if !visited_write_statement {
                         // If we already visited a write statement, we should be going to the primary.
@@ -1985,12 +2019,14 @@ impl QueryRouter {
     /// A query the parser couldn't read might touch a table a plugin checks:
     /// its text has a name a plugin gates (a table's, or a function's that
     /// runs SQL given as text, which can build any name), or Unicode escapes
-    /// (`U&"..."`), which can spell any name.
+    /// (`U&"..."`), which can spell any name. A VACUUM without a table name
+    /// processes every table, so any VACUUM might.
     fn might_touch_gated(&self, query: &str) -> bool {
         let query = query.to_ascii_lowercase();
+        let gated = self.gated_tables();
         query.contains("u&")
-            || self
-                .gated_tables()
+            || (!gated.is_empty() && first_word(&query) == "vacuum")
+            || gated
                 .iter()
                 .any(|table| query.contains(&table.to_ascii_lowercase()))
     }
@@ -2153,11 +2189,19 @@ mod test {
             "WITH x AS (WITH y AS (DELETE FROM data RETURNING *) SELECT * FROM y) \
              SELECT * FROM x",
             "SELECT 1 UNION ALL (WITH x AS (DELETE FROM data RETURNING *) SELECT 1)",
+            // A read after one of these, or after a locking read, in the same
+            // message stays on the primary.
+            "WITH x AS (SELECT 1) DELETE FROM data WHERE id = 5; SELECT 1",
+            "WITH x AS (SELECT 1) MERGE INTO data USING a ON data.id = a.id \
+             WHEN MATCHED THEN DELETE; SELECT 1",
+            "WITH x AS (DELETE FROM data RETURNING *) SELECT * FROM x; SELECT 1",
+            "SELECT * FROM data FOR UPDATE; SELECT 1",
         ] {
             assert_eq!(role_of(sql), Some(Role::Primary), "{}", sql);
         }
 
         for sql in [
+            "SELECT 1; SELECT 1",
             "WITH x AS (SELECT * FROM data) SELECT * FROM x",
             "WITH x AS (WITH y AS (SELECT 1) SELECT * FROM y) SELECT * FROM x",
             "SELECT 1 UNION ALL (WITH x AS (SELECT 1) SELECT * FROM x)",
@@ -3588,6 +3632,52 @@ mod test {
         assert!(!qr.rejects_unparsed(&message));
         assert!(!qr.rejects_unparsed(&simple_query("reset search_path;")));
         assert!(!qr.rejects_unparsed(&parse_message("", "RESET ALL", &[])));
+    }
+
+    #[test]
+    fn test_unparsed_vacuum_is_rejected_while_a_table_is_gated() {
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        let with_gated = |tables: Vec<String>| {
+            let mut settings = testing_plugin_settings(true);
+            if let Some(ref mut plugins) = settings.plugins {
+                plugins.table_access = Some(crate::config::TableAccess {
+                    enabled: true,
+                    tables,
+                });
+            }
+            settings
+        };
+
+        // These process every table, so they might touch a gated one.
+        let vacuums = [
+            "VACUUM (FULL)",
+            "vacuum (full, freeze)",
+            "VACUUM FREEZE VERBOSE",
+            "  -- comment\n\tVACUUM VERBOSE ANALYZE",
+            "/* a /* nested */ comment */ VACUUM(FULL)",
+        ];
+        qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
+        for query in vacuums {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{}",
+                query
+            );
+        }
+        for query in ["VACUUMS (FULL)", "/* VACUUM */ SELEKT 1"] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+
+        qr.update_pool_settings(&with_gated(vec![]));
+        for query in vacuums {
+            assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
+        }
     }
 
     #[tokio::test]
