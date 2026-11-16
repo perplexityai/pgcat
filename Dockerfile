@@ -1,4 +1,4 @@
-FROM rust:1.81.0-slim-bookworm AS builder
+FROM rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS builder
 
 RUN apt-get update && \
     apt-get install -y build-essential
@@ -10,6 +10,8 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install  -o Dpkg::Options::=--force-confdef -yq --no-install-recommends \
     postgresql-client \
+    # The system roots, for a client in the image that trusts them (core's TLS brings its own).
+    ca-certificates \
     # Clean up layer
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \

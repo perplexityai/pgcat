@@ -1,6 +1,6 @@
 /// Helper functions to send one-off protocol messages
 /// and handle TcpStream (TCP socket).
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, error};
 use md5::{Digest, Md5};
 use socket2::{SockRef, TcpKeepalive};
@@ -12,6 +12,8 @@ use crate::config::get_config;
 use crate::errors::Error;
 
 use crate::constants::MESSAGE_TERMINATOR;
+use crate::plugins::StatementPlan;
+use crate::sql_observer::SharedSnap;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -329,6 +331,20 @@ where
     send_ready_for_query(stream).await
 }
 
+/// Send a custom error message to the client, followed by a ReadyForQuery
+/// with the transaction status (`I`, `T` or `E`).
+pub async fn error_response_with_status<S>(
+    stream: &mut S,
+    message: &str,
+    status: u8,
+) -> Result<(), Error>
+where
+    S: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    error_response_terminal(stream, message).await?;
+    write_all(stream, ready_for_query_status(status)).await
+}
+
 /// Send a custom error message to the client.
 /// Tell the client we are ready for the next query and no rollback is necessary.
 /// Docs on error codes: <https://www.postgresql.org/docs/12/errcodes-appendix.html>.
@@ -336,19 +352,57 @@ pub async fn error_response_terminal<S>(stream: &mut S, message: &str) -> Result
 where
     S: tokio::io::AsyncWrite + std::marker::Unpin,
 {
+    write_all_half(stream, &error_message(message)).await
+}
+
+/// Give an error message a SQLSTATE. The client gets it at ERROR severity, and
+/// its connection stays usable.
+pub fn with_sqlstate(code: &str, message: &str) -> String {
+    format!("\0{}\0{}", code, message)
+}
+
+/// The SQLSTATE a message was given with `with_sqlstate`, and the message.
+pub fn sqlstate_of(message: &str) -> (Option<&str>, &str) {
+    match message
+        .strip_prefix('\0')
+        .and_then(|rest| rest.split_once('\0'))
+    {
+        Some((code, message)) if code.len() == 5 => (Some(code), message),
+        _ => (None, message),
+    }
+}
+
+/// `message`, or `message` with the SQLSTATE `code` if it doesn't have one.
+pub fn or_sqlstate(code: &str, message: &str) -> String {
+    match sqlstate_of(message) {
+        (Some(_), _) => message.to_string(),
+        (None, message) => with_sqlstate(code, message),
+    }
+}
+
+/// An ErrorResponse message, as sent by `error_response_terminal`.
+pub fn error_message(message: &str) -> BytesMut {
+    let (code, message) = sqlstate_of(message);
+    let (severity, code) = match code {
+        Some(code) => ("ERROR", code),
+        // Not sure how much this matters: system_error, see Appendix A.
+        None => ("FATAL", "58000"),
+    };
+    let message = message.replace('\0', " ");
+
     let mut error = BytesMut::new();
 
     // Error level
     error.put_u8(b'S');
-    error.put_slice(&b"FATAL\0"[..]);
+    error.put_slice(format!("{}\0", severity).as_bytes());
 
     // Error level (non-translatable)
     error.put_u8(b'V');
-    error.put_slice(&b"FATAL\0"[..]);
+    error.put_slice(format!("{}\0", severity).as_bytes());
 
-    // Error code: not sure how much this matters.
+    // Error code
     error.put_u8(b'C');
-    error.put_slice(&b"58000\0"[..]); // system_error, see Appendix A.
+    error.put_slice(format!("{}\0", code).as_bytes());
 
     // The short error message.
     error.put_u8(b'M');
@@ -364,10 +418,12 @@ where
     res.put_i32(error.len() as i32 + 4);
     res.put(error);
 
-    write_all_half(stream, &res).await
+    res
 }
 
-pub async fn wrong_password<S>(stream: &mut S, user: &str) -> Result<(), Error>
+/// Tell the client its credentials were rejected (FATAL 28P01). Only the user name
+/// goes into the message.
+pub async fn authentication_failed<S>(stream: &mut S, user: &str) -> Result<(), Error>
 where
     S: tokio::io::AsyncWrite + std::marker::Unpin,
 {
@@ -572,18 +628,285 @@ pub fn parse_complete() -> BytesMut {
     bytes
 }
 
+pub fn bind_complete() -> BytesMut {
+    let mut bytes = BytesMut::with_capacity(mem::size_of::<u8>() + mem::size_of::<i32>());
+
+    bytes.put_u8(b'2');
+    bytes.put_i32(4);
+    bytes
+}
+
+pub fn no_data() -> BytesMut {
+    let mut bytes = BytesMut::with_capacity(mem::size_of::<u8>() + mem::size_of::<i32>());
+
+    bytes.put_u8(b'n');
+    bytes.put_i32(4);
+    bytes
+}
+
+/// ParameterDescription ('t') listing the parameter type OIDs.
+pub fn parameter_description(param_types: &[i32]) -> BytesMut {
+    let mut bytes = BytesMut::with_capacity(7 + 4 * param_types.len());
+
+    bytes.put_u8(b't');
+    bytes.put_i32(4 + 2 + 4 * param_types.len() as i32);
+    bytes.put_i16(param_types.len() as i16);
+    for oid in param_types {
+        bytes.put_i32(*oid);
+    }
+    bytes
+}
+
+/// The query text of a Query or Parse message, without copying it.
+pub fn query_text(message: &[u8]) -> &[u8] {
+    let mut body = message.get(5..).unwrap_or_default();
+
+    // Parse: skip the statement name.
+    if message.first() == Some(&b'P') {
+        if let Some(end) = body.iter().position(|byte| *byte == 0) {
+            body = &body[end + 1..];
+        }
+    }
+
+    match body.iter().position(|byte| *byte == 0) {
+        Some(end) => &body[..end],
+        None => body,
+    }
+}
+
+/// Parameter type OIDs of a ParameterDescription ('t') message.
+pub fn parameter_types(message: &[u8]) -> Result<Vec<i32>, Error> {
+    let mut body = message
+        .get(5..)
+        .ok_or_else(|| Error::ProtocolSyncError("short ParameterDescription".into()))?;
+
+    if body.len() < 2 {
+        return Err(Error::ProtocolSyncError(
+            "short ParameterDescription".into(),
+        ));
+    }
+    let count = body.get_i16().max(0) as usize;
+
+    if body.len() < 4 * count {
+        return Err(Error::ProtocolSyncError(
+            "short ParameterDescription".into(),
+        ));
+    }
+
+    Ok((0..count).map(|_| body.get_i32()).collect())
+}
+
+/// One column of a RowDescription ('T') message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldDescription {
+    pub name: String,
+    pub table_oid: i32,
+    pub column_id: i16,
+    pub type_oid: i32,
+    pub type_size: i16,
+    pub type_modifier: i32,
+    /// 0 for text, 1 for binary. Always 0 when describing a statement.
+    pub format: i16,
+}
+
+/// RowDescription ('T') message.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowDescription {
+    pub fields: Vec<FieldDescription>,
+}
+
+impl TryFrom<&[u8]> for RowDescription {
+    type Error = Error;
+
+    fn try_from(message: &[u8]) -> Result<RowDescription, Error> {
+        let short = || Error::ProtocolSyncError("short RowDescription".into());
+
+        let mut body = message.get(5..).ok_or_else(short)?;
+        if body.len() < 2 {
+            return Err(short());
+        }
+        let count = body.get_i16().max(0) as usize;
+        let mut fields = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let end = body.iter().position(|byte| *byte == 0).ok_or_else(short)?;
+            let name = String::from_utf8_lossy(&body[..end]).to_string();
+            body.advance(end + 1);
+
+            if body.len() < 18 {
+                return Err(short());
+            }
+
+            fields.push(FieldDescription {
+                name,
+                table_oid: body.get_i32(),
+                column_id: body.get_i16(),
+                type_oid: body.get_i32(),
+                type_size: body.get_i16(),
+                type_modifier: body.get_i32(),
+                format: body.get_i16(),
+            });
+        }
+
+        Ok(RowDescription { fields })
+    }
+}
+
+impl From<&RowDescription> for BytesMut {
+    fn from(description: &RowDescription) -> BytesMut {
+        let mut body = BytesMut::new();
+        body.put_i16(description.fields.len() as i16);
+
+        for field in &description.fields {
+            body.put_slice(field.name.as_bytes());
+            body.put_u8(0);
+            body.put_i32(field.table_oid);
+            body.put_i16(field.column_id);
+            body.put_i32(field.type_oid);
+            body.put_i16(field.type_size);
+            body.put_i32(field.type_modifier);
+            body.put_i16(field.format);
+        }
+
+        let mut message = BytesMut::with_capacity(body.len() + 5);
+        message.put_u8(b'T');
+        message.put_i32(body.len() as i32 + 4);
+        message.put(body);
+        message
+    }
+}
+
+/// DataRow ('D') message. A `None` value is NULL.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DataRow {
+    pub values: Vec<Option<Bytes>>,
+}
+
+impl TryFrom<&[u8]> for DataRow {
+    type Error = Error;
+
+    fn try_from(message: &[u8]) -> Result<DataRow, Error> {
+        let short = || Error::ProtocolSyncError("short DataRow".into());
+
+        let mut body = message.get(5..).ok_or_else(short)?;
+        if body.len() < 2 {
+            return Err(short());
+        }
+        let count = body.get_i16().max(0) as usize;
+        let mut values = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if body.len() < 4 {
+                return Err(short());
+            }
+            let len = body.get_i32();
+
+            if len < 0 {
+                values.push(None);
+            } else {
+                let len = len as usize;
+                if body.len() < len {
+                    return Err(short());
+                }
+                values.push(Some(Bytes::copy_from_slice(&body[..len])));
+                body.advance(len);
+            }
+        }
+
+        Ok(DataRow { values })
+    }
+}
+
+impl From<&DataRow> for BytesMut {
+    fn from(row: &DataRow) -> BytesMut {
+        let len = 4
+            + 2
+            + row
+                .values
+                .iter()
+                .map(|value| 4 + value.as_ref().map_or(0, |value| value.len()))
+                .sum::<usize>();
+
+        let mut message = BytesMut::with_capacity(len + 1);
+        message.put_u8(b'D');
+        message.put_i32(len as i32);
+        message.put_i16(row.values.len() as i16);
+
+        for value in &row.values {
+            match value {
+                Some(value) => {
+                    message.put_i32(value.len() as i32);
+                    message.put_slice(value);
+                }
+                None => message.put_i32(-1),
+            }
+        }
+
+        message
+    }
+}
+
+/// Expand Bind result format codes (none, one for all, or one per column)
+/// to one code per column.
+pub fn column_formats(result_formats: &[i16], columns: usize) -> Vec<i16> {
+    match result_formats.len() {
+        0 => vec![0; columns],
+        1 => vec![result_formats[0]; columns],
+        _ => (0..columns)
+            .map(|i| result_formats.get(i).copied().unwrap_or(0))
+            .collect(),
+    }
+}
+
+/// Split a buffer of complete protocol messages into individual messages
+/// (code + length + body).
+pub fn split_messages(buf: &[u8]) -> Result<Vec<BytesMut>, Error> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+
+    while offset < buf.len() {
+        if buf.len() - offset < 5 {
+            return Err(Error::ProtocolSyncError(
+                "truncated message header".to_string(),
+            ));
+        }
+
+        let len = i32::from_be_bytes([
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+            buf[offset + 4],
+        ]);
+
+        if len < 4 || buf.len() - offset - 1 < len as usize {
+            return Err(Error::ProtocolSyncError(format!(
+                "truncated message '{}'",
+                buf[offset] as char
+            )));
+        }
+
+        let end = offset + 1 + len as usize;
+        messages.push(BytesMut::from(&buf[offset..end]));
+        offset = end;
+    }
+
+    Ok(messages)
+}
+
 pub fn ready_for_query(in_transaction: bool) -> BytesMut {
+    ready_for_query_status(if in_transaction { b'T' } else { b'I' })
+}
+
+/// A ReadyForQuery with the transaction status: `I` idle, `T` in a transaction,
+/// `E` in a failed transaction.
+pub fn ready_for_query_status(status: u8) -> BytesMut {
     let mut bytes = BytesMut::with_capacity(
         mem::size_of::<u8>() + mem::size_of::<i32>() + mem::size_of::<u8>(),
     );
 
     bytes.put_u8(b'Z');
     bytes.put_i32(5);
-    if in_transaction {
-        bytes.put_u8(b'T');
-    } else {
-        bytes.put_u8(b'I');
-    }
+    bytes.put_u8(status);
 
     bytes
 }
@@ -635,6 +958,9 @@ where
     }
 }
 
+/// Memory reserved for a message before its body arrives.
+const MESSAGE_PREALLOCATION: usize = 64 * 1024;
+
 /// Read a complete message from the socket.
 pub async fn read_message<S>(stream: &mut S) -> Result<BytesMut, Error>
 where
@@ -660,33 +986,40 @@ where
         }
     };
 
-    let mut bytes = BytesMut::with_capacity(len as usize + 1);
-
-    bytes.put_u8(code);
-    bytes.put_i32(len);
-
-    bytes.resize(bytes.len() + len as usize - mem::size_of::<i32>(), b'0');
-
-    let slice_start = mem::size_of::<u8>() + mem::size_of::<i32>();
-    let slice_end = slice_start + len as usize - mem::size_of::<i32>();
-
-    // Avoids a panic
-    if slice_end < slice_start {
+    // The length counts itself.
+    if len < mem::size_of::<i32>() as i32 {
         return Err(Error::SocketError(format!(
             "Error reading message from socket - Code: {:?} - Length {:?}, Error: {:?}",
             code, len, "Unexpected length value for message"
         )));
     }
 
-    match stream.read_exact(&mut bytes[slice_start..slice_end]).await {
-        Ok(_) => (),
-        Err(err) => {
-            return Err(Error::SocketError(format!(
-                "Error reading message from socket - Code: {:?}, Error: {:?}",
-                code, err
-            )))
+    // The length is the peer's claim: past the first MESSAGE_PREALLOCATION
+    // bytes, memory is reserved as the body arrives.
+    let size = len as usize + 1;
+    let mut bytes = BytesMut::with_capacity(size.min(MESSAGE_PREALLOCATION));
+
+    bytes.put_u8(code);
+    bytes.put_i32(len);
+
+    while bytes.len() < size {
+        let remaining = size - bytes.len();
+        if bytes.len() == bytes.capacity() {
+            // Doubling, so a large body is copied a bounded number of times.
+            bytes.reserve(remaining.min(bytes.capacity()));
         }
-    };
+        // Not past this message: the reader may hold the next one.
+        let mut body = (&mut *stream).take(remaining as u64);
+        let error = match body.read_buf(&mut bytes).await {
+            Ok(0) => std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            Ok(_) => continue,
+            Err(err) => err,
+        };
+        return Err(Error::SocketError(format!(
+            "Error reading message from socket - Code: {:?}, Error: {:?}",
+            code, error
+        )));
+    }
 
     Ok(bytes)
 }
@@ -749,10 +1082,61 @@ impl BytesMutReader for Cursor<&BytesMut> {
     fn read_string(&mut self) -> Result<String, Error> {
         let mut buf = vec![];
         match self.read_until(b'\0', &mut buf) {
-            Ok(_) => Ok(String::from_utf8_lossy(&buf[..buf.len() - 1]).to_string()),
+            Ok(_) if buf.last() == Some(&b'\0') => {
+                Ok(String::from_utf8_lossy(&buf[..buf.len() - 1]).to_string())
+            }
+            Ok(_) => Err(Error::ParseBytesError("Could not read string".to_string())),
             Err(err) => Err(Error::ParseBytesError(err.to_string())),
         }
     }
+}
+
+/// Reads from a client's message that fail, instead of panicking, when the
+/// message is shorter than it says.
+trait CheckedReader {
+    fn take_u8(&mut self) -> Result<u8, Error>;
+    fn take_i16(&mut self) -> Result<i16, Error>;
+    /// A count: Postgres reads them as unsigned 16-bit integers.
+    fn take_count(&mut self) -> Result<usize, Error>;
+    fn take_i32(&mut self) -> Result<i32, Error>;
+    fn skip(&mut self, len: usize) -> Result<(), Error>;
+}
+
+impl CheckedReader for Cursor<&BytesMut> {
+    fn take_u8(&mut self) -> Result<u8, Error> {
+        check_remaining(self, 1)?;
+        Ok(self.get_u8())
+    }
+
+    fn take_i16(&mut self) -> Result<i16, Error> {
+        check_remaining(self, 2)?;
+        Ok(self.get_i16())
+    }
+
+    fn take_count(&mut self) -> Result<usize, Error> {
+        check_remaining(self, 2)?;
+        Ok(self.get_u16() as usize)
+    }
+
+    fn take_i32(&mut self) -> Result<i32, Error> {
+        check_remaining(self, 4)?;
+        Ok(self.get_i32())
+    }
+
+    fn skip(&mut self, len: usize) -> Result<(), Error> {
+        check_remaining(self, len)?;
+        self.advance(len);
+        Ok(())
+    }
+}
+
+fn check_remaining(cursor: &Cursor<&BytesMut>, len: usize) -> Result<(), Error> {
+    if cursor.remaining() < len {
+        return Err(Error::ParseBytesError(
+            "message is shorter than it says".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl BytesMutReader for BytesMut {
@@ -778,11 +1162,13 @@ pub enum ExtendedProtocolData {
     },
     Bind {
         data: BytesMut,
-        metadata: Option<String>,
+        metadata: Option<(String, Arc<Parse>, u64)>,
+        plan: Option<Arc<StatementPlan>>,
     },
     Describe {
         data: BytesMut,
-        metadata: Option<String>,
+        metadata: Option<(String, Arc<Parse>, u64)>,
+        plan: Option<Arc<StatementPlan>>,
     },
     Execute {
         data: BytesMut,
@@ -791,6 +1177,10 @@ pub enum ExtendedProtocolData {
         data: BytesMut,
         close: Close,
     },
+    /// Answered by pgcat without involving the server.
+    Local {
+        response: BytesMut,
+    },
 }
 
 impl ExtendedProtocolData {
@@ -798,12 +1188,28 @@ impl ExtendedProtocolData {
         Self::Parse { data, metadata }
     }
 
-    pub fn create_new_bind(data: BytesMut, metadata: Option<String>) -> Self {
-        Self::Bind { data, metadata }
+    pub fn create_new_bind(
+        data: BytesMut,
+        metadata: Option<(String, Arc<Parse>, u64)>,
+        plan: Option<Arc<StatementPlan>>,
+    ) -> Self {
+        Self::Bind {
+            data,
+            metadata,
+            plan,
+        }
     }
 
-    pub fn create_new_describe(data: BytesMut, metadata: Option<String>) -> Self {
-        Self::Describe { data, metadata }
+    pub fn create_new_describe(
+        data: BytesMut,
+        metadata: Option<(String, Arc<Parse>, u64)>,
+        plan: Option<Arc<StatementPlan>>,
+    ) -> Self {
+        Self::Describe {
+            data,
+            metadata,
+            plan,
+        }
     }
 
     pub fn create_new_execute(data: BytesMut) -> Self {
@@ -812,6 +1218,14 @@ impl ExtendedProtocolData {
 
     pub fn create_new_close(data: BytesMut, close: Close) -> Self {
         Self::Close { data, close }
+    }
+
+    pub fn create_new_local(response: BytesMut) -> Self {
+        Self::Local { response }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local { .. })
     }
 }
 
@@ -826,6 +1240,9 @@ pub struct Parse {
     query: String,
     num_params: i16,
     param_types: Vec<i32>,
+    /// The SQL observer's classification of `query`, shared by the clients
+    /// holding this statement from the pool's cache. Never part of the frame.
+    observed: SharedSnap,
 }
 
 impl TryFrom<&BytesMut> for Parse {
@@ -833,15 +1250,16 @@ impl TryFrom<&BytesMut> for Parse {
 
     fn try_from(buf: &BytesMut) -> Result<Parse, Error> {
         let mut cursor = Cursor::new(buf);
-        let code = cursor.get_u8() as char;
-        let len = cursor.get_i32();
+        let code = cursor.take_u8()? as char;
+        let len = cursor.take_i32()?;
         let name = cursor.read_string()?;
         let query = cursor.read_string()?;
-        let num_params = cursor.get_i16();
-        let mut param_types = Vec::new();
+        let num_params = cursor.take_count()?;
+        check_remaining(&cursor, 4 * num_params)?;
+        let mut param_types = Vec::with_capacity(num_params);
 
         for _ in 0..num_params {
-            param_types.push(cursor.get_i32());
+            param_types.push(cursor.take_i32()?);
         }
 
         Ok(Parse {
@@ -849,8 +1267,9 @@ impl TryFrom<&BytesMut> for Parse {
             len,
             name,
             query,
-            num_params,
+            num_params: num_params as i16,
             param_types,
+            observed: SharedSnap::default(),
         })
     }
 }
@@ -872,13 +1291,13 @@ impl TryFrom<Parse> for BytesMut {
             + name.len()
             + query.len()
             + 2
-            + 4 * parse.num_params as usize;
+            + 4 * parse.param_types.len();
 
         bytes.put_u8(parse.code as u8);
         bytes.put_i32(len as i32);
         bytes.put_slice(name);
         bytes.put_slice(query);
-        bytes.put_i16(parse.num_params);
+        bytes.put_u16(parse.param_types.len() as u16);
         for param in parse.param_types {
             bytes.put_i32(param);
         }
@@ -909,7 +1328,16 @@ impl Parse {
     pub fn get_name(buf: &BytesMut) -> Result<String, Error> {
         let mut cursor = Cursor::new(buf);
         // Skip the code and length
+        cursor.skip(mem::size_of::<u8>() + mem::size_of::<i32>())?;
+        cursor.read_string()
+    }
+
+    /// Gets the query text from the buffer
+    pub fn get_query(buf: &BytesMut) -> Result<String, Error> {
+        let mut cursor = Cursor::new(buf);
+        // Skip the code and length
         cursor.advance(mem::size_of::<u8>() + mem::size_of::<i32>());
+        cursor.read_string()?;
         cursor.read_string()
     }
 
@@ -937,6 +1365,42 @@ impl Parse {
     pub fn anonymous(&self) -> bool {
         self.name.is_empty()
     }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn param_types(&self) -> &[i32] {
+        &self.param_types
+    }
+
+    /// The same statement under another name.
+    pub fn named(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Replace the query text, keeping the statement name and parameter types.
+    pub fn with_query(mut self, query: String) -> Self {
+        self.query = query;
+        self.observed = SharedSnap::default();
+        self
+    }
+
+    /// The SQL observer's classification of the query, once a client has
+    /// staged it (see `sql_observer::SharedSnap`).
+    pub fn observed(&self) -> &SharedSnap {
+        &self.observed
+    }
+
+    /// Declare the types of extra parameters `$n+1...` appended after the
+    /// client's `n` parameters. Types the client didn't declare stay unspecified (0).
+    pub fn with_appended_params(mut self, client_params: usize, types: &[i32]) -> Self {
+        self.param_types.resize(client_params, 0);
+        self.param_types.extend_from_slice(types);
+        self.num_params = self.param_types.len() as i16;
+        self
+    }
 }
 
 /// Bind (B) message.
@@ -961,26 +1425,29 @@ impl TryFrom<&BytesMut> for Bind {
 
     fn try_from(buf: &BytesMut) -> Result<Bind, Error> {
         let mut cursor = Cursor::new(buf);
-        let code = cursor.get_u8() as char;
-        let len = cursor.get_i32();
+        let code = cursor.take_u8()? as char;
+        let len = cursor.take_i32()?;
         let portal = cursor.read_string()?;
         let prepared_statement = cursor.read_string()?;
-        let num_param_format_codes = cursor.get_i16();
-        let mut param_format_codes = Vec::new();
+        let num_param_format_codes = cursor.take_count()?;
+        check_remaining(&cursor, 2 * num_param_format_codes)?;
+        let mut param_format_codes = Vec::with_capacity(num_param_format_codes);
 
         for _ in 0..num_param_format_codes {
-            param_format_codes.push(cursor.get_i16());
+            param_format_codes.push(cursor.take_i16()?);
         }
 
-        let num_param_values = cursor.get_i16();
-        let mut param_values = Vec::new();
+        let num_param_values = cursor.take_count()?;
+        check_remaining(&cursor, 4 * num_param_values)?;
+        let mut param_values = Vec::with_capacity(num_param_values);
 
         for _ in 0..num_param_values {
-            let param_len = cursor.get_i32();
+            let param_len = cursor.take_i32()?;
             // There is special occasion when the parameter is NULL
             // In that case, param length is defined as -1
             // So if the passed parameter len is over 0
             if param_len > 0 {
+                check_remaining(&cursor, param_len as usize)?;
                 let mut param = BytesMut::with_capacity(param_len as usize);
                 param.resize(param_len as usize, b'0');
                 cursor.copy_to_slice(&mut param);
@@ -994,11 +1461,12 @@ impl TryFrom<&BytesMut> for Bind {
             }
         }
 
-        let num_result_column_format_codes = cursor.get_i16();
-        let mut result_columns_format_codes = Vec::new();
+        let num_result_column_format_codes = cursor.take_count()?;
+        check_remaining(&cursor, 2 * num_result_column_format_codes)?;
+        let mut result_columns_format_codes = Vec::with_capacity(num_result_column_format_codes);
 
         for _ in 0..num_result_column_format_codes {
-            result_columns_format_codes.push(cursor.get_i16());
+            result_columns_format_codes.push(cursor.take_i16()?);
         }
 
         Ok(Bind {
@@ -1006,11 +1474,11 @@ impl TryFrom<&BytesMut> for Bind {
             len: len as i64,
             portal,
             prepared_statement,
-            num_param_format_codes,
+            num_param_format_codes: num_param_format_codes as i16,
             param_format_codes,
-            num_param_values,
+            num_param_values: num_param_values as i16,
             param_values,
-            num_result_column_format_codes,
+            num_result_column_format_codes: num_result_column_format_codes as i16,
             result_columns_format_codes,
         })
     }
@@ -1032,29 +1500,30 @@ impl TryFrom<Bind> for BytesMut {
             + portal.len()
             + prepared_statement.len()
             + 2 // num_param_format_codes
-            + 2 * bind.num_param_format_codes as usize // num_param_format_codes
+            + 2 * bind.param_format_codes.len() // num_param_format_codes
             + 2; // num_param_values
 
         for (param_len, _) in &bind.param_values {
-            len += 4 + *param_len as usize;
+            // NULL parameters have a length of -1 and no data.
+            len += 4 + (*param_len).max(0) as usize;
         }
         len += 2; // num_result_column_format_codes
-        len += 2 * bind.num_result_column_format_codes as usize;
+        len += 2 * bind.result_columns_format_codes.len();
 
         bytes.put_u8(bind.code as u8);
         bytes.put_i32(len as i32);
         bytes.put_slice(portal);
         bytes.put_slice(prepared_statement);
-        bytes.put_i16(bind.num_param_format_codes);
+        bytes.put_u16(bind.param_format_codes.len() as u16);
         for param_format_code in bind.param_format_codes {
             bytes.put_i16(param_format_code);
         }
-        bytes.put_i16(bind.num_param_values);
+        bytes.put_u16(bind.param_values.len() as u16);
         for (param_len, param) in bind.param_values {
             bytes.put_i32(param_len);
             bytes.put_slice(&param);
         }
-        bytes.put_i16(bind.num_result_column_format_codes);
+        bytes.put_u16(bind.result_columns_format_codes.len() as u16);
         for result_column_format_code in bind.result_columns_format_codes {
             bytes.put_i16(result_column_format_code);
         }
@@ -1064,11 +1533,23 @@ impl TryFrom<Bind> for BytesMut {
 }
 
 impl Bind {
+    pub fn portal(&self) -> &str {
+        &self.portal
+    }
+
+    /// Gets the name of the portal from the buffer
+    pub fn get_portal(buf: &BytesMut) -> Result<String, Error> {
+        let mut cursor = Cursor::new(buf);
+        // Skip the code and length
+        cursor.skip(mem::size_of::<u8>() + mem::size_of::<i32>())?;
+        cursor.read_string()
+    }
+
     /// Gets the name of the prepared statement from the buffer
     pub fn get_name(buf: &BytesMut) -> Result<String, Error> {
         let mut cursor = Cursor::new(buf);
         // Skip the code and length
-        cursor.advance(mem::size_of::<u8>() + mem::size_of::<i32>());
+        cursor.skip(mem::size_of::<u8>() + mem::size_of::<i32>())?;
         cursor.read_string()?;
         cursor.read_string()
     }
@@ -1077,8 +1558,8 @@ impl Bind {
     pub fn rename(buf: BytesMut, new_name: &str) -> Result<BytesMut, Error> {
         let mut cursor = Cursor::new(&buf);
         // Read basic data from the cursor
-        let code = cursor.get_u8();
-        let current_len = cursor.get_i32();
+        let code = cursor.take_u8()?;
+        let current_len = cursor.take_i32()?;
         let portal = cursor.read_string()?;
         let prepared_statement = cursor.read_string()?;
 
@@ -1105,6 +1586,123 @@ impl Bind {
     pub fn anonymous(&self) -> bool {
         self.prepared_statement.is_empty()
     }
+
+    /// The parameter values with one format code per value.
+    pub fn params(&self) -> BindParams {
+        let formats = (0..self.param_values.len())
+            .map(|i| match self.param_format_codes.len() {
+                0 => 0,
+                1 => self.param_format_codes[0],
+                _ => self.param_format_codes.get(i).copied().unwrap_or(0),
+            })
+            .collect();
+
+        let values = self
+            .param_values
+            .iter()
+            .map(|(len, value)| {
+                if *len < 0 {
+                    None
+                } else {
+                    Some(value.clone().freeze())
+                }
+            })
+            .collect();
+
+        BindParams {
+            formats,
+            values,
+            result_formats: self.result_columns_format_codes.clone(),
+            modified: false,
+        }
+    }
+
+    /// Replace the parameter values (and result format codes). Format codes are
+    /// written with as few codes as possible: none if all are text, one if they
+    /// are all the same, one per parameter otherwise.
+    pub fn with_params(mut self, params: BindParams) -> Bind {
+        self.param_format_codes = if params.formats.iter().all(|format| *format == 0) {
+            Vec::new()
+        } else if params.formats.windows(2).all(|pair| pair[0] == pair[1]) {
+            vec![params.formats[0]]
+        } else {
+            params.formats.clone()
+        };
+        self.num_param_format_codes = self.param_format_codes.len() as i16;
+
+        self.param_values = params
+            .values
+            .into_iter()
+            .map(|value| match value {
+                Some(value) => (value.len() as i32, BytesMut::from(&value[..])),
+                None => (-1, BytesMut::new()),
+            })
+            .collect();
+        self.num_param_values = self.param_values.len() as i16;
+
+        self.num_result_column_format_codes = params.result_formats.len() as i16;
+        self.result_columns_format_codes = params.result_formats;
+
+        self
+    }
+}
+
+/// Parameter values of a Bind message, as seen by plugins.
+/// Formats are 0 (text) or 1 (binary); a `None` value is NULL.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BindParams {
+    formats: Vec<i16>,
+    values: Vec<Option<Bytes>>,
+    result_formats: Vec<i16>,
+    modified: bool,
+}
+
+impl BindParams {
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn format(&self, index: usize) -> i16 {
+        self.formats[index]
+    }
+
+    pub fn value(&self, index: usize) -> Option<&[u8]> {
+        self.values[index].as_deref()
+    }
+
+    /// Replace parameter `index`.
+    pub fn set(&mut self, index: usize, format: i16, value: Option<Vec<u8>>) {
+        self.formats[index] = format;
+        self.values[index] = value.map(Bytes::from);
+        self.modified = true;
+    }
+
+    /// Append a parameter after the existing ones.
+    pub fn push(&mut self, format: i16, value: Option<Vec<u8>>) {
+        self.formats.push(format);
+        self.values.push(value.map(Bytes::from));
+        self.modified = true;
+    }
+
+    /// Result column format codes as sent by the client (none, one for all
+    /// columns, or one per column).
+    pub fn result_formats(&self) -> &[i16] {
+        &self.result_formats
+    }
+
+    pub fn set_result_formats(&mut self, formats: Vec<i16>) {
+        self.result_formats = formats;
+        self.modified = true;
+    }
+
+    /// The parameters were changed and the Bind must be rewritten.
+    pub fn modified(&self) -> bool {
+        self.modified
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1122,9 +1720,9 @@ impl TryFrom<&BytesMut> for Describe {
 
     fn try_from(bytes: &BytesMut) -> Result<Describe, Error> {
         let mut cursor = Cursor::new(bytes);
-        let code = cursor.get_u8() as char;
-        let len = cursor.get_i32();
-        let target = cursor.get_u8() as char;
+        let code = cursor.take_u8()? as char;
+        let len = cursor.take_i32()?;
+        let target = cursor.take_u8()? as char;
         let statement_name = cursor.read_string()?;
 
         Ok(Describe {
@@ -1174,6 +1772,20 @@ impl Describe {
     }
 }
 
+/// Execute (F) message.
+/// See: <https://www.postgresql.org/docs/current/protocol-message-formats.html>
+pub struct Execute;
+
+impl Execute {
+    /// Gets the name of the portal from the buffer
+    pub fn get_portal(buf: &BytesMut) -> Result<String, Error> {
+        let mut cursor = Cursor::new(buf);
+        // Skip the code and length
+        cursor.skip(mem::size_of::<u8>() + mem::size_of::<i32>())?;
+        cursor.read_string()
+    }
+}
+
 /// Close (F) message.
 /// See: <https://www.postgresql.org/docs/current/protocol-message-formats.html>
 #[derive(Clone, Debug)]
@@ -1190,9 +1802,9 @@ impl TryFrom<&BytesMut> for Close {
 
     fn try_from(bytes: &BytesMut) -> Result<Close, Error> {
         let mut cursor = Cursor::new(bytes);
-        let code = cursor.get_u8() as char;
-        let len = cursor.get_i32();
-        let close_type = cursor.get_u8() as char;
+        let code = cursor.take_u8()? as char;
+        let len = cursor.take_i32()?;
+        let close_type = cursor.take_u8()? as char;
         let name = cursor.read_string()?;
 
         Ok(Close {
@@ -1225,6 +1837,10 @@ impl TryFrom<Close> for BytesMut {
 }
 
 impl Close {
+    pub fn is_portal(&self) -> bool {
+        self.close_type == 'P'
+    }
+
     pub fn new(name: &str) -> Close {
         let name = name.to_string();
 
@@ -1433,6 +2049,331 @@ impl PgErrorMsg {
 mod tests {
     use crate::messages::PgErrorMsg;
     use log::{error, info};
+
+    /// Messages of several sizes, one larger than a client's read buffer.
+    fn stream_of_messages() -> Vec<bytes::BytesMut> {
+        let close: bytes::BytesMut = super::Close::new("PGCAT_1").try_into().unwrap();
+        vec![
+            super::simple_query("SELECT 1"),
+            super::sync(),
+            close,
+            super::data_row(&vec!["x".repeat(10_000)]),
+            super::flush(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_read_message_whatever_each_read_returns() {
+        use tokio::io::AsyncWriteExt;
+
+        let messages = stream_of_messages();
+        let stream = messages.concat();
+        for read_size in [1, 2, 3, 5, 4096] {
+            // Each read of the duplex returns at most `read_size` bytes.
+            let (mut client, mut pgcat) = tokio::io::duplex(read_size);
+            let send = async {
+                client.write_all(&stream).await.unwrap();
+                client.shutdown().await.unwrap();
+            };
+            let receive = async {
+                let mut received = Vec::new();
+                for _ in 0..messages.len() {
+                    received.push(super::read_message(&mut pgcat).await.unwrap());
+                }
+                assert!(super::read_message(&mut pgcat).await.is_err());
+                received
+            };
+            let ((), received) = tokio::join!(send, receive);
+            assert_eq!(received, messages, "reads of {} bytes", read_size);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_message_reserves_as_the_body_arrives() {
+        use crate::test_allocator::take_largest;
+        use tokio::io::AsyncWriteExt;
+
+        // Claims about 1 GB, sends 100 bytes and hangs up.
+        let mut stream = vec![b'Q'];
+        stream.extend((1i32 << 30).to_be_bytes());
+        stream.extend([b'x'; 100]);
+        take_largest();
+        assert!(super::read_message(&mut &stream[..]).await.is_err());
+        assert!(take_largest() <= super::MESSAGE_PREALLOCATION);
+
+        // A body larger than that is still read whole, in memory that grows
+        // with it.
+        let body = vec![b'x'; 1 << 20];
+        let message = super::data_row(&vec![String::from_utf8(body).unwrap()]);
+        let (mut client, mut pgcat) = tokio::io::duplex(4096);
+        let send = async {
+            client.write_all(&message).await.unwrap();
+        };
+        let ((), read) = tokio::join!(send, super::read_message(&mut pgcat));
+        assert_eq!(read.unwrap(), message);
+    }
+
+    #[tokio::test]
+    async fn test_read_message_fuzz() {
+        for seed in 0..5_000 {
+            let mut rng = crate::fuzz::Rng::new(seed);
+            // Messages end to end, the last length maybe invalid, the stream
+            // cut anywhere.
+            let mut stream = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                stream.push(rng.next_u64() as u8);
+                let len = rng.below(48) as i32 - 8;
+                stream.extend(len.to_be_bytes());
+                if len < 4 {
+                    break;
+                }
+                stream.extend((4..len).map(|_| rng.next_u64() as u8));
+            }
+            stream.truncate(rng.below(stream.len() + 1));
+
+            let mut reader = &stream[..];
+            while let Ok(message) = super::read_message(&mut reader).await {
+                let len = i32::from_be_bytes([message[1], message[2], message[3], message[4]]);
+                assert!(len >= 4, "seed {}", seed);
+                assert_eq!(message.len(), len as usize + 1, "seed {}", seed);
+            }
+        }
+    }
+
+    #[test]
+    fn test_message_parsers_fuzz() {
+        use super::*;
+
+        fn message(code: u8, body: &[u8]) -> Vec<u8> {
+            let mut message = vec![code];
+            message.extend(((body.len() + 4) as i32).to_be_bytes());
+            message.extend(body);
+            message
+        }
+        let parse = message(b'P', b"s\0SELECT $1, $2\0\0\x02\0\0\0\x17\0\0\0\x19");
+        let bind = message(
+            b'B',
+            b"p\0s\0\0\x01\0\x01\0\x02\0\0\0\x02hi\xff\xff\xff\xff\0\x01\0\0",
+        );
+        let seeds = [
+            parse,
+            bind,
+            message(b'D', b"Ss\0"),
+            message(b'E', b"p\0\0\0\0\0"),
+            message(b'C', b"Pp\0"),
+            row_description(&vec![("a", DataType::Text), ("b", DataType::Int4)]).to_vec(),
+            data_row_nullable(&vec![Some("x".into()), None]).to_vec(),
+        ];
+
+        for seed in 0..20_000 {
+            let mut rng = crate::fuzz::Rng::new(seed);
+            let original = rng.pick(&seeds).clone();
+            let mutant = BytesMut::from(&rng.mutate(&original)[..]);
+            // Whatever the bytes, each returns, Ok or Err.
+            let _ = Parse::try_from(&mutant);
+            let _ = Parse::get_name(&mutant);
+            let _ = Bind::try_from(&mutant);
+            let _ = Bind::get_name(&mutant);
+            let _ = Bind::get_portal(&mutant);
+            let _ = Describe::try_from(&mutant);
+            let _ = Execute::get_portal(&mutant);
+            let _ = Close::try_from(&mutant);
+            let _ = RowDescription::try_from(&mutant[..]);
+            let _ = DataRow::try_from(&mutant[..]);
+            let _ = split_messages(&mutant);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_message_stream_cut_anywhere() {
+        let messages = stream_of_messages();
+        let stream = messages.concat();
+        let ends: Vec<usize> = messages
+            .iter()
+            .scan(0, |end, message| {
+                *end += message.len();
+                Some(*end)
+            })
+            .collect();
+        for cut in 0..stream.len() {
+            let whole = ends.iter().filter(|end| **end <= cut).count();
+            let mut cut_stream = &stream[..cut];
+            for message in &messages[..whole] {
+                assert_eq!(
+                    &super::read_message(&mut cut_stream).await.unwrap(),
+                    message
+                );
+            }
+            assert!(
+                super::read_message(&mut cut_stream).await.is_err(),
+                "cut at byte {}",
+                cut
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_messages() {
+        use super::{bind_complete, parse_complete, ready_for_query, split_messages};
+        use bytes::BufMut;
+
+        let mut buf = bytes::BytesMut::new();
+        buf.put(parse_complete());
+        buf.put(bind_complete());
+        buf.put(ready_for_query(true));
+
+        let messages = split_messages(&buf).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0], parse_complete());
+        assert_eq!(messages[1], bind_complete());
+        assert_eq!(messages[2], ready_for_query(true));
+
+        // Truncated input is an error, not a panic.
+        assert!(split_messages(&buf[..buf.len() - 1]).is_err());
+        assert!(split_messages(&buf[..3]).is_err());
+        assert!(split_messages(&[]).unwrap().is_empty());
+    }
+
+    /// Bind for `statement` with (format, value) parameters and result format codes.
+    fn bind_message(
+        statement: &str,
+        format_codes: &[i16],
+        values: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) -> bytes::BytesMut {
+        use bytes::BufMut;
+
+        let mut payload = bytes::BytesMut::new();
+        payload.put_slice(format!("portal\0{}\0", statement).as_bytes());
+        payload.put_i16(format_codes.len() as i16);
+        for code in format_codes {
+            payload.put_i16(*code);
+        }
+        payload.put_i16(values.len() as i16);
+        for value in values {
+            match value {
+                Some(value) => {
+                    payload.put_i32(value.len() as i32);
+                    payload.put_slice(value);
+                }
+                None => payload.put_i32(-1),
+            }
+        }
+        payload.put_i16(result_formats.len() as i16);
+        for code in result_formats {
+            payload.put_i16(*code);
+        }
+
+        let mut message = bytes::BytesMut::from(&b"B"[..]);
+        message.put_i32(payload.len() as i32 + 4);
+        message.put(payload);
+        message
+    }
+
+    #[test]
+    fn test_bind_params_round_trip() {
+        use super::Bind;
+
+        // No format codes: everything is text. NULL and empty values survive.
+        let message = bind_message("s", &[], &[Some(b"a"), None, Some(b"")], &[1]);
+        let bind: Bind = (&message).try_into().unwrap();
+        let params = bind.params();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params.format(0), 0);
+        assert_eq!(params.value(0), Some(&b"a"[..]));
+        assert_eq!(params.value(1), None);
+        assert_eq!(params.value(2), Some(&b""[..]));
+        assert_eq!(params.result_formats(), &[1]);
+        assert!(!params.modified());
+
+        // Unchanged params serialize back to the original message.
+        let rewritten: bytes::BytesMut = bind.with_params(params).try_into().unwrap();
+        assert_eq!(rewritten, message);
+    }
+
+    #[test]
+    fn test_bind_params_format_codes() {
+        use super::Bind;
+
+        // One code applies to all parameters.
+        let message = bind_message("s", &[1], &[Some(b"\x00\x01"), Some(b"\x02")], &[]);
+        let bind: Bind = (&message).try_into().unwrap();
+        let mut params = bind.params();
+        assert_eq!(params.format(1), 1);
+
+        // Appending a binary parameter keeps a single code.
+        params.push(1, Some(vec![9]));
+        let rewritten: bytes::BytesMut = bind.clone().with_params(params).try_into().unwrap();
+        assert_eq!(
+            rewritten,
+            bind_message(
+                "s",
+                &[1],
+                &[Some(b"\x00\x01"), Some(b"\x02"), Some(&[9])],
+                &[]
+            )
+        );
+
+        // Appending a text parameter needs one code per parameter.
+        let mut params = bind.clone().params();
+        params.push(0, None);
+        let rewritten: bytes::BytesMut = bind.clone().with_params(params).try_into().unwrap();
+        assert_eq!(
+            rewritten,
+            bind_message(
+                "s",
+                &[1, 1, 0],
+                &[Some(b"\x00\x01"), Some(b"\x02"), None],
+                &[]
+            )
+        );
+
+        // Per-parameter codes that end up all text collapse to none.
+        let message = bind_message("s", &[0, 1], &[Some(b"a"), Some(b"b")], &[0, 1]);
+        let bind: Bind = (&message).try_into().unwrap();
+        let mut params = bind.params();
+        params.set(1, 0, Some(b"c".to_vec()));
+        params.set_result_formats(vec![1, 1, 1]);
+        let rewritten: bytes::BytesMut = bind.with_params(params).try_into().unwrap();
+        assert_eq!(
+            rewritten,
+            bind_message("s", &[], &[Some(b"a"), Some(b"c")], &[1, 1, 1])
+        );
+    }
+
+    #[test]
+    fn test_parse_with_appended_params() {
+        use super::Parse;
+        use bytes::BufMut;
+
+        let mut message = bytes::BytesMut::from(&b"P"[..]);
+        let payload = b"s\0INSERT INTO t (a, b) VALUES ($1, $2)\0";
+        message.put_i32(4 + payload.len() as i32 + 2 + 4);
+        message.put_slice(payload);
+        message.put_i16(1);
+        message.put_i32(25);
+
+        let parse: Parse = (&message).try_into().unwrap();
+        let parse = parse.with_appended_params(2, &[17, 23]);
+        assert_eq!(parse.param_types(), &[25, 0, 17, 23]);
+
+        let bytes: bytes::BytesMut = parse.clone().try_into().unwrap();
+        let reparsed: Parse = (&bytes).try_into().unwrap();
+        assert_eq!(reparsed.param_types(), &[25, 0, 17, 23]);
+        assert_eq!(reparsed.query(), parse.query());
+    }
+
+    #[test]
+    fn test_parameter_description() {
+        use super::parameter_description;
+
+        let message = parameter_description(&[23, 25]);
+        assert_eq!(
+            &message[..],
+            &[b't', 0, 0, 0, 14, 0, 2, 0, 0, 0, 23, 0, 0, 0, 25]
+        );
+        assert_eq!(&parameter_description(&[])[..], &[b't', 0, 0, 0, 6, 0, 0]);
+    }
 
     fn field(kind: char, content: &str) -> Vec<u8> {
         format!("{kind}{content}\0").as_bytes().to_vec()

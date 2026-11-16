@@ -18,7 +18,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set package version
       if: github.event_name == 'push'  # For push event
       run: |
@@ -27,9 +27,11 @@ jobs:
     - name: Set package version (manual dispatch)
       if: github.event_name == 'workflow_dispatch'  # For manual dispatch
       run: echo "packageVersion=${{ github.event.inputs.packageVersion }}" >> "$GITHUB_ENV"
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
+    # actions-rs/toolchain is archived and runs on Node 12, which runners no longer provide.
+    - name: Install Rust
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup default stable
     - name: Install dependencies
       env:
         DEBIAN_FRONTEND: noninteractive

@@ -12,7 +12,7 @@ else
 fi
 
 cd "$script_dir/.."
-cargo build --release
+cargo build --release || exit $?
 
 rm -rf "$deb_dir"
 mkdir -p "$deb_dir/DEBIAN"

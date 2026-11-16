@@ -30,6 +30,8 @@ pub enum Error {
     QueryRouterError(String),
     InvalidShardId(usize),
     PreparedStatementError,
+    /// A plugin rejected the statement, the message is sent to the client.
+    PluginError(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -119,6 +121,8 @@ impl std::fmt::Display for Error {
             &Error::ServerAuthError(error, server_identifier) => {
                 write!(f, "{} for {}", error, server_identifier,)
             }
+
+            &Error::PluginError(error) => write!(f, "{}", error),
 
             // The rest can use Debug.
             err => write!(f, "{:?}", err),

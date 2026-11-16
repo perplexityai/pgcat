@@ -162,6 +162,15 @@ default: 5
 
 Number of worker threads the Runtime will use (4 by default).
 
+### plugin_hook_concurrency
+```
+path: general.plugin_hook_concurrency
+default: 256
+```
+
+Most plugin hooks that may run at once in the whole process. A hook that finds none free waits
+within its pool's `plugin_hook_timeout`. Read when pgcat starts.
+
 ### tcp_keepalives_idle
 ```
 path: general.tcp_keepalives_idle
@@ -381,6 +390,323 @@ every incoming query to determine if it's a read or a write.
 If it's a read query, we'll direct it to a replica. Otherwise, if it's a write,
 we'll direct it to the primary.
 
+### plugins_require_parse
+```
+path: pools.<pool_name>.plugins_require_parse
+default: false
+```
+
+If plugins are configured and this setting is enabled, queries the query parser can't handle
+(syntax it doesn't understand, or longer than `query_parser_max_length`) that might touch a table
+a plugin checks are rejected with an error instead of being forwarded to the server without the
+plugins seeing them. A query might touch such a table if its text names one (in any case), or has
+Unicode escapes (`U&"..."`), which can spell any name. Other queries the parser can't handle are
+forwarded, for the server to answer. `ONLY` before a table name counts as something the parser
+can't handle: it reads `FROM ONLY t` as a table named `ONLY`.
+
+A plugin configured in a pool's `[plugins.<name>]` section refuses, while it's on, every query the
+parser can't handle on that pool, with or without this setting, unless it declares that it checks
+only some tables (see docs/plugin-registration.md). `RESET` is still forwarded.
+
+Statements pgcat refuses, here or in a plugin, fail like statements the server refuses: with an
+ERROR (the connection stays usable) and a SQLSTATE, `0A000` for queries pgcat can't parse, `42501`
+for statements a plugin denies and `XX000` for a plugin that failed, unless the plugin gives its own.
+A refused statement inside a transaction fails the transaction, so the rest of it can't commit: the
+client can only roll it back.
+
+### plugin_hook_timeout
+```
+path: pools.<pool_name>.plugin_hook_timeout
+default: 5000 # milliseconds
+```
+
+Longest a plugin may take on one statement, waiting for a free hook slot (see
+`plugin_hook_concurrency`) included. A plugin that takes longer fails the statement with `PH001`
+(`PH002` if it never got a slot), instead of holding the client's connection. The same bound
+applies to a configured plugin verifying a `SET PGCAT_IDENTITY` token: the `SET` fails with
+`PH001` or `PH002`, and the previous identity is cleared.
+
+### identity_required_for_plugins
+```
+path: pools.<pool_name>.identity_required_for_plugins
+default: false
+```
+
+If enabled, plugins that support it reject the statements they cover when the client hasn't
+attached a caller identity to its connection. Each plugin decides which statements it covers; the
+built-in `table_access`, `intercept`, `query_logger` and `prewarmer` plugins ignore this setting.
+A configured plugin (see `pools.<pool_name>.plugins.<name>` Sections) can require it on the pools
+it's enabled on. Clients attach an identity with commands answered by pgcat itself, over the simple
+or extended protocol:
+
+```sql
+SET PGCAT_IDENTITY TO '<token>';  -- or SET PGCAT_IDENTITY = '<token>'
+SHOW PGCAT_IDENTITY;              -- whether it's set, and a fingerprint (never the token)
+RESET PGCAT_IDENTITY;
+```
+
+What the identity is attached to, and for how long:
+
+- **The client connection.** pgcat keeps the token on the client connection, not on a server
+  connection, so it survives transaction pooling: an autocommit statement carries it without a
+  `BEGIN`, and so does every statement after it.
+- **Until the client replaces or clears it.** It's held until the next `SET PGCAT_IDENTITY`,
+  `RESET PGCAT_IDENTITY`, `DISCARD ALL` or `RESET ALL`, or until the client disconnects.
+  `COMMIT` and `ROLLBACK` don't touch it, including the `ROLLBACK` of a transaction it was set
+  in. A plugin that verifies tokens (see below) can refuse one: the `SET` then fails and the
+  previous identity is cleared too. An identity whose verified token expires is forgotten.
+- **Never sent to Postgres.** The commands are answered by pgcat, and take effect when pgcat
+  answers them: one in a batch pgcat refuses (one that also has statements for the server)
+  changes nothing. Queries that mix an identity command with other SQL, or use another form of
+  it (`SET LOCAL PGCAT_IDENTITY`), are rejected so the token can't reach the server, its logs or
+  `pg_stat_statements`. So are `SET`, `RESET` and `SHOW` of a setting named with Unicode escapes
+  (`SET U&"..."`), which pgcat doesn't decode, and `set_config()` calls whose name is
+  `pgcat_identity` (in any case, also as `pg_catalog.set_config` or in a `DO` block), or isn't a
+  string literal in a query that mentions `pgcat_identity` or has Unicode escapes. These are all
+  refused with `0A000`. Other SQL goes to Postgres as it is, with any token a client puts in a
+  literal, or in a `set_config()` whose name pgcat can't read (an expression that doesn't spell
+  it, a bound parameter or, on a pool without `identity_tenant_parameter`, a name with backslash
+  escapes after the client turns `standard_conforming_strings` off). pgcat logs a fingerprint
+  instead of the token. Fingerprints are keyed per pgcat process: the same token has a different
+  one on another pgcat instance or after a restart, so they only correlate log lines of one
+  process.
+
+### identity_tenant_parameter
+```
+path: pools.<pool_name>.identity_tenant_parameter
+default: <none>
+example: "app.tenant"
+```
+
+A custom session parameter that carries the tenant of the client's identity to Postgres, so that
+row-level security can use it in autocommit statements and transactions alike:
+
+```sql
+CREATE POLICY tenant_rows ON accounts
+  USING (tenant_id::text = NULLIF(current_setting('app.tenant', true), ''));
+```
+
+The tenant comes from a plugin that verifies the token of `SET PGCAT_IDENTITY`, one in a
+`plugins.<name>` section (below). A pool has one such plugin at most; with none there is no
+tenant. A pool with one must set this parameter: pgcat refuses to start otherwise. pgcat treats
+the parameter like the startup parameters it tracks: when a client checks out a server
+connection, and before each of its statements is sent, pgcat sets the parameter to the client's
+tenant, or resets it if the client has none. A server connection
+therefore carries a client's tenant only while that client is using it: the next client sets its
+own tenant or resets it before its first statement. Read the parameter with `missing_ok`
+(`current_setting(name, true)`): it's NULL on a connection pgcat never set it on and `''` after
+a reset.
+
+Postgres doesn't report custom parameters back, so pgcat tracks what it set on each server
+connection. It sets the parameter at every checkout, since the last client's statements may have
+changed it without naming it (a function, view, rule or default that sets it). Within a checkout
+it sets it again when it can't be sure: after a transaction in which it set it ends (a `ROLLBACK` undoes a `SET`) or rolls back to a savepoint,
+and after the client or pgcat's cleanup runs `DISCARD ALL` or `RESET ALL`. It also sets it again
+after any statement that could name it (one that mentions both parts of its name, `set_config`,
+`EXECUTE` or a Unicode escape) and wasn't rejected, in case it changed the parameter anyway.
+
+One case is left: when pgcat sets the parameter inside a transaction (the client changed its
+identity in it, or pgcat had to set it again), and the client sends `ROLLBACK` and more statements
+in one simple query, those statements run with the value from before the transaction. That value
+is the same client's earlier tenant, never another client's: the server connection stays with the
+client for the whole transaction.
+
+Clients can't set the parameter themselves: queries that `SET` or `RESET` it (also in
+`ALTER ... SET` or a function's `SET` clause), or call `set_config()` with its name or with a name
+that isn't a string literal, are rejected (`42501`). So are queries pgcat can't read as Postgres
+would: ones with Unicode escapes (`U&'...'`, `U&"..."`), which can spell the parameter or
+`set_config` without writing either, and every `DO` block and `CREATE FUNCTION` or
+`CREATE PROCEDURE`, whose bodies are SQL with their own quoting and escapes inside a string.
+pgcat can't see what existing database objects do, so the database has to keep the client from
+changing the parameter through them (see below).
+
+pgcat finds these statements by reading queries the way Postgres splits them into strings and
+comments, which depends on `standard_conforming_strings` and `client_encoding`. In a pool with
+this setting, clients can't change either (`SET client_encoding` or `SET NAMES` to UTF8 is
+allowed), and a client whose session would have `standard_conforming_strings` off or a client
+encoding other than UTF8, from its startup parameters or the database's defaults, is refused at
+connection with `0A000`. If the server reports either later (a function changed it), the client
+is disconnected with the same error and the server connection is closed.
+
+Row-level security only holds if the database also keeps the pool's role under it:
+
+- The role doesn't own the tables (owners bypass their policies unless the table has
+  `FORCE ROW LEVEL SECURITY`), and isn't a superuser or `BYPASSRLS`.
+- The role can't `SET ROLE` or `SET SESSION AUTHORIZATION` to a role that is any of those: it
+  isn't a member of one.
+- The role can't execute any function or procedure that sets the tenant parameter (revoke
+  `EXECUTE` on such functions from `PUBLIC`), and no view, rule, trigger or column default it can
+  reach calls one. Not creating or owning one isn't enough: calling one is.
+- The role can't create such objects: it has no `CREATE` on any schema, and no `TEMPORARY` on the
+  database (`REVOKE TEMPORARY ON DATABASE ... FROM PUBLIC`), which also stops temporary views,
+  rules and column defaults, and temporary tables. Revoking `USAGE ON LANGUAGE plpgsql` from
+  `PUBLIC` also stops `DO` blocks at the database.
+- The database and role defaults keep `standard_conforming_strings` on, and the database encoding
+  lets clients use UTF8.
+
+If a function that sets the parameter is reachable anyway, pgcat can't stop a statement from
+calling it and reading under the changed value in the same statement (`SELECT set_tenant('x'),
+(SELECT ... FROM docs)`), nor the same client's later statements in that checkout from running
+under it. The next checkout sets the client's tenant again.
+
+### plugin_response_batch_rows
+```
+path: pools.<pool_name>.plugin_response_batch_rows
+default: 500
+```
+
+Plugins that rewrite result rows receive them in batches of up to this many rows.
+
+### plugin_response_batch_bytes
+```
+path: pools.<pool_name>.plugin_response_batch_bytes
+default: 1048576 # 1 MB
+```
+
+Plugins that rewrite result rows receive them in batches of up to this many bytes,
+or `plugin_response_batch_rows` rows, whichever comes first.
+
+### sql_observer_enabled
+```
+path: pools.<pool_name>.sql_observer_enabled
+default: false
+```
+
+If enabled, pgcat counts the SQL statements clients send for execution through the pool and
+exports the counts with the Prometheus metrics. A statement is counted once, when pgcat admits
+it, as the client wrote it: before plugins rewrite or refuse it, and whether or not the server
+then runs it. Commands pgcat answers itself (`PGCAT_IDENTITY`, its custom commands) and the SQL
+pgcat sends on its own are not counted.
+
+Simple queries the query parser parsed are counted, and so is the first Execute of each portal
+whose statement the parser parsed (once per Bind, as the client Parsed it; fetching more rows
+with further Executes counts nothing). The count is a lower bound, except after pgcat refuses a
+rebind of a portal, which can count that portal's next Execute again (it then fails at the
+server, as the refusal fails the transaction). What pgcat could not count is
+reported as gap events: each one is a message whose statements went uncounted, not a number of
+statements. To count Executes pgcat keeps a small, fixed-size record per client (at most 128
+statements and 128 portals, names up to 128 bytes, kept as keyed hashes rather than copies, at
+most 16,512 bytes in all), allocated only for clients of pools that observe. The relation
+classifier's 16 KiB scratch is one per worker thread, not per client. When the record overflows
+or is invalidated, it is dropped, never grown, and the Executes it can't account for are gap
+events.
+
+With the prepared statement cache on (a transaction-mode pool with a nonzero
+[`prepared_statements_cache_size`](#prepared_statements_cache_size)), a named statement isn't kept
+in this record. Its classification is kept once on the pool's cached statement, set by the first
+client whose Parse of that SQL text the parser parsed and no plugin rewrote, so it depends only on
+the SQL text and the pool's parser and observer config, and pgcat finds it through the client's own
+prepared statements, so the 128-statement bound doesn't apply to it: it is counted for as long as
+the client's prepared statement makes it run. Each cached statement pgcat holds is 48 bytes larger
+for this, with the observer off too. Where the cached statement's classification isn't this client's
+(the unnamed statement, statements a plugin rewrote, and statements this client classified
+differently), the client's own is kept with the client's prepared statement, so it goes, and is put
+back, with it; each hash bucket of a client's prepared statements is 16 bytes larger for this, also
+with the observer off, and with the observer on each statement with its own classification takes one
+44-byte allocation, made with its Parse. The record still keeps the statements pgcat answers itself,
+as well as all portals; with the cache on, these tables start empty and grow as they are used, up to
+the same 128 entries each, so a client binding more than 128 distinct portals still overflows. With
+the cache off, the record and its bounds are as described above.
+
+What a batch of extended protocol messages stages in the record stands once staged: pgcat doesn't
+take it back when it refuses the batch or the server answers it with an error, and counts already
+made stay. A name the batch defined counts when it is executed, though the server may not have
+created it. A name the batch redefined counts as the new definition until it is defined again, so
+with the prepared statement cache off, after pgcat refuses a batch that redefines a statement, or
+the server fails it before the redefinition, the server keeps running the old definition while its
+Executes are counted as the new one. With the cache on, a statement is counted as what the client's
+prepared statement runs: pgcat puts back the client's prepared statements when it refuses a batch,
+and the count follows, and a batch the server fails was sent, so what it prepared stands in pgcat
+and in the counts. A name the batch closed is forgotten, so its later Executes are gap events; with
+the cache on, a statement is forgotten only when pgcat drops it from the client's prepared
+statements. This only changes the counts, never what pgcat or the server runs.
+
+- `pgcat_sql_observer_observing{pool,user}`: 1 if the pool counts, 0 if not. A pool that isn't
+  counting exports no counts, so it can't be mistaken for one without traffic. This reflects the
+  pool's current config, but each client reads the setting from its own copy of the pool's
+  settings, refreshed when it next takes a server from the pool, so a reload is not an instant
+  switch for every client: one still holding the older settings (such as a session-mode client,
+  or one whose statements pgcat answers itself) can keep counting after the pool stops observing,
+  or not count yet after it starts. The counts are cumulative, so what such a client counted while
+  the pool didn't export it shows once the pool observes again.
+- `pgcat_sql_observer_attempts_total{pool,user,identity}`: statements counted, by the client's
+  `PGCAT_IDENTITY` state when the statement was admitted (see below).
+- `pgcat_sql_observer_gap_events_total{pool,user,reason}`: messages not counted, by reason:
+  `unparsed_query` (a simple query the parser didn't parse, or with the parser disabled),
+  `refused_unparsed` (a simple query refused before it was parsed), `unparsed_statement` (an Execute
+  of a prepared statement the parser didn't parse, or of one dropped from the record before the
+  server was last idle: pgcat forgets why a statement is missing when a transaction ends, so read
+  this reason as statement metadata unavailable, not only as parser coverage), `unknown_portal` (an
+  Execute of a portal pgcat has no record of, such as a SQL cursor's) and `metadata_invalidated` (an
+  Execute whose statement was dropped from the record: a statement that ended the portal, a
+  Close, the server being taken from the client, or the record's bounds).
+
+- `pgcat_sql_observer_relation_attempts_total{pool,user,relation,identity}`: for each counted
+  statement, the tables it names, from the statement as the client wrote it (before plugins
+  rewrite it). `relation` is the bare table name, without its schema (the database is the `pool`
+  label), or one of three fixed labels: `other` (a new name once the pool's names are full, see
+  below), `unknown` (anything pgcat can't attribute: a function or other non-table source, a name
+  with three parts, an unquoted non-ASCII name, unsupported syntax, more than 16 distinct
+  relations, or a statement prepared before the pool was removed and added back) and
+  `no_explicit_relation` (a statement naming no relation, such as `SELECT 1` or
+  `BEGIN`). A statement naming several relations counts once in each, and once per relation
+  however often it repeats one, so these are not statement counts: the series do not sum to
+  `attempts_total`. Names fold as PostgreSQL folds them: unquoted names to lower case, `"quoted"`
+  names exactly. A name PostgreSQL would accept unquoted (lower-case ASCII letters, digits, `_`
+  and `$`, not starting with a digit) is its own label, so `Public.Orders` and `"public"."orders"`
+  are both `orders`; any other name keeps its quotes, with embedded quotes doubled (`"Orders"`,
+  `"order items"`), as does a table named like a fixed label (`"other"`). A name is cut to 63
+  bytes on a character boundary, as PostgreSQL cuts identifiers, so names PostgreSQL reads as one
+  share a label; the label is then cut to 64 characters, quotes included, and names sharing a
+  label share its series. A quoted name of 63 one-byte characters loses only its closing quote,
+  but embedded quotes are doubled, so a name loses real content once its characters plus its
+  embedded quotes exceed 63: one embedded quote in a 63-character name is enough. Two names
+  PostgreSQL keeps apart that differ only past that cut share a label (a deliberate false
+  positive). Dropping the schema and
+  never consulting the search path means a temp table, or the same name in two schemas, counts
+  under one label (a deliberate false positive). CTE names, aliases and function names are never
+  labels. A view is labeled by its own name, not the tables under it. Overflowing the relation
+  bounds changes only these series, never `attempts_total` or the gap events.
+
+Every table name the parser sees is recorded, in the order first seen, up to 1,000 names per pool
+and user. These counters are shared by that pool's clients and are not part of the per-client
+record above. A name keeps its series while the pool exists: names are never evicted, and a config
+reload that keeps the pool keeps them all (and their counts). Removing the pool from the config
+and adding it back starts an empty set. The counters are allocated 64 names at a time as names
+are first seen, so a pool that never counts a name allocates none. When a pool first reaches 800
+names, and again when it reaches 1,000, pgcat logs one warning with the pool, user and count. Past
+1,000, new names count as `other`, and pgcat logs a warning naming up to 16 of the names seen
+since the previous such warning, at the next overflow at least a minute later (per pool and user);
+a name seen under contention, or after the last overflow, may go unlisted. The counts are exact
+either way. A name takes its place when pgcat first classifies a statement naming it, which is at
+Parse for a prepared statement, so a statement that is only prepared, or is refused after it was
+parsed, still takes one, though it counts nothing.
+The relation series take up to 1,003 × 4 series per pool and user. Datadog folds metric tag
+values to lower-case names of at most 200 characters, other characters becoming `_`, so a quoted
+or mixed-case label may be merged with another there.
+
+Both counted metrics label the client's `PGCAT_IDENTITY` state as `identity`:
+
+- `present`: a verified, unexpired identity is set.
+- `absent`: none was ever set, or it was reset (`RESET PGCAT_IDENTITY`, `DISCARD ALL` or
+  `RESET ALL`).
+- `expired`: the identity set expired. It stays `expired` until the next successful `SET` or a reset.
+- `refused`: the last `SET PGCAT_IDENTITY` was refused. It stays `refused` until the next successful
+  `SET` or a reset.
+
+The state only labels the counts: authorization and plugins see the client as having no identity
+whenever it isn't `present`. The first time a relation is counted for a pool and user with an
+identity other than `present`, pgcat logs one info line on the `pgcat::sql_observer::callers` log
+target with the pool, user, relation, identity state, `application_name` and client address
+(at most once per relation and state, so at most 3,000 lines per pool and user); the relation and
+`application_name` are in double quotes. In this line and the overflow warning, client-chosen text
+(table names, `application_name`) is escaped: `\`, `"`, control characters (such as a newline,
+`\n`, or an escape, `\u{1b}`) and Unicode line and bidi controls.
+
+The global attempt and gap counters survive a config reload for as long as the pool exists, and
+so do the relation series. A query admitted just before a reload enables the parser is recorded
+once, as the gap it was admitted as; its statements are not counted as well.
+
 ### primary_reads_enabled
 ```
 path: pools.<pool_name>.primary_reads_enabled
@@ -573,3 +899,38 @@ default: "shard0"
 ```
 
 Database name (e.g. "postgres")
+
+## `pools.<pool_name>.plugins.<name>` Sections
+
+Besides the built-in plugins, an executable embedding pgcat can register plugins that a pool turns
+on and configures in its own `[pools.<pool_name>.plugins.<name>]` section, or inherits from a global
+`[plugins.<name>]` one (see `docs/plugin-registration.md`). The plugin registered under that name
+defines the section's settings. pgcat refuses to start, and a reload keeps the previous config, if
+no plugin of that name is registered (the standalone `pgcat` binary registers none, so the images
+`Dockerfile` and `Dockerfile.dev` build and the deb package refuse every such section), if the plugin
+refuses the section, or if an enabled section applies to a pool without `query_parser_enabled`.
+Such a plugin can verify the pool's `SET PGCAT_IDENTITY` tokens; a pool where more than one plugin
+would verify them is refused the same way. Each such plugin starts
+once, when pgcat starts, and pgcat doesn't start if one fails to or takes longer than 60 seconds. A
+reload never starts one: a plugin that needs to have started on a pool fails closed on a pool a
+reload first turns it on for. Logs show whether each such plugin is enabled, not its settings,
+with one exception: a value the plugin can't parse is quoted in the error that fails the config.
+Keep secrets out of plugin sections.
+
+pgcat counts the plugin errors clients got, for every plugin, built-in or registered, in the
+`/metrics` counter `pgcat_hook_errors_total{plugin,hook,sqlstate}`. A plugin's decisions
+(`Deny`, which a plugin may count in its own metrics) and pgcat's own refusals aren't counted.
+Each label takes fixed values, never a message, a token or a tenant:
+
+- `plugin`: the name a plugin was registered under, or a built-in's (`testing`,
+  `query_logger`, `intercept`, `table_access`). It's the plugin whose hook failed, the one running
+  when the plugin chain timed out, and, for a planned statement's later hooks, the one that planned
+  it. `none` for `PH002` (no hook ran) and for a statement no plugin is known to have planned.
+- `hook`: `verify_identity` (a `SET PGCAT_IDENTITY` token, or a client's identity verified again
+  after a reload changed its verifier), `query` and `parse` (the plugin chain on a simple Query or a
+  Parse), and a planned statement's `execute`, `checkout`, `bind`, `param_description`,
+  `row_description` and `rows`.
+- `sqlstate`: the client's: `PH001` (timed out), `PH002` (no free hook slot), `28000` (the verifier
+  refused a `SET PGCAT_IDENTITY` token), `0A000` (it refused, after a reload, the identity a client
+  held, which ends the session), `42501` (a plugin's error denied the statement), `XX000`, or a code
+  the plugin chose. A code that isn't five of `[0-9A-Z]` is counted as `XX000`.

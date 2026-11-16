@@ -19,6 +19,15 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+// This library module retains upstream's main.rs path so startup fixes merge
+// into the code we execute. If upstream syncability is no longer needed, rename
+// it to server_startup.rs and update the module wiring in lib.rs and runtime.rs.
+// The standalone entry point and allocator belong in src/bin/pgcat.rs instead.
+//
+// Require the library's module wiring even if a future sync restores fn main():
+// a stale binary root must fail rather than bypass registration or its allocator.
+const _: fn() -> Result<(), Box<dyn std::error::Error>> = crate::upstream_main::run_server;
+
 extern crate arc_swap;
 extern crate async_trait;
 extern crate bb8;
@@ -36,14 +45,6 @@ extern crate tokio;
 extern crate tokio_rustls;
 extern crate toml;
 extern crate trust_dns_resolver;
-
-// Only use jemalloc on x86_64 - it has issues on ARM64 when cross-compiled with zig
-#[cfg(all(not(target_env = "msvc"), target_arch = "x86_64"))]
-use jemallocator::Jemalloc;
-
-#[cfg(all(not(target_env = "msvc"), target_arch = "x86_64"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
 
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
@@ -70,7 +71,7 @@ use pgcat::pool::{ClientServerMap, ConnectionPool};
 use pgcat::prometheus::start_metric_server;
 use pgcat::stats::{Collector, Reporter, REPORTER};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let args = cmd_args::parse();
     logger::init(&args);
 
@@ -158,6 +159,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error!("Pool error: {:?}", err);
                 std::process::exit(exitcode::CONFIG);
             }
+        };
+
+        // The configured plugins, which a reload never starts.
+        let started_plugins = match pgcat::plugins::lifecycle::start(&config).await {
+            Ok(started) => started,
+            Err(_) => std::process::exit(exitcode::CONFIG),
         };
 
         tokio::task::spawn(async move {
@@ -334,6 +341,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+    started_plugins.shutdown().await;
 
     info!("Shutting down...");
     });

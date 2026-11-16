@@ -1,4 +1,4 @@
-FROM cimg/rust:1.81.0
+FROM cimg/rust:1.97.1@sha256:ff590a566178a27df40d6dc81756de1872eabf3df4f6a4bb965ff9bb845e78a7
 COPY --from=sclevine/yj /bin/yj /bin/yj
 RUN /bin/yj -h
 RUN sudo apt-get update && \
@@ -7,7 +7,7 @@ RUN sudo apt-get update && \
 		ruby ruby-dev python3 python3-pip \
 		lcov llvm-11 iproute2 && \
 	sudo apt-get upgrade curl && \
-	cargo install cargo-binutils rustfilt && \
+	cargo install --locked cargo-binutils@0.3.6 rustfilt@0.2.1 && \
 	rustup component add llvm-tools-preview && \
 	pip3 install psycopg2 && sudo gem install bundler && \
 	wget -O /tmp/toxiproxy-2.4.0.deb https://github.com/Shopify/toxiproxy/releases/download/v2.4.0/toxiproxy_2.4.0_linux_$(dpkg --print-architecture).deb && \
