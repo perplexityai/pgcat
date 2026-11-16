@@ -355,27 +355,30 @@ impl CachedResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_resolver::config::NameServerConfig;
+    use hickory_resolver::config::{NameServerConfig, ServerOrderingStrategy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::UdpSocket;
 
-    /// A nameserver on a local UDP port that answers every query after
-    /// `delay`: with NXDOMAIN when `answer` is `None`, and otherwise with
-    /// `answer` as the A record.
-    async fn mock_name_server(answer: Option<[u8; 4]>, delay: Duration) -> NameServerConfig {
+    /// A nameserver on a local UDP port that answers every query with
+    /// NXDOMAIN when `answer` is `None`, and otherwise with `answer` as the
+    /// A record. It also returns the number of queries it has received.
+    async fn mock_name_server(answer: Option<[u8; 4]>) -> (NameServerConfig, Arc<AtomicUsize>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut name_server = NameServerConfig::udp(IpAddr::from([127, 0, 0, 1]));
         name_server.connections[0].port = socket.local_addr().unwrap().port();
+        let queries = Arc::new(AtomicUsize::new(0));
 
+        let counter = queries.clone();
         tokio::spawn(async move {
             let mut query = [0; 512];
             loop {
                 let (len, client) = socket.recv_from(&mut query).await.unwrap();
-                sleep(delay).await;
+                counter.fetch_add(1, Ordering::SeqCst);
                 let response = mock_response(&query[..len], answer);
                 socket.send_to(&response, client).await.unwrap();
             }
         });
-        name_server
+        (name_server, queries)
     }
 
     /// The response to a query with one question (RFC 1035, section 4.1).
@@ -404,30 +407,34 @@ mod tests {
         response
     }
 
+    /// A resolver that asks these nameservers one at a time, in this order.
     fn resolver_for(name_servers: Vec<NameServerConfig>) -> TokioResolver {
         let config = ResolverConfig::from_parts(None, vec![], name_servers);
-        resolver_with(config, ResolverOpts::default()).unwrap()
+        let mut options = ResolverOpts::default();
+        options.num_concurrent_reqs = 1;
+        options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
+        resolver_with(config, options).unwrap()
     }
 
     #[tokio::test]
     async fn nxdomain_from_one_nameserver_falls_back_to_the_others() {
-        // The second answers later, so the first's NXDOMAIN arrives first.
-        let resolver = resolver_for(vec![
-            mock_name_server(None, Duration::ZERO).await,
-            mock_name_server(Some([192, 0, 2, 7]), Duration::from_millis(100)).await,
-        ]);
+        let (first, first_queries) = mock_name_server(None).await;
+        let (second, second_queries) = mock_name_server(Some([192, 0, 2, 7])).await;
+        let resolver = resolver_for(vec![first, second]);
         let lookup = resolver.lookup_ip("db.example.").await.unwrap();
         assert_eq!(
             lookup.iter().collect::<Vec<_>>(),
             vec![IpAddr::from([192, 0, 2, 7])]
         );
+        assert_eq!(first_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(second_queries.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn nxdomain_from_every_nameserver_fails() {
         let resolver = resolver_for(vec![
-            mock_name_server(None, Duration::ZERO).await,
-            mock_name_server(None, Duration::ZERO).await,
+            mock_name_server(None).await.0,
+            mock_name_server(None).await.0,
         ]);
         let response = resolver.lookup_ip("db.example.").await;
         assert!(matches!(response, Err(e) if e.is_nx_domain()));
