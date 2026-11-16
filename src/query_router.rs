@@ -73,6 +73,39 @@ enum ParameterFormat {
 static TABLE_FREE_UNPARSED_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)^\s*RESET\s+[a-z_][a-z0-9_.]*\s*;?\s*$").unwrap());
 
+/// The first word of a query, after the whitespace and comments before it.
+fn first_word(query: &str) -> &str {
+    let mut rest = query;
+    loop {
+        rest = rest.trim_start();
+        if let Some(comment) = rest.strip_prefix("--") {
+            rest = comment.find(['\n', '\r']).map_or("", |end| &comment[end..]);
+        } else if rest.starts_with("/*") {
+            // Block comments nest.
+            let bytes = rest.as_bytes();
+            let (mut depth, mut i) = (1, 2);
+            while depth > 0 {
+                match bytes.get(i..i + 2) {
+                    Some(b"/*") => (depth, i) = (depth + 1, i + 2),
+                    Some(b"*/") => (depth, i) = (depth - 1, i + 2),
+                    Some(_) => i += 1,
+                    None => return "",
+                }
+            }
+            rest = &rest[i..];
+        } else {
+            // Postgres reads letters, digits, `_`, `$` and non-ASCII
+            // characters as part of a word.
+            let end = rest
+                .find(|c: char| {
+                    c.is_ascii() && !(c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                })
+                .unwrap_or(rest.len());
+            return &rest[..end];
+        }
+    }
+}
+
 /// Quickly test for match when a query is received.
 static CUSTOM_SQL_REGEX_SET: OnceCell<RegexSet> = OnceCell::new();
 
@@ -531,15 +564,29 @@ impl QueryRouter {
         }
     }
 
-    /// Determines if a query is a mutation or not.
+    /// Determines if a query is a mutation or not: its body or a query in its
+    /// `WITH` clause writes.
     fn is_mutation_query(q: &sqlparser::ast::Query) -> bool {
-        use sqlparser::ast::*;
+        let cte_mutates = q.with.as_ref().is_some_and(|with| {
+            with.cte_tables
+                .iter()
+                .any(|cte| Self::is_mutation_query(&cte.query))
+        });
+        cte_mutates || Self::is_mutation_set_expr(&q.body)
+    }
 
-        match q.body.as_ref() {
-            SetExpr::Insert(_) => true,
-            SetExpr::Update(_) => true,
+    /// Determines if a query body writes. The match lists every kind of body,
+    /// so a new one has to be classified here.
+    fn is_mutation_set_expr(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
+                true
+            }
             SetExpr::Query(q) => Self::is_mutation_query(q),
-            _ => false,
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::is_mutation_set_expr(left) || Self::is_mutation_set_expr(right)
+            }
+            SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => false,
         }
     }
 
@@ -653,6 +700,7 @@ impl QueryRouter {
                     let has_mutation = Self::is_mutation_query(query);
 
                     if has_locks || has_mutation {
+                        visited_write_statement = true;
                         self.active_role = Some(Role::Primary);
                     } else if !visited_write_statement {
                         // If we already visited a write statement, we should be going to the primary.
@@ -751,10 +799,11 @@ impl QueryRouter {
 
         match q {
             Insert(i) => {
-                // Not supported in postgres.
-                assert!(i.or.is_none());
-                assert!(i.partitioned.is_none());
-                assert!(i.after_columns.is_empty());
+                // Not supported in postgres, which rejects them; the parser
+                // accepts `INSERT OR ...`.
+                if i.or.is_some() || i.partitioned.is_some() || !i.after_columns.is_empty() {
+                    return None;
+                }
 
                 let TableObject::TableName(table_name) = &i.table else {
                     return None;
@@ -775,8 +824,11 @@ impl QueryRouter {
                     exprs.push(expr.clone());
                 }
 
-                // Multi-tables delete are not supported in postgres.
-                assert!(d.tables.is_empty());
+                // Multi-tables delete are not supported in postgres, which
+                // rejects them.
+                if !d.tables.is_empty() {
+                    return None;
+                }
 
                 if let Some(using_tbl_with_join) = &d.using {
                     Self::process_tables_with_join(
@@ -929,7 +981,10 @@ impl QueryRouter {
 
             // We can filter results based on join conditions, e.g.
             // SELECT * FROM t INNER JOIN B ON B.sharding_key = 5;
-            if let JoinOperator::Inner(JoinConstraint::On(expr)) = &join.join_operator {
+            // The parser reads a plain JOIN as `Join`, and INNER JOIN as `Inner`.
+            if let JoinOperator::Join(JoinConstraint::On(expr))
+            | JoinOperator::Inner(JoinConstraint::On(expr)) = &join.join_operator
+            {
                 // Parse the selection criteria later.
                 exprs.push(expr.clone());
             };
@@ -1964,12 +2019,14 @@ impl QueryRouter {
     /// A query the parser couldn't read might touch a table a plugin checks:
     /// its text has a name a plugin gates (a table's, or a function's that
     /// runs SQL given as text, which can build any name), or Unicode escapes
-    /// (`U&"..."`), which can spell any name.
+    /// (`U&"..."`), which can spell any name. A VACUUM without a table name
+    /// processes every table, so any VACUUM might.
     fn might_touch_gated(&self, query: &str) -> bool {
         let query = query.to_ascii_lowercase();
+        let gated = self.gated_tables();
         query.contains("u&")
-            || self
-                .gated_tables()
+            || (!gated.is_empty() && first_word(&query) == "vacuum")
+            || gated
                 .iter()
                 .any(|table| query.contains(&table.to_ascii_lowercase()))
     }
@@ -2105,6 +2162,52 @@ mod test {
         let ast = qr.parse(&query).unwrap();
         assert!(qr.infer(&ast).is_ok());
         assert_eq!(qr.role(), Some(Role::Primary));
+    }
+
+    #[test]
+    fn test_data_modifying_bodies_and_ctes_go_to_primary() {
+        QueryRouter::setup();
+        let role_of = |sql: &str| {
+            let mut qr = QueryRouter::new();
+            qr.pool_settings.query_parser_read_write_splitting = true;
+            qr.pool_settings.primary_reads_enabled = false;
+            assert!(qr.infer(&qr.parse(&simple_query(sql)).unwrap()).is_ok());
+            qr.role()
+        };
+
+        for sql in [
+            // The parser reads these as a query whose body is the DELETE or
+            // MERGE.
+            "WITH x AS (SELECT 1) DELETE FROM data WHERE id = 5",
+            "WITH x AS (SELECT 1) MERGE INTO data USING a ON data.id = a.id \
+             WHEN MATCHED THEN DELETE",
+            // A SELECT over a CTE that writes.
+            "WITH x AS (DELETE FROM data WHERE id = 5 RETURNING *) SELECT * FROM x",
+            "WITH x AS (UPDATE data SET v = 1 RETURNING *) SELECT * FROM x",
+            "WITH x AS (INSERT INTO data VALUES (1) RETURNING *) SELECT * FROM x",
+            "WITH r AS (SELECT 1), x AS (DELETE FROM data RETURNING *) SELECT * FROM r",
+            "WITH x AS (WITH y AS (DELETE FROM data RETURNING *) SELECT * FROM y) \
+             SELECT * FROM x",
+            "SELECT 1 UNION ALL (WITH x AS (DELETE FROM data RETURNING *) SELECT 1)",
+            // A read after one of these, or after a locking read, in the same
+            // message stays on the primary.
+            "WITH x AS (SELECT 1) DELETE FROM data WHERE id = 5; SELECT 1",
+            "WITH x AS (SELECT 1) MERGE INTO data USING a ON data.id = a.id \
+             WHEN MATCHED THEN DELETE; SELECT 1",
+            "WITH x AS (DELETE FROM data RETURNING *) SELECT * FROM x; SELECT 1",
+            "SELECT * FROM data FOR UPDATE; SELECT 1",
+        ] {
+            assert_eq!(role_of(sql), Some(Role::Primary), "{}", sql);
+        }
+
+        for sql in [
+            "SELECT 1; SELECT 1",
+            "WITH x AS (SELECT * FROM data) SELECT * FROM x",
+            "WITH x AS (WITH y AS (SELECT 1) SELECT * FROM y) SELECT * FROM x",
+            "SELECT 1 UNION ALL (WITH x AS (SELECT 1) SELECT * FROM x)",
+        ] {
+            assert_eq!(role_of(sql), Some(Role::Replica), "{}", sql);
+        }
     }
 
     #[test]
@@ -2644,6 +2747,71 @@ mod test {
             )
             .is_ok());
         assert_eq!(qr.shard().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_automatic_sharding_key_in_join_on() {
+        QueryRouter::setup();
+
+        let mut qr = QueryRouter::new();
+        qr.pool_settings.automatic_sharding_key = Some("data.id".to_string());
+        qr.pool_settings.shards = 3;
+        qr.pool_settings.query_parser_read_write_splitting = true;
+
+        let mut shard_of = |sql: &str| {
+            assert!(qr.infer(&qr.parse(&simple_query(sql)).unwrap()).is_ok());
+            qr.shard()
+        };
+
+        // The key is only in ON. Each query moves to a different shard than
+        // the previous one, so a join whose ON isn't read keeps the previous
+        // shard.
+        assert_eq!(shard_of("SELECT * FROM data WHERE id = 6"), Some(0));
+        assert_eq!(
+            shard_of("SELECT * FROM data JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
+            Some(2)
+        );
+        assert_eq!(shard_of("SELECT * FROM data WHERE id = 6"), Some(0));
+        assert_eq!(
+            shard_of("SELECT * FROM data INNER JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
+            Some(2)
+        );
+        assert_eq!(
+            shard_of("SELECT * FROM t2 JOIN data ON data.id = 6 AND t2.data_id = data.id"),
+            Some(0)
+        );
+
+        // An outer join's ON doesn't filter the rows of both tables, so it
+        // still doesn't choose a shard.
+        assert_eq!(
+            shard_of("SELECT * FROM data LEFT JOIN t2 ON data.id = 5 AND t2.data_id = data.id"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_writes_postgres_rejects_are_not_inferred() {
+        QueryRouter::setup();
+
+        let mut qr = QueryRouter::new();
+        qr.pool_settings.automatic_sharding_key = Some("data.id".to_string());
+        qr.pool_settings.shards = 3;
+        qr.pool_settings.query_parser_read_write_splitting = true;
+
+        // The parser accepts these, and the server rejects them. Inference
+        // skips them instead of panicking.
+        for sql in [
+            "INSERT OR REPLACE INTO data (id) VALUES (5)",
+            "DELETE data FROM data WHERE id = 5",
+        ] {
+            assert!(
+                qr.infer(&qr.parse(&simple_query(sql)).unwrap()).is_ok(),
+                "{}",
+                sql
+            );
+            assert_eq!(qr.role(), Some(Role::Primary), "{}", sql);
+            assert_eq!(qr.shard(), None, "{}", sql);
+        }
     }
 
     fn auto_shard_wrapper(qry: &str, should_succeed: bool) -> Option<usize> {
@@ -3464,6 +3632,52 @@ mod test {
         assert!(!qr.rejects_unparsed(&message));
         assert!(!qr.rejects_unparsed(&simple_query("reset search_path;")));
         assert!(!qr.rejects_unparsed(&parse_message("", "RESET ALL", &[])));
+    }
+
+    #[test]
+    fn test_unparsed_vacuum_is_rejected_while_a_table_is_gated() {
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        let with_gated = |tables: Vec<String>| {
+            let mut settings = testing_plugin_settings(true);
+            if let Some(ref mut plugins) = settings.plugins {
+                plugins.table_access = Some(crate::config::TableAccess {
+                    enabled: true,
+                    tables,
+                });
+            }
+            settings
+        };
+
+        // These process every table, so they might touch a gated one.
+        let vacuums = [
+            "VACUUM (FULL)",
+            "vacuum (full, freeze)",
+            "VACUUM FREEZE VERBOSE",
+            "  -- comment\n\tVACUUM VERBOSE ANALYZE",
+            "/* a /* nested */ comment */ VACUUM(FULL)",
+        ];
+        qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
+        for query in vacuums {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{}",
+                query
+            );
+        }
+        for query in ["VACUUMS (FULL)", "/* VACUUM */ SELEKT 1"] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+
+        qr.update_pool_settings(&with_gated(vec![]));
+        for query in vacuums {
+            assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
+        }
     }
 
     #[tokio::test]

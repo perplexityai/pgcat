@@ -1,9 +1,10 @@
 use crate::config::get_config;
 use crate::errors::Error;
 use arc_swap::ArcSwap;
-use hickory_resolver::error::{ResolveError, ResolveResult};
+use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::lookup_ip::LookupIp;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::net::NetError;
+use hickory_resolver::TokioResolver;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,18 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::time::{sleep, Duration};
+
+/// A resolver with the system's configuration. The options hickory-resolver
+/// 0.26 changed the defaults of are set as 0.24 had them.
+fn system_resolver() -> Result<TokioResolver, NetError> {
+    let mut builder = TokioResolver::builder_tokio()?;
+    let options = builder.options_mut();
+    options.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+    options.cache_size = 32;
+    // 0.24 didn't read `options edns0` from resolv.conf.
+    options.edns0 = false;
+    builder.build()
+}
 
 /// Cached Resolver Globally available
 pub static CACHED_RESOLVER: Lazy<ArcSwap<CachedResolver>> =
@@ -79,7 +92,7 @@ pub struct CachedResolver {
     data: Option<RwLock<HashMap<String, AddrSet>>>,
 
     // The resolver to be used for DNS queries.
-    resolver: Option<TokioAsyncResolver>,
+    resolver: Option<TokioResolver>,
 
     // The RefreshLoop
     refresh_loop: RwLock<Option<tokio::task::JoinHandle<()>>>,
@@ -136,7 +149,7 @@ impl CachedResolver {
         data: Option<HashMap<String, AddrSet>>,
     ) -> Result<Arc<Self>, io::Error> {
         // Construct a new Resolver with default configuration options
-        let resolver = Some(TokioAsyncResolver::tokio_from_system_conf()?);
+        let resolver = Some(system_resolver().map_err(io::Error::other)?);
 
         let data = if let Some(hash) = data {
             Some(RwLock::new(hash))
@@ -171,7 +184,7 @@ impl CachedResolver {
 
     // Schedules the refresher
     async fn refresh_dns_entries_loop(&self) {
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap();
+        let resolver = system_resolver().unwrap();
         let interval = Duration::from_secs(self.config.dns_max_ttl);
         loop {
             debug!("Begin refreshing cached DNS addresses.");
@@ -241,7 +254,7 @@ impl CachedResolver {
     /// # })
     /// ```
     ///
-    pub async fn lookup_ip(&self, host: &str) -> ResolveResult<AddrSet> {
+    pub async fn lookup_ip(&self, host: &str) -> Result<AddrSet, NetError> {
         debug!("Lookup up {} in cache", host);
         match self.fetch_from_cache(host) {
             Some(addr_set) => {
@@ -256,7 +269,7 @@ impl CachedResolver {
                     self.store_in_cache(host, addr_set.clone());
                     Ok(addr_set)
                 } else {
-                    Err(ResolveError::from("No resolver available"))
+                    Err(NetError::from("No resolver available"))
                 }
             }
         }
@@ -326,7 +339,6 @@ impl CachedResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_resolver::error::ResolveError;
 
     #[tokio::test]
     async fn new() {
@@ -371,7 +383,7 @@ mod tests {
         let resolver = CachedResolver::new(config, None).await.unwrap();
         let hostname = "www.idontexists.";
         let response = resolver.lookup_ip(hostname).await;
-        assert!(matches!(response, Err(ResolveError { .. })));
+        assert!(response.is_err());
     }
 
     #[tokio::test]
@@ -383,7 +395,7 @@ mod tests {
         let resolver = CachedResolver::new(config, None).await.unwrap();
         let hostname = "w  ww.idontexists.";
         let response = resolver.lookup_ip(hostname).await;
-        assert!(matches!(response, Err(ResolveError { .. })));
+        assert!(response.is_err());
         assert!(!resolver.has_changed(hostname, &AddrSet::new()));
     }
 

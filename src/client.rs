@@ -7,11 +7,13 @@ use crate::identity::{
 use crate::pool::BanReason;
 /// Handle clients by pretending to be a PostgreSQL server.
 use bytes::{Buf, BufMut, BytesMut};
+use futures::FutureExt;
 use log::{debug, error, info, trace, warn};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::mem;
+use std::panic::AssertUnwindSafe;
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::{Instant, SystemTime};
 use tokio::io::{split, AsyncReadExt, BufReader, ReadHalf, WriteHalf};
@@ -440,6 +442,40 @@ impl LocalStatement {
     }
 }
 
+/// Runs a connected client's handler. A client that isn't an admin counts
+/// toward the drain total while the handler runs, and the client is reported
+/// disconnected when the handler fails. Both also happen when the handler
+/// panics; the panic then continues.
+async fn handle_with_accounting(
+    handle: impl std::future::Future<Output = Result<(), Error>>,
+    admin: bool,
+    stats: &ClientStats,
+    drain: &Sender<i32>,
+) -> Result<(), Error> {
+    if !admin {
+        let _ = drain.send(1).await;
+    }
+
+    let result = AssertUnwindSafe(handle).catch_unwind().await;
+
+    if !admin {
+        let _ = drain.send(-1).await;
+    }
+
+    match result {
+        Ok(result) => {
+            if result.is_err() {
+                stats.disconnect();
+            }
+            result
+        }
+        Err(panic) => {
+            stats.disconnect();
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
 /// Client entrypoint.
 pub async fn client_entrypoint(
     mut stream: TcpStream,
@@ -481,21 +517,9 @@ pub async fn client_entrypoint(
                             debug!("Client {:?} connected (TLS)", addr);
                         }
 
-                        if !client.is_admin() {
-                            let _ = drain.send(1).await;
-                        }
-
-                        let result = client.handle().await;
-
-                        if !client.is_admin() {
-                            let _ = drain.send(-1).await;
-                        }
-
-                        if result.is_err() {
-                            client.stats.disconnect();
-                        }
-
-                        result
+                        let admin = client.is_admin();
+                        let stats = client.stats.clone();
+                        handle_with_accounting(client.handle(), admin, &stats, &drain).await
                     }
                     Err(err) => Err(err),
                 }
@@ -533,21 +557,9 @@ pub async fn client_entrypoint(
                                     debug!("Client {:?} connected (plain)", addr);
                                 }
 
-                                if !client.is_admin() {
-                                    let _ = drain.send(1).await;
-                                }
-
-                                let result = client.handle().await;
-
-                                if !client.is_admin() {
-                                    let _ = drain.send(-1).await;
-                                }
-
-                                if result.is_err() {
-                                    client.stats.disconnect();
-                                }
-
-                                result
+                                let admin = client.is_admin();
+                                let stats = client.stats.clone();
+                                handle_with_accounting(client.handle(), admin, &stats, &drain).await
                             }
                             Err(err) => Err(err),
                         }
@@ -594,21 +606,9 @@ pub async fn client_entrypoint(
                         debug!("Client {:?} connected (plain)", addr);
                     }
 
-                    if !client.is_admin() {
-                        let _ = drain.send(1).await;
-                    }
-
-                    let result = client.handle().await;
-
-                    if !client.is_admin() {
-                        let _ = drain.send(-1).await;
-                    }
-
-                    if result.is_err() {
-                        client.stats.disconnect();
-                    }
-
-                    result
+                    let admin = client.is_admin();
+                    let stats = client.stats.clone();
+                    handle_with_accounting(client.handle(), admin, &stats, &drain).await
                 }
                 Err(err) => Err(err),
             }
@@ -623,21 +623,9 @@ pub async fn client_entrypoint(
                 Ok(mut client) => {
                     info!("Client {:?} issued a cancel query request", addr);
 
-                    if !client.is_admin() {
-                        let _ = drain.send(1).await;
-                    }
-
-                    let result = client.handle().await;
-
-                    if !client.is_admin() {
-                        let _ = drain.send(-1).await;
-                    }
-
-                    if result.is_err() {
-                        client.stats.disconnect();
-                    }
-
-                    result
+                    let admin = client.is_admin();
+                    let stats = client.stats.clone();
+                    handle_with_accounting(client.handle(), admin, &stats, &drain).await
                 }
 
                 Err(err) => Err(err),
@@ -4999,6 +4987,39 @@ fn is_lock_release(statement: &sqlparser::ast::Statement) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn panicking_handler() -> Result<(), Error> {
+        panic!("the client handler panicked")
+    }
+
+    #[tokio::test]
+    async fn test_accounting_is_undone_when_the_handler_panics() {
+        // An id no other test registers.
+        let client_id = i32::MIN + 0x5eed;
+        let stats = Arc::new(ClientStats::new(
+            client_id,
+            "app",
+            "user",
+            "pool",
+            tokio::time::Instant::now(),
+        ));
+        stats.register(stats.clone());
+        assert!(crate::stats::get_client_stats().contains_key(&client_id));
+
+        let (drain, mut drain_rx) = tokio::sync::mpsc::channel(8);
+        let handle = async { panicking_handler() };
+        let result = AssertUnwindSafe(handle_with_accounting(handle, false, &stats, &drain))
+            .catch_unwind()
+            .await;
+
+        // The panic still reaches the task, after the drain count is back to
+        // zero and the client's stats are removed.
+        assert!(result.is_err());
+        assert_eq!(drain_rx.try_recv(), Ok(1));
+        assert_eq!(drain_rx.try_recv(), Ok(-1));
+        assert!(drain_rx.try_recv().is_err());
+        assert!(!crate::stats::get_client_stats().contains_key(&client_id));
+    }
 
     // ==================== PREPARED_STATEMENT_COUNTER Tests ====================
 
