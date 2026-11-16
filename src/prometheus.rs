@@ -342,6 +342,9 @@ async fn prometheus_stats(
             push_pool_stats(&mut lines);
             push_server_stats(&mut lines);
             push_database_stats(&mut lines);
+            lines.extend(crate::sql_observer::prometheus_lines());
+            lines.extend(crate::plugins::hook_errors::prometheus_lines());
+            crate::plugins::lifecycle::prometheus_lines(&mut lines);
             lines.push("".to_string()); // Ensure to end the stats with a line terminator as required by the specification.
 
             Response::builder()

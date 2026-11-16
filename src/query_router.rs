@@ -3,7 +3,7 @@
 use bytes::{Buf, BytesMut};
 use log::{debug, error};
 use mini_moka::sync::Cache;
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use regex::{Regex, RegexSet};
 use sqlparser::ast::Statement::{Delete, Insert, Query, StartTransaction, Update};
 use sqlparser::ast::{
@@ -12,12 +12,18 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::config::Role;
 use crate::errors::Error;
+use crate::identity::{Identity, IdentityToken, VerifiedIdentity};
 use crate::messages::BytesMutReader;
-use crate::plugins::{Intercept, Plugin, PluginOutput, QueryLogger, TableAccess};
+use crate::plugins::hook_errors::{self, Hook, NO_PLUGIN};
+use crate::plugins::registry::{self, PluginRegistry, Section};
+use crate::plugins::{
+    Intercept, Plugin, PluginContext, PluginOutput, PluginResult, QueryLogger, TableAccess,
+};
 use crate::pool::PoolSettings;
 use crate::sharding::Sharder;
 
@@ -63,6 +69,10 @@ enum ParameterFormat {
     Specified(Vec<ParameterFormat>),
 }
 
+/// Statements the parser doesn't understand that can't reference a table.
+static TABLE_FREE_UNPARSED_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)^\s*RESET\s+[a-z_][a-z0-9_.]*\s*;?\s*$").unwrap());
+
 /// Quickly test for match when a query is received.
 static CUSTOM_SQL_REGEX_SET: OnceCell<RegexSet> = OnceCell::new();
 
@@ -80,6 +90,59 @@ enum DatabaseActivityState {
 static DATABASE_ACTIVITY_CACHE: OnceLock<Cache<String, DatabaseActivityState>> = OnceLock::new();
 // A moka cache for the tables, the key is the db_table.
 static TABLE_MUTATIONS_CACHE: OnceLock<Cache<String, bool>> = OnceLock::new();
+
+/// Refuses identities on a pool where more than one plugin verifies them,
+/// which config validation doesn't allow.
+const MANY_VERIFIERS: &str = "more than one plugin verifies identities on the pool";
+
+/// What the client gets instead of a configured verifier's refusal that
+/// might quote the token.
+const REDACTED_REFUSAL: &str = "the plugin refused the identity";
+
+/// Whether a refusal has 20 or more characters in a row a token is made of
+/// (`A-Z a-z 0-9 - _`): the token, without its `v1.`, or a slice of it. One
+/// pass, so the cost depends on the message's length only; a long identifier
+/// is hidden too. Considered instead: always sending [`REDACTED_REFUSAL`],
+/// which loses the plugin's reason, and searching for the token and the token
+/// without `v1.`, which misses a cut or sliced one.
+fn might_quote_token(message: &str) -> bool {
+    let mut run = 0;
+    message.bytes().any(|byte| {
+        let in_token = byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+        run = if in_token { run + 1 } else { 0 };
+        run >= 20
+    })
+}
+
+/// Why a token is verified, which decides the SQLSTATE a client gets when
+/// it isn't.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Verifying {
+    /// `SET PGCAT_IDENTITY`: a refusal is 28000.
+    Set,
+    /// The identity a client holds, again after a reload changed its
+    /// verifier: a refusal ends the session with 0A000 (`Identity::recheck`).
+    Again,
+}
+
+/// `plugin`'s answer to a token, its refusal or failure counted with the
+/// SQLSTATE the client gets: the hook's (PH001, PH002), else 28000 for a
+/// `SET`, or 0A000 when verified `Again`.
+fn counted(
+    plugin: &'static str,
+    verifying: Verifying,
+    verified: Result<VerifiedIdentity, String>,
+) -> Result<VerifiedIdentity, String> {
+    if let Err(error) = &verified {
+        let code = match (crate::messages::sqlstate_of(error).0, verifying) {
+            (Some(code @ (crate::plugins::HOOK_TIMED_OUT | crate::plugins::HOOK_BUSY)), _) => code,
+            (_, Verifying::Again) => crate::plugins::UNSUPPORTED,
+            (code, Verifying::Set) => code.unwrap_or(crate::plugins::IDENTITY_REFUSED),
+        };
+        hook_errors::count_code(plugin, Hook::VerifyIdentity, Some(code));
+    }
+    verified
+}
 
 /// The query router.
 pub struct QueryRouter {
@@ -100,12 +163,32 @@ pub struct QueryRouter {
 
     // Placeholders from prepared statement.
     placeholders: Vec<i16>,
+    registered_plugins: Arc<PluginRegistry>,
+
+    /// `plan_generation()`, kept current with the pool settings.
+    plan_generation: u64,
+
+    /// The plugin the plugin chain last called: the one a chain error or
+    /// timeout is counted for.
+    running: parking_lot::Mutex<&'static str>,
 }
 
 struct ExtractedExprsAndTables<'a> {
     exprs: Vec<Expr>,
     table_names: Vec<Vec<Ident>>,
     assignments_opt: Option<&'a Vec<Assignment>>,
+}
+
+/// A statement names a table `ONLY`: the parser's reading of `ONLY t`. An
+/// unquoted ONLY is a reserved word, never a table's name.
+fn names_only(statement: &Statement) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_relations(statement, |relation| {
+        found |= matches!(relation.0.as_slice(),
+            [name] if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("only"));
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    found
 }
 
 impl QueryRouter {
@@ -138,19 +221,31 @@ impl QueryRouter {
     /// Create a new instance of the query router.
     /// Each client gets its own.
     pub fn new() -> QueryRouter {
-        QueryRouter {
+        Self::with_plugins(registry::process_plugins())
+    }
+
+    /// Explicit injection keeps library callers and tests independent of the
+    /// process-wide runner. The registry is shared, never copied per statement.
+    pub fn with_plugins(registered_plugins: Arc<PluginRegistry>) -> QueryRouter {
+        let mut router = QueryRouter {
             active_shard: None,
             active_role: None,
             query_parser_enabled: None,
             primary_reads_enabled: None,
             pool_settings: PoolSettings::default(),
             placeholders: Vec::new(),
-        }
+            registered_plugins,
+            plan_generation: 0,
+            running: parking_lot::Mutex::new(NO_PLUGIN),
+        };
+        router.plan_generation = router.compute_plan_generation();
+        router
     }
 
     /// Pool settings can change because of a config reload.
     pub fn update_pool_settings(&mut self, pool_settings: &PoolSettings) {
         self.pool_settings = pool_settings.clone();
+        self.plan_generation = self.compute_plan_generation();
     }
 
     pub fn pool_settings(&self) -> &PoolSettings {
@@ -203,7 +298,10 @@ impl QueryRouter {
                                     cap.get(1).and_then(|id| id.as_str().parse::<i64>().ok())
                                 });
                         if let Some(sharding_key) = sharding_key {
-                            debug!("Setting sharding_key to {:?}", sharding_key);
+                            // The key is a value from the query's text.
+                            if !self.redact_queries() {
+                                debug!("Setting sharding_key to {:?}", sharding_key);
+                            }
                             self.set_sharding_key(sharding_key);
                             // Skip other command processing since a sharding command was found
                             return None;
@@ -377,20 +475,20 @@ impl QueryRouter {
         let query = match code {
             // Query
             'Q' => {
-                let query = message_cursor.read_string().unwrap();
-                debug!("Query: '{}'", query);
+                let query = message_cursor.read_string()?;
+                debug!("Parsing simple query");
                 query
             }
 
             // Parse (prepared statement)
             'P' => {
                 // Reads statement name
-                let _name = message_cursor.read_string().unwrap();
+                let _name = message_cursor.read_string()?;
 
                 // Reads query string
-                let query = message_cursor.read_string().unwrap();
+                let query = message_cursor.read_string()?;
 
-                debug!("Prepared statement: '{}'", query);
+                debug!("Parsing prepared statement");
 
                 query
             }
@@ -398,11 +496,35 @@ impl QueryRouter {
             _ => return Err(Error::UnsupportedStatement),
         };
 
-        match Parser::parse_sql(&PostgreSqlDialect {}, &query) {
+        Self::parse_sql(&query)
+    }
+
+    /// Parse a plugin's rewrite again from the SQL that's sent, with the limits
+    /// of a client's query, so it's checked as the server will read it.
+    fn parse_rewrite(&self, sql: &str) -> Result<Vec<Statement>, Error> {
+        match self.pool_settings.query_parser_max_length {
+            Some(max_length) if sql.len() > max_length => Err(Error::QueryRouterParserError(
+                "rewrite too long for parser".into(),
+            )),
+            _ => Self::parse_sql(sql),
+        }
+    }
+
+    fn parse_sql(query: &str) -> Result<Vec<Statement>, Error> {
+        match Parser::parse_sql(&PostgreSqlDialect {}, query) {
+            // The parser reads `FROM ONLY t` as a table named ONLY, aliased t:
+            // what plugins check wouldn't be the table the server reads.
+            Ok(ast) if ast.iter().any(names_only) => Err(Error::QueryRouterParserError(
+                "ONLY before a table name isn't supported".into(),
+            )),
             Ok(ast) => Ok(ast),
-            Err(err) => {
-                debug!("{}: {}", err, query);
-                Err(Error::QueryRouterParserError(err.to_string()))
+            Err(_) => {
+                // Parser errors can quote SQL literals, including passwords.
+                // Callers log this error and may also return it to the client.
+                debug!("SQL parsing failed");
+                Err(Error::QueryRouterParserError(
+                    "SQL syntax is not supported by the query parser".into(),
+                ))
             }
         }
     }
@@ -905,7 +1027,7 @@ impl QueryRouter {
                         match value.parse::<i64>() {
                             Ok(value) => value,
                             Err(_) => {
-                                debug!("Error parsing bind value: {}", value);
+                                debug!("Bind value of parameter {} isn't an integer", placeholder);
                                 continue;
                             }
                         }
@@ -1065,7 +1187,7 @@ impl QueryRouter {
                         match value.parse::<i64>() {
                             Ok(value) => result.push(ShardingKey::Value(value)),
                             Err(_) => {
-                                debug!("Sharding key was not an integer: {}", value);
+                                debug!("Sharding key was not an integer");
                             }
                         };
                     }
@@ -1086,7 +1208,10 @@ impl QueryRouter {
             };
         }
 
-        debug!("Sharding keys found: {:?}", result);
+        // The keys are the query's literals.
+        if !self.redact_queries() {
+            debug!("Sharding keys found: {:?}", result);
+        }
 
         result
     }
@@ -1164,16 +1289,227 @@ impl QueryRouter {
         }
     }
 
-    /// Add your plugins here and execute them.
+    /// Ask the plugins to verify an identity token the client set. With no
+    /// plugin that verifies tokens, the token is kept as it is, without a tenant.
+    /// Config validation allows one verifier per pool; should a pool have more,
+    /// or a section its plugin hasn't parsed, the token is refused, unless the
+    /// test-only `testing` verifier is on, which takes priority.
+    ///
+    /// A configured verifier runs like a plugin hook: under the pool's
+    /// `plugin_hook_timeout` and `general.plugin_hook_concurrency`.
+    ///
+    /// An error is a refusal (28000), unless it has a SQLSTATE: the hook's
+    /// `PH001` (timed out) or `PH002` (no slot).
+    pub async fn verify_identity(&self, token: &IdentityToken) -> Result<VerifiedIdentity, String> {
+        self.verify_identity_in(&crate::plugins::HOOK_SLOTS, token, Verifying::Set)
+            .await
+    }
+
+    /// [`Self::verify_identity`], for the identity a client holds after a
+    /// reload changed its verifier: a refusal is counted as the 0A000 that
+    /// ends the session, not 28000.
+    pub async fn verify_identity_again(
+        &self,
+        token: &IdentityToken,
+    ) -> Result<VerifiedIdentity, String> {
+        self.verify_identity_in(&crate::plugins::HOOK_SLOTS, token, Verifying::Again)
+            .await
+    }
+
+    /// [`Self::verify_identity`], with a configured verifier holding one of
+    /// `slots` while it runs.
+    pub(crate) async fn verify_identity_in(
+        &self,
+        slots: &tokio::sync::Semaphore,
+        token: &IdentityToken,
+        verifying: Verifying,
+    ) -> Result<VerifiedIdentity, String> {
+        #[cfg(any(test, feature = "test-plugins"))]
+        if let Some(testing) = self
+            .pool_settings
+            .plugins
+            .as_ref()
+            .and_then(|plugins| plugins.testing.as_ref())
+        {
+            if testing.enabled && testing.verify_identity {
+                return counted(
+                    "testing",
+                    verifying,
+                    crate::plugins::testing::verify_identity(token),
+                );
+            }
+        }
+
+        let mut verifier = None;
+        for (name, section) in self.named_configured_sections() {
+            match section {
+                Section::On(plugin, config) if plugin.verifies_identity(config) => {
+                    if verifier.replace((name, plugin, config)).is_some() {
+                        return Err(MANY_VERIFIERS.into());
+                    }
+                }
+                Section::On(..) | Section::Off => {}
+                Section::NotLoaded => return Err(registry::NOT_LOADED.into()),
+            }
+        }
+
+        match verifier {
+            Some((name, plugin, config)) => {
+                let verify = async { Ok(plugin.verify_identity(config, token).await) };
+                let timeout = self.pool_settings.plugin_hook_timeout;
+                let verified = match crate::plugins::run_hook_with(slots, timeout, verify).await {
+                    // A refusal: the client gets the message with 28000, so
+                    // it can't pick a SQLSTATE of its own, or hold the token.
+                    Ok(verified) => verified.map_err(|message| {
+                        let (_, message) = crate::messages::sqlstate_of(&message);
+                        // With no NUL left, client.rs can't read a SQLSTATE
+                        // out of it, however many the plugin nested.
+                        let refusal = message.replace('\0', " ");
+                        // The whole token is looked for too, as a plugin's may
+                        // have other characters; before and after, so a NUL
+                        // can't hide it.
+                        if might_quote_token(&refusal)
+                            || message.contains(token.as_str())
+                            || refusal.contains(token.as_str())
+                        {
+                            REDACTED_REFUSAL.to_string()
+                        } else {
+                            refusal
+                        }
+                    }),
+                    // Timed out or no hook slot: the hook's SQLSTATE (PH001,
+                    // PH002), not a refusal's 28000.
+                    Err(error) => Err(error.to_string()),
+                };
+                counted(name, verifying, verified)
+            }
+            None => Ok(VerifiedIdentity::default()),
+        }
+    }
+
+    /// Identifies what verifies identity tokens on the pool, as
+    /// [`Self::verify_identity`] finds it, with its section: 0 if nothing
+    /// does. A client's identity verified with another is verified again
+    /// before its next statement (see `Identity::recheck`).
+    pub fn verifier_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let plugins = match self.pool_settings.plugins.as_ref() {
+            Some(plugins) => plugins,
+            None => return 0,
+        };
+        #[cfg(any(test, feature = "test-plugins"))]
+        let testing = plugins
+            .testing
+            .as_ref()
+            .map_or(false, |testing| testing.enabled && testing.verify_identity);
+        #[cfg(not(any(test, feature = "test-plugins")))]
+        let testing = false;
+        // A section no plugin parsed refuses every token.
+        let sections: Vec<_> = plugins
+            .configured
+            .iter()
+            .filter(|(name, section)| {
+                match Section::resolve(self.registered_plugins.configured_plugin(name), section) {
+                    Section::On(plugin, config) => plugin.verifies_identity(config),
+                    Section::Off => false,
+                    Section::NotLoaded => true,
+                }
+            })
+            .collect();
+        if !testing && sections.is_empty() {
+            return 0;
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        testing.hash(&mut hasher);
+        sections.hash(&mut hasher);
+        hasher.finish() | 1
+    }
+
+    /// Run the plugins on a simple Query.
     pub async fn execute_plugins(&self, ast: &Vec<Statement>) -> Result<PluginOutput, Error> {
+        Ok(self.execute_query_plugins(ast, None).await?.output)
+    }
+
+    /// Run the plugins on a simple Query, keeping the plan for its results.
+    pub async fn execute_query_plugins(
+        &self,
+        ast: &Vec<Statement>,
+        identity: Option<&Identity>,
+    ) -> Result<PluginResult, Error> {
+        self.execute_plugin_chain(ast, None, identity).await
+    }
+
+    /// Run the plugins on a Parse. `param_types` are the types the client declared.
+    pub async fn execute_parse_plugins(
+        &self,
+        ast: &Vec<Statement>,
+        param_types: &[i32],
+        identity: Option<&Identity>,
+    ) -> Result<PluginResult, Error> {
+        self.execute_plugin_chain(ast, Some(param_types), identity)
+            .await
+    }
+
+    /// Add your plugins here and execute them.
+    ///
+    /// Registered plugins run first, then `query_logger`, `intercept`,
+    /// `table_access`, the newer built-ins, and the configured plugins the pool
+    /// turns on. Every plugin sees the original statements. After them, the
+    /// final rewrite is checked (`check_rewrite`), another plugin's as parsed
+    /// again from its SQL: by `table_access`, so a rewrite cannot reach a
+    /// blocked table, and by each configured plugin that checks rewrites, so
+    /// another plugin's rewrite cannot reach what it covers.
+    /// The first `Deny` or `Intercept` wins and stops the chain. At most one
+    /// plugin may return `Overwrite` (or a statement plan); a second one denies the
+    /// query, since the two can't be combined safely.
+    ///
+    /// `parse` holds the declared parameter types when this is a Parse.
+    async fn execute_plugin_chain(
+        &self,
+        ast: &Vec<Statement>,
+        parse: Option<&[i32]>,
+        identity: Option<&Identity>,
+    ) -> Result<PluginResult, Error> {
+        let no_builtins = crate::config::Plugins::default();
         let plugins = match self.pool_settings.plugins {
             Some(ref plugins) => plugins,
-            None => return Ok(PluginOutput::Allow),
+            None if !self.registered_plugins.has_process_plugins() => {
+                return Ok(PluginOutput::Allow.into())
+            }
+            None => &no_builtins,
         };
 
+        // External plugins see every parsed statement before a legacy intercept
+        // can answer it. They use the existing single-plan/single-rewrite rule.
+        let mut merged = PluginResult::from(PluginOutput::Allow);
+        let ctx = PluginContext {
+            query_router: self,
+            declared_param_types: parse.unwrap_or(&[]),
+            identity,
+        };
+        let hook = match parse {
+            Some(_) => Hook::Parse,
+            None => Hook::Query,
+        };
+        self.note(NO_PLUGIN);
+        for (name, plugin) in self.registered_plugins.plugins() {
+            self.note(name);
+            // An error stops the chain: `chain_failed` counts it.
+            let result = match parse {
+                Some(_) => plugin.on_parse(&ctx, ast).await?,
+                None => plugin.on_query(&ctx, ast).await?,
+            };
+            if let Some(output) = Self::merge_from(name, hook, Ok(result), &mut merged) {
+                return Ok(output.into());
+            }
+        }
+
         if let Some(ref query_logger) = plugins.query_logger {
+            self.note("query_logger");
             let mut query_logger = QueryLogger {
-                enabled: query_logger.enabled,
+                enabled: query_logger.enabled && !self.redact_queries(),
                 user: &self.pool_settings.user.username,
                 db: &self.pool_settings.db,
             };
@@ -1182,6 +1518,7 @@ impl QueryRouter {
         }
 
         if let Some(ref intercept) = plugins.intercept {
+            self.note("intercept");
             let mut intercept = Intercept {
                 enabled: intercept.enabled,
                 config: intercept,
@@ -1190,11 +1527,12 @@ impl QueryRouter {
             let result = intercept.run(self, ast).await;
 
             if let Ok(PluginOutput::Intercept(output)) = result {
-                return Ok(PluginOutput::Intercept(output));
+                return Ok(PluginOutput::Intercept(output).into());
             }
         }
 
         if let Some(ref table_access) = plugins.table_access {
+            self.note("table_access");
             let mut table_access = TableAccess {
                 enabled: table_access.enabled,
                 tables: &table_access.tables,
@@ -1203,11 +1541,423 @@ impl QueryRouter {
             let result = table_access.run(self, ast).await;
 
             if let Ok(PluginOutput::Deny(error)) = result {
-                return Ok(PluginOutput::Deny(error));
+                return Ok(PluginOutput::Deny(error).into());
             }
         }
 
-        Ok(PluginOutput::Allow)
+        // Newer plugins. Unlike the ones above, an error from these denies the query.
+        #[cfg(any(test, feature = "test-plugins"))]
+        if let Some(ref testing) = plugins.testing {
+            self.note("testing");
+            let mut testing = crate::plugins::testing::Testing {
+                enabled: testing.enabled,
+                config: testing,
+            };
+
+            let result = match parse {
+                Some(_) => testing.on_parse(&ctx, ast).await,
+                None => testing.on_query(&ctx, ast).await,
+            };
+
+            if let Some(output) = Self::merge_from("testing", hook, result, &mut merged) {
+                return Ok(output.into());
+            }
+        }
+
+        // Configured plugins the pool turns on, in registration order.
+        // `rewriter` is the configured plugin whose rewrite the chain carries,
+        // and whether its rewrite is checked as it built it.
+        let mut rewriter = None;
+        for (name, section) in self.named_configured_sections() {
+            let result = match section {
+                Section::Off => continue,
+                Section::NotLoaded => Ok(PluginOutput::Deny(registry::not_loaded()).into()),
+                Section::On(plugin, config) => {
+                    self.note(name);
+                    let result = plugin.run(config, &ctx, ast, parse.is_some()).await;
+                    if let Ok(PluginResult {
+                        output: PluginOutput::Overwrite(_),
+                        ..
+                    }) = &result
+                    {
+                        rewriter = Some((name, plugin.rewrite_checked_as_built(config)));
+                    }
+                    result
+                }
+            };
+
+            if let Some(output) = Self::merge_from(name, hook, result, &mut merged) {
+                return Ok(output.into());
+            }
+        }
+
+        if let PluginOutput::Overwrite(ref statements) = merged.output {
+            let table_access = plugins.table_access.as_ref();
+            if let Some(output) = self.check_rewrite(table_access, statements, rewriter).await {
+                return Ok(output.into());
+            }
+        }
+
+        Ok(merged)
+    }
+
+    /// Check the final rewrite after all plugins ran. Another plugin's rewrite
+    /// is checked as the server will read it: its SQL, parsed again, since a
+    /// plugin's statements can print as SQL that names other tables than they
+    /// hold. It's parsed once, and only if a check below applies. `rewriter`
+    /// is the configured plugin that rewrote, if one did, and whether its
+    /// rewrite is checked as it built it. Returns the output that refuses the
+    /// rewrite, if one does.
+    async fn check_rewrite(
+        &self,
+        table_access: Option<&crate::config::TableAccess>,
+        rewrite: &Vec<Statement>,
+        rewriter: Option<(&'static str, bool)>,
+    ) -> Option<PluginOutput> {
+        // A configured plugin plans the client's statements, not another
+        // plugin's rewrite of them, so each one on the pool that checks
+        // rewrites gets to refuse it. Its own rewrite is the one it planned.
+        let rewriter_name = rewriter.map(|(name, _)| name);
+        let checkers = || {
+            self.named_configured_sections()
+                .filter_map(move |(name, section)| match section {
+                    Section::On(plugin, config)
+                        if Some(name) != rewriter_name && plugin.checks_rewrites(config) =>
+                    {
+                        Some((plugin, config))
+                    }
+                    _ => None,
+                })
+        };
+        // table_access checks both sides of a rewrite: the original SQL in the
+        // chain, so a query naming a blocked table can't be rewritten away from
+        // it, and the final SQL here, so a rewrite can't reach a blocked table.
+        let table_access = table_access.filter(|table_access| table_access.enabled);
+        if table_access.is_none() && checkers().next().is_none() {
+            return None;
+        }
+
+        // A rewrite checked as built is checked from the plugin's own AST:
+        // built from the client's parsed statements and names it quotes
+        // itself, it can hold SQL that sqlparser prints but can't parse.
+        // Another plugin's rewrite is parsed again; what can't be parsed can't
+        // be checked, so that fails closed.
+        let parsed;
+        let sent: &Vec<Statement> = if matches!(rewriter, Some((_, true))) {
+            rewrite
+        } else {
+            parsed = match self.parse_rewrite(&crate::plugins::statements_to_sql(rewrite)) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    // The parser's errors are fixed text, without the SQL.
+                    debug!("refused a plugin's rewrite: {}", err);
+                    return Some(PluginOutput::Deny(crate::messages::with_sqlstate(
+                        crate::plugins::PLUGIN_FAILED,
+                        "a plugin's rewrite can't be parsed",
+                    )));
+                }
+            };
+            &parsed
+        };
+
+        for (plugin, config) in checkers() {
+            if let Err(error) = plugin.check_rewrite(config, sent) {
+                return Some(PluginOutput::Deny(error));
+            }
+        }
+
+        if let Some(table_access) = table_access {
+            self.note("table_access");
+            let mut table_access = TableAccess {
+                enabled: true,
+                tables: &table_access.tables,
+            };
+
+            // Anything but Allow refuses the rewrite.
+            if !matches!(table_access.run(self, sent).await, Ok(PluginOutput::Allow)) {
+                // The client didn't write the rewritten SQL, so the error doesn't
+                // name the table the rewrite reached: it can be plugin-derived,
+                // for example per tenant.
+                return Some(PluginOutput::Deny(crate::messages::with_sqlstate(
+                    crate::plugins::PLUGIN_DENIED,
+                    "permission denied for rewritten statement",
+                )));
+            }
+        }
+
+        None
+    }
+
+    /// The plugin chain calls `plugin` next.
+    fn note(&self, plugin: &'static str) {
+        *self.running.lock() = plugin;
+    }
+
+    /// The plugin the plugin chain last called.
+    pub(crate) fn running_plugin(&self) -> &'static str {
+        *self.running.lock()
+    }
+
+    /// The message a client gets when the plugin chain on `hook` fails with
+    /// `err`, the error a registered plugin returned or the chain's hook
+    /// timeout (PH001) or slot (PH002), counted for the plugin it called last.
+    pub(crate) fn chain_failed(&self, hook: Hook, err: &Error) -> String {
+        let message = crate::messages::or_sqlstate(crate::plugins::PLUGIN_FAILED, &err.to_string());
+        hook_errors::count(self.running_plugin(), hook, &message);
+        message
+    }
+
+    /// [`Self::merge_plugin_result`] for `plugin`'s result: its plan is
+    /// stamped with the plugin's name, and its error, which denies the
+    /// statement (42501), counted.
+    fn merge_from(
+        plugin: &'static str,
+        hook: Hook,
+        mut result: Result<PluginResult, Error>,
+        merged: &mut PluginResult,
+    ) -> Option<PluginOutput> {
+        match &mut result {
+            Ok(PluginResult {
+                plan: Some(plan), ..
+            }) => plan.plugin = plugin,
+            Ok(_) => {}
+            Err(_) => hook_errors::count_code(plugin, hook, Some(crate::plugins::PLUGIN_DENIED)),
+        }
+        Self::merge_plugin_result(result, merged)
+    }
+
+    /// Fold one plugin's result into the chain. Returns `Some` if the chain
+    /// should stop with that output.
+    #[allow(dead_code)]
+    fn merge_plugin_result(
+        result: Result<PluginResult, Error>,
+        merged: &mut PluginResult,
+    ) -> Option<PluginOutput> {
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => return Some(PluginOutput::Deny(format!("plugin error: {}", err))),
+        };
+
+        // Every plugin sees the original AST. A plan from one plugin cannot
+        // safely describe SQL rewritten by a different plugin.
+        if (result.plan.is_some() && matches!(merged.output, PluginOutput::Overwrite(_)))
+            || (matches!(result.output, PluginOutput::Overwrite(_)) && merged.plan.is_some())
+        {
+            return Some(PluginOutput::Deny(crate::messages::with_sqlstate(
+                crate::plugins::PLUGIN_DENIED,
+                "statement transformed by more than one plugin",
+            )));
+        }
+
+        if result.plan.is_some() {
+            if merged.plan.is_some() {
+                error!("More than one plugin planned the same statement");
+                return Some(PluginOutput::Deny(
+                    "statement planned by more than one plugin".into(),
+                ));
+            }
+            merged.plan = result.plan;
+        }
+
+        match result.output {
+            PluginOutput::Allow => None,
+            PluginOutput::Overwrite(statements) => {
+                if let PluginOutput::Overwrite(_) = merged.output {
+                    error!("More than one plugin rewrote the same query");
+                    return Some(PluginOutput::Deny(
+                        "query rewritten by more than one plugin".into(),
+                    ));
+                }
+                merged.output = PluginOutput::Overwrite(statements);
+                None
+            }
+            output => Some(output),
+        }
+    }
+
+    /// Queries may hold values that must not be logged: with a configured
+    /// plugin that says so, SQL text, literals and parse errors (which quote
+    /// the query) stay out of the logs. So they do if a section isn't loaded.
+    pub fn redact_queries(&self) -> bool {
+        self.configured_sections().any(|section| match section {
+            Section::On(plugin, config) => plugin.sensitive_queries(config),
+            Section::Off => false,
+            Section::NotLoaded => true,
+        })
+    }
+
+    /// The text of the server's errors and notices is withheld from clients:
+    /// a configured plugin that's on says so. So it is if a section isn't
+    /// loaded.
+    pub fn withholds_server_text(&self) -> bool {
+        self.configured_sections().any(|section| match section {
+            Section::On(plugin, config) => plugin.withholds_server_text(config),
+            Section::Off => false,
+            Section::NotLoaded => true,
+        })
+    }
+
+    /// The pool's `[plugins.<name>]` sections: those of registered configured
+    /// plugins in registration order, then any no plugin is registered for.
+    /// It runs for every statement, so it doesn't allocate.
+    fn configured_sections(&self) -> impl Iterator<Item = Section<'_>> + '_ {
+        self.named_configured_sections().map(|(_, section)| section)
+    }
+
+    /// [`Self::configured_sections`], with each one's plugin name:
+    /// `NO_PLUGIN` for those no plugin is registered for.
+    fn named_configured_sections(&self) -> impl Iterator<Item = (&'static str, Section<'_>)> + '_ {
+        let sections = self
+            .pool_settings
+            .plugins
+            .as_ref()
+            .map(|plugins| &plugins.configured)
+            .filter(|sections| !sections.is_empty());
+        let registered = sections.into_iter().flat_map(move |sections| {
+            self.registered_plugins
+                .configured_plugins()
+                .filter_map(move |(name, plugin)| {
+                    sections
+                        .get(name)
+                        .map(|section| (name, Section::resolve(Some(plugin), section)))
+                })
+        });
+        let unregistered = sections
+            .into_iter()
+            .flatten()
+            .filter(move |(name, _)| self.registered_plugins.configured_plugin(name).is_none())
+            .map(|(_, section)| (NO_PLUGIN, Section::resolve(None, section)));
+        registered.chain(unregistered)
+    }
+
+    /// Identifies the plugin configuration statements are planned with: 0 if
+    /// no plugin that plans them is on. A statement planned with another
+    /// generation must be planned again.
+    pub fn plan_generation(&self) -> u64 {
+        self.plan_generation
+    }
+
+    fn compute_plan_generation(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        if !self.plugins_enabled() {
+            return 0;
+        }
+        let sections: Vec<_> = match self.pool_settings.plugins {
+            Some(ref plugins) => plugins
+                .configured
+                .iter()
+                .filter(|(name, section)| {
+                    !matches!(
+                        Section::resolve(self.registered_plugins.configured_plugin(name), section),
+                        Section::Off
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        if sections.is_empty() {
+            return 0;
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sections.hash(&mut hasher);
+        hasher.finish() | 1
+    }
+
+    /// Registered code runs independently of pool TOML and parser routing
+    /// settings. Legacy plugins retain their configured parser requirement.
+    pub fn plugins_enabled(&self) -> bool {
+        self.registered_plugins.has_process_plugins()
+            || (self.pool_settings.plugins.is_some() && self.pool_settings.query_parser_enabled)
+    }
+
+    /// Queries that can't be parsed must be rejected instead of forwarded,
+    /// because a plugin needs to see every query.
+    pub fn plugins_require_parse(&self) -> bool {
+        self.registered_plugins.has_process_plugins()
+            || (self.plugins_enabled() && self.pool_settings.plugins_require_parse)
+    }
+
+    /// External policy is opaque to the core, so no unparsed query can bypass
+    /// it. Nor can one bypass a configured plugin that's on, unless it allows
+    /// unparsed queries outside its gated tables. Legacy plugins, and those
+    /// that allow them, retain their table-scoped compatibility exceptions.
+    pub fn rejects_unparsed(&self, message: &BytesMut) -> bool {
+        if self.registered_plugins.has_process_plugins() {
+            return true;
+        }
+        // A section no plugin parsed can't say what it checks.
+        if self.plugins_enabled()
+            && self
+                .configured_sections()
+                .any(|section| matches!(section, Section::NotLoaded))
+        {
+            return true;
+        }
+        let every = self.refuses_every_unparsed();
+        if !every && !self.plugins_require_parse() {
+            return false;
+        }
+
+        let mut cursor = Cursor::new(message);
+        let code = cursor.get_u8() as char;
+        let _len = cursor.get_i32();
+
+        if code == 'P' && cursor.read_string().is_err() {
+            return true;
+        }
+
+        match cursor.read_string() {
+            Ok(query) => {
+                !TABLE_FREE_UNPARSED_REGEX.is_match(&query)
+                    && (every || self.might_touch_gated(&query))
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// A configured plugin that's on sees every statement that reaches the
+    /// server, unless it allows unparsed ones outside its gated tables (see
+    /// `ConfiguredPlugin::allows_unparsed_outside_gated_tables`).
+    fn refuses_every_unparsed(&self) -> bool {
+        self.plugins_enabled()
+            && self.configured_sections().any(|section| match section {
+                Section::On(plugin, config) => !plugin.allows_unparsed_outside_gated_tables(config),
+                Section::Off | Section::NotLoaded => false,
+            })
+    }
+
+    /// A query the parser couldn't read might touch a table a plugin checks:
+    /// its text has a name a plugin gates (a table's, or a function's that
+    /// runs SQL given as text, which can build any name), or Unicode escapes
+    /// (`U&"..."`), which can spell any name.
+    fn might_touch_gated(&self, query: &str) -> bool {
+        let query = query.to_ascii_lowercase();
+        query.contains("u&")
+            || self
+                .gated_tables()
+                .iter()
+                .any(|table| query.contains(&table.to_ascii_lowercase()))
+    }
+
+    /// Names plugins gate: the tables they check statements on, and others an
+    /// unparsed query mustn't mention (see `ConfiguredPlugin::gated_tables`).
+    fn gated_tables(&self) -> Vec<&str> {
+        let mut tables = Vec::new();
+        if let Some(ref plugins) = self.pool_settings.plugins {
+            if let Some(ref table_access) = plugins.table_access {
+                if table_access.enabled {
+                    tables.extend(table_access.tables.iter().map(String::as_str));
+                }
+            }
+        }
+        for section in self.configured_sections() {
+            if let Section::On(plugin, config) = section {
+                tables.extend(plugin.gated_tables(config));
+            }
+        }
+        tables
     }
 
     fn set_sharding_key(&mut self, sharding_key: i64) -> Option<usize> {
@@ -1282,6 +2032,19 @@ mod test {
     use crate::sharding::ShardingFunction;
     use bytes::BufMut;
     use serial_test::serial;
+
+    #[test]
+    fn test_might_quote_token() {
+        let twenty = "aZ09-_".repeat(4)[..20].to_string();
+        assert!(might_quote_token(&twenty));
+        assert!(might_quote_token(&format!("bad token: {}.", twenty)));
+        assert!(!might_quote_token(&twenty[..19]));
+        // Other characters end a run.
+        for separator in [".", "+", "/", "=", " ", "\0", "é"] {
+            let split = format!("{}{}{}", &twenty[..10], separator, &twenty[10..]);
+            assert!(!might_quote_token(&split), "{:?}", split);
+        }
+    }
 
     #[test]
     fn test_defaults() {
@@ -1643,6 +2406,7 @@ mod test {
             db_activity_ttl: PoolSettings::default().db_activity_ttl,
             table_mutation_cache_ms_ttl: PoolSettings::default().table_mutation_cache_ms_ttl,
             plugins: None,
+            ..Default::default()
         };
         let mut qr = QueryRouter::new();
         assert_eq!(qr.active_role, None);
@@ -1726,6 +2490,7 @@ mod test {
             db_activity_ttl: PoolSettings::default().db_activity_ttl,
             table_mutation_cache_ms_ttl: PoolSettings::default().table_mutation_cache_ms_ttl,
             plugins: None,
+            ..Default::default()
         };
 
         let mut qr = QueryRouter::new();
@@ -2092,6 +2857,124 @@ mod test {
         assert!(qr.placeholders.is_empty());
     }
 
+    /// A router with the table_access plugin forbidding `secrets`, and
+    /// plugins_require_parse on.
+    fn forbidding_secrets() -> QueryRouter {
+        use crate::config::{Plugins, TableAccess};
+        QueryRouter::setup();
+        let pool_settings = PoolSettings {
+            query_parser_enabled: true,
+            plugins_require_parse: true,
+            plugins: Some(Plugins {
+                table_access: Some(TableAccess {
+                    enabled: true,
+                    tables: vec![String::from("secrets")],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut qr = QueryRouter::new();
+        qr.update_pool_settings(&pool_settings);
+        qr
+    }
+
+    #[test]
+    fn test_parse_fuzz() {
+        use crate::fuzz::Rng;
+        let qr = forbidding_secrets();
+        let pieces: [&[u8]; 6] = [
+            b"SELECT 1",
+            b"\0",
+            b"s",
+            b"COPY secrets FROM STDIN",
+            b";",
+            b"\xff",
+        ];
+        for seed in 0..5_000 {
+            let mut rng = Rng::new(seed);
+            let mut body = Vec::new();
+            for _ in 0..rng.below(5) {
+                match rng.one_in(3) {
+                    true => body.extend(rng.bytes(4)),
+                    false => body.extend(*rng.pick(&pieces)),
+                }
+            }
+            let mut message = BytesMut::new();
+            message.put_u8(*rng.pick(b"QP"));
+            message.put_i32(body.len() as i32 + 4);
+            message.put_slice(&body);
+            // Whatever the bytes, each returns.
+            let _ = qr.parse(&message);
+            let _ = qr.rejects_unparsed(&message);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forbidden_table_fuzz() {
+        use crate::fuzz::Rng;
+        let qr = forbidding_secrets();
+        let spellings = [
+            "secrets",
+            "SECRETS",
+            "Secrets",
+            "\"secrets\"",
+            "public.secrets",
+            "public.\"secrets\"",
+            "\"public\".secrets",
+        ];
+        let statements = [
+            "SELECT * FROM {t}",
+            "SELECT a FROM {t} WHERE b = 1",
+            "SELECT * FROM other JOIN {t} ON true",
+            "SELECT * FROM (SELECT * FROM {t}) s",
+            "WITH w AS (SELECT * FROM {t}) SELECT * FROM w",
+            "SELECT 1 UNION SELECT a FROM {t}",
+            "SELECT (SELECT a FROM {t} LIMIT 1)",
+            "SELECT * FROM other WHERE a IN (SELECT a FROM {t})",
+            "INSERT INTO {t} VALUES (1)",
+            "INSERT INTO other SELECT * FROM {t}",
+            "UPDATE {t} SET a = 1",
+            "DELETE FROM {t}",
+            "COPY {t} TO STDOUT",
+            "COPY (SELECT * FROM {t}) TO STDOUT",
+            "COPY {t} FROM STDIN",
+            "TABLE {t}",
+            "SELECT * FROM ONLY {t}",
+            "EXPLAIN ANALYZE SELECT * FROM {t}",
+            "CREATE TABLE copied AS SELECT * FROM {t}",
+        ];
+        let spaces = [" ", "  ", "\n", "\t", " /* c */ ", " -- c\n"];
+
+        for seed in 0..5_000 {
+            let mut rng = Rng::new(seed);
+            let statement = rng.pick(&statements).replace("{t}", rng.pick(&spellings));
+            let mut sql = String::new();
+            let mut quoted = false;
+            for c in statement.chars() {
+                quoted ^= c == '"';
+                match c {
+                    ' ' => sql.push_str(rng.pick(&spaces)),
+                    // Outside quotes, Postgres folds names and keywords to lower case.
+                    _ if !quoted && rng.one_in(2) => sql.push(c.to_ascii_uppercase()),
+                    _ => sql.push(c),
+                }
+            }
+
+            // Refused unread, or read and denied: never forwarded unchecked.
+            let message = simple_query(&sql);
+            match qr.parse(&message) {
+                Ok(ast) => assert!(
+                    matches!(qr.execute_plugins(&ast).await, Ok(PluginOutput::Deny(_))),
+                    "seed {}: {:?}",
+                    seed,
+                    sql
+                ),
+                Err(_) => assert!(qr.rejects_unparsed(&message), "seed {}: {:?}", seed, sql),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_table_access_plugin() {
         use crate::config::{Plugins, TableAccess};
@@ -2104,6 +2987,7 @@ mod test {
             intercept: None,
             query_logger: None,
             prewarmer: None,
+            ..Default::default()
         };
 
         QueryRouter::setup();
@@ -2126,6 +3010,427 @@ mod test {
                 "permission for table \"pg_database\" denied".to_string()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_table_access_checks_original_and_rewritten_statements() {
+        use crate::config::{Plugins, TableAccess, Testing};
+
+        let rewrites = [
+            ("select * from allowed where false", "SELECT * FROM blocked"),
+            ("select * from blocked where false", "SELECT * FROM allowed"),
+            ("select * from other where false", "SELECT * FROM allowed"),
+            // `COPY t` isn't visited as a relation; table_access checks it.
+            ("select * from copied where false", "COPY blocked TO STDOUT"),
+        ];
+        let pool_settings = PoolSettings {
+            query_parser_enabled: true,
+            plugins: Some(Plugins {
+                table_access: Some(TableAccess {
+                    enabled: true,
+                    tables: vec![String::from("blocked")],
+                }),
+                testing: Some(Testing {
+                    enabled: true,
+                    rewrites: rewrites
+                        .iter()
+                        .map(|(from, to)| (from.to_string(), to.to_string()))
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        qr.update_pool_settings(&pool_settings);
+        let run = |sql: &str| {
+            let ast = qr.parse(&simple_query(sql)).unwrap();
+            let qr = &qr;
+            async move { qr.execute_plugins(&ast).await.unwrap() }
+        };
+        let original_denial = PluginOutput::Deny("permission for table \"blocked\" denied".into());
+
+        assert_eq!(run("SELECT * FROM blocked").await, original_denial);
+        assert_eq!(run("SELECT * FROM allowed").await, PluginOutput::Allow);
+        assert_eq!(
+            run("SELECT * FROM blocked WHERE false").await,
+            original_denial
+        );
+        assert_eq!(
+            run("SELECT * FROM other WHERE false").await,
+            PluginOutput::Overwrite(qr.parse(&simple_query("SELECT * FROM allowed")).unwrap())
+        );
+        for sql in [
+            "SELECT * FROM allowed WHERE false",
+            "SELECT * FROM copied WHERE false",
+        ] {
+            assert_eq!(
+                run(sql).await,
+                PluginOutput::Deny(crate::messages::with_sqlstate(
+                    crate::plugins::PLUGIN_DENIED,
+                    "permission denied for rewritten statement",
+                )),
+                "{}",
+                sql
+            );
+        }
+    }
+
+    /// A plugin whose rewrite holds no table but prints as SQL that names one.
+    struct Smuggles(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::plugins::registry::RegisteredPlugin for Smuggles {
+        async fn on_query(
+            &self,
+            _context: &PluginContext<'_>,
+            _statements: &[Statement],
+        ) -> Result<PluginResult, Error> {
+            use sqlparser::ast::{visit_expressions_mut, visit_relations, Expr};
+            use std::ops::ControlFlow;
+
+            let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT a").unwrap();
+            let _ = visit_expressions_mut(&mut statements, |expr| {
+                if let Expr::Identifier(ident) = expr {
+                    ident.value = self.0.into();
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            assert!(visit_relations(&statements, |_| ControlFlow::Break(())).is_continue());
+            Ok(PluginOutput::Overwrite(statements).into())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rewrites_are_checked_as_the_sql_that_is_sent() {
+        use crate::config::{Plugins, TableAccess};
+        use crate::messages::with_sqlstate;
+        use crate::plugins::registry::PluginRegistry;
+        use crate::plugins::{statements_to_sql, PLUGIN_DENIED, PLUGIN_FAILED};
+
+        let settings = PoolSettings {
+            query_parser_enabled: true,
+            plugins: Some(Plugins {
+                table_access: Some(TableAccess {
+                    enabled: true,
+                    tables: vec!["blocked".into()],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        QueryRouter::setup();
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT 1").unwrap();
+        for (smuggled, expected) in [
+            // table_access sees the table.
+            (
+                "1 FROM blocked",
+                Some((PLUGIN_DENIED, "permission denied for rewritten statement")),
+            ),
+            (
+                "1 FROM",
+                Some((PLUGIN_FAILED, "a plugin's rewrite can't be parsed")),
+            ),
+            ("1 FROM allowed", None),
+        ] {
+            let mut registry = PluginRegistry::default();
+            registry.register("smuggles", Smuggles(smuggled)).unwrap();
+            let mut qr = QueryRouter::with_plugins(std::sync::Arc::new(registry));
+            qr.update_pool_settings(&settings);
+
+            for parse in [false, true] {
+                let result = match parse {
+                    true => qr.execute_parse_plugins(&ast, &[], None).await,
+                    false => qr.execute_query_plugins(&ast, None).await,
+                };
+                match (result.unwrap().output, expected) {
+                    (PluginOutput::Deny(error), Some((code, message))) => {
+                        assert_eq!(error, with_sqlstate(code, message), "{}", smuggled)
+                    }
+                    (PluginOutput::Overwrite(statements), None) => {
+                        assert_eq!(statements_to_sql(&statements), "SELECT 1 FROM allowed")
+                    }
+                    (output, _) => panic!("{} (parse: {}): {:?}", smuggled, parse, output),
+                }
+            }
+        }
+    }
+
+    fn testing_plugin_settings(require_parse: bool) -> PoolSettings {
+        use crate::config::{Plugins, Testing};
+
+        let testing = Testing {
+            enabled: true,
+            rewrites: [("select 1".to_string(), "SELECT 2".to_string())].into(),
+            ..Default::default()
+        };
+
+        PoolSettings {
+            query_parser_enabled: true,
+            plugins_require_parse: require_parse,
+            plugins: Some(Plugins {
+                testing: Some(testing),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plugin_overwrite_simple_query() {
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        qr.update_pool_settings(&testing_plugin_settings(false));
+
+        let ast = qr.parse(&simple_query("SELECT 1")).unwrap();
+        let statements = match qr.execute_plugins(&ast).await {
+            Ok(PluginOutput::Overwrite(statements)) => statements,
+            other => panic!("expected a rewrite, got {:?}", other),
+        };
+
+        // This is the Q message the client code sends instead.
+        let rewritten = simple_query(&crate::plugins::statements_to_sql(&statements));
+        assert_eq!(rewritten, simple_query("SELECT 2"));
+
+        // Other queries are left alone.
+        let ast = qr.parse(&simple_query("SELECT 3")).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await, Ok(PluginOutput::Allow));
+    }
+
+    fn parse_message(name: &str, query: &str, param_types: &[i32]) -> BytesMut {
+        let mut payload = BytesMut::new();
+        payload.put_slice(format!("{}\0{}\0", name, query).as_bytes());
+        payload.put_i16(param_types.len() as i16);
+        for oid in param_types {
+            payload.put_i32(*oid);
+        }
+
+        let mut message = BytesMut::from(&b"P"[..]);
+        message.put_i32(payload.len() as i32 + 4);
+        message.put(payload);
+        message
+    }
+
+    #[tokio::test]
+    async fn test_plugin_overwrite_parse() {
+        use crate::messages::Parse;
+
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        qr.update_pool_settings(&testing_plugin_settings(false));
+
+        let message = parse_message("my_stmt", "SELECT 1", &[23, 25]);
+        let ast = qr.parse(&message).unwrap();
+        let statements = match qr.execute_plugins(&ast).await {
+            Ok(PluginOutput::Overwrite(statements)) => statements,
+            other => panic!("expected a rewrite, got {:?}", other),
+        };
+
+        // Same steps as the client code: swap the query, keep name and param OIDs.
+        let parse: Parse = (&message).try_into().unwrap();
+        let rewritten: BytesMut = parse
+            .with_query(crate::plugins::statements_to_sql(&statements))
+            .try_into()
+            .unwrap();
+
+        assert_eq!(rewritten, parse_message("my_stmt", "SELECT 2", &[23, 25]));
+    }
+
+    #[tokio::test]
+    async fn test_plugin_overwrite_shares_prepared_statement_cache() {
+        use crate::messages::Parse;
+        use crate::pool::PreparedStatementCache;
+
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        qr.update_pool_settings(&testing_plugin_settings(false));
+
+        let mut cache = PreparedStatementCache::new(10);
+        let mut names = Vec::new();
+
+        // Two clients with different statement names, and one that sends the
+        // rewritten SQL directly, all share one server-side statement.
+        for (name, query) in [("a", "SELECT 1"), ("b", "SELECT 1"), ("c", "SELECT 2")] {
+            let message = parse_message(name, query, &[]);
+            let ast = qr.parse(&message).unwrap();
+            let parse: Parse = (&message).try_into().unwrap();
+            let parse = match qr.execute_plugins(&ast).await {
+                Ok(PluginOutput::Overwrite(statements)) => {
+                    parse.with_query(crate::plugins::statements_to_sql(&statements))
+                }
+                _ => parse,
+            };
+
+            assert_eq!(parse.query(), "SELECT 2");
+            names.push(cache.get_or_insert(&parse, parse.get_hash()).name.clone());
+        }
+
+        assert_eq!(names[0], names[1]);
+        assert_eq!(names[0], names[2]);
+    }
+
+    #[tokio::test]
+    async fn test_plugin_plans_bind() {
+        use crate::config::TestingCopyParam;
+        use crate::messages::Bind;
+        use crate::plugins::ExecuteContext;
+
+        QueryRouter::setup();
+        let mut settings = testing_plugin_settings(false);
+        if let Some(ref mut plugins) = settings.plugins {
+            plugins.testing.as_mut().unwrap().copy_param = Some(TestingCopyParam {
+                table: "t".into(),
+                from: "a".into(),
+                to: "b".into(),
+            });
+        }
+        let mut qr = QueryRouter::new();
+        qr.update_pool_settings(&settings);
+
+        let message = parse_message("", "INSERT INTO t (c, a) VALUES ($2, $1), ($3, $4)", &[]);
+        let ast = qr.parse(&message).unwrap();
+        let result = qr.execute_parse_plugins(&ast, &[], None).await.unwrap();
+
+        match result.output {
+            PluginOutput::Overwrite(ref statements) => assert_eq!(
+                crate::plugins::statements_to_sql(statements),
+                "INSERT INTO t (c, a, b) VALUES ($2, $1, $5), ($3, $4, $6)"
+            ),
+            ref other => panic!("expected a rewrite, got {:?}", other),
+        }
+
+        let plan = result.plan.expect("a plan");
+        assert_eq!(plan.client_params, 4);
+        assert_eq!(plan.appended_param_types, vec![25, 25]);
+
+        // Bind: c1, a1, c2, a2 in text format.
+        let mut payload = BytesMut::from(&b"\0\0"[..]);
+        payload.put_i16(0);
+        payload.put_i16(4);
+        for value in [&b"a1"[..], b"c1", b"c2", b"a2"] {
+            payload.put_i32(value.len() as i32);
+            payload.put_slice(value);
+        }
+        payload.put_i16(0);
+        let mut bind = BytesMut::from(&b"B"[..]);
+        bind.put_i32(payload.len() as i32 + 4);
+        bind.put(payload);
+
+        let bind: Bind = (&bind).try_into().unwrap();
+        let mut params = bind.params();
+        let mut ctx = ExecuteContext::new(qr.pool_settings(), None);
+        plan.hooks
+            .on_bind(&mut ctx, &plan, &mut params)
+            .await
+            .unwrap();
+
+        assert!(params.modified());
+        assert_eq!(params.len(), 6);
+        assert_eq!(params.value(4), Some(&b"a1"[..]));
+        assert_eq!(params.value(5), Some(&b"a2"[..]));
+    }
+
+    #[test]
+    fn test_merge_plugin_result() {
+        let mut merged = PluginResult::from(PluginOutput::Allow);
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT 2").unwrap();
+        let overwrite = || Ok(PluginOutput::Overwrite(statements.clone()).into());
+
+        assert!(
+            QueryRouter::merge_plugin_result(Ok(PluginOutput::Allow.into()), &mut merged).is_none()
+        );
+        assert!(QueryRouter::merge_plugin_result(overwrite(), &mut merged).is_none());
+        assert_eq!(merged.output, PluginOutput::Overwrite(statements.clone()));
+
+        // A second rewrite can't be combined with the first one.
+        assert!(matches!(
+            QueryRouter::merge_plugin_result(overwrite(), &mut merged),
+            Some(PluginOutput::Deny(_))
+        ));
+
+        // Deny stops the chain, and so does a plugin error.
+        let mut merged = PluginResult::from(PluginOutput::Allow);
+        assert_eq!(
+            QueryRouter::merge_plugin_result(
+                Ok(PluginOutput::Deny("no".into()).into()),
+                &mut merged
+            ),
+            Some(PluginOutput::Deny("no".into()))
+        );
+        assert!(matches!(
+            QueryRouter::merge_plugin_result(Err(Error::UnsupportedStatement), &mut merged),
+            Some(PluginOutput::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn test_plugins_require_parse() {
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+
+        // No plugins: nothing is required, even if the flag is set.
+        qr.update_pool_settings(&PoolSettings {
+            plugins_require_parse: true,
+            ..Default::default()
+        });
+        assert!(!qr.plugins_require_parse());
+
+        // Plugins from the global config on a pool with the parser off don't run.
+        let mut settings = testing_plugin_settings(true);
+        settings.query_parser_enabled = false;
+        qr.update_pool_settings(&settings);
+        assert!(!qr.plugins_enabled());
+        assert!(!qr.plugins_require_parse());
+
+        let mut settings = testing_plugin_settings(false);
+        qr.update_pool_settings(&settings);
+        assert!(!qr.plugins_require_parse());
+
+        settings.plugins_require_parse = true;
+        settings.query_parser_max_length = Some(48);
+        if let Some(ref mut plugins) = settings.plugins {
+            plugins.table_access = Some(crate::config::TableAccess {
+                enabled: true,
+                tables: vec!["secrets".into(), "a_very_long_table_name".into()],
+            });
+        }
+        qr.update_pool_settings(&settings);
+        assert!(qr.plugins_require_parse());
+
+        // These might touch a table a plugin checks: rejected by the client
+        // instead of being forwarded.
+        for query in [
+            "SELEKT * FROM secrets",
+            "SELECT 1 FROM a_very_long_table_name, and_another_one",
+            "SELECT * FROM ONLY secrets",
+            "UPDATE ONLY Secrets SET a = 1",
+            "SELEKT * FROM U&\"\\0073ecrets\"",
+        ] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{}",
+                query
+            );
+        }
+
+        // These can't: forwarded, for the server to answer.
+        for query in ["SELEKT 1", "SELECT * FROM ONLY other"] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+
+        // The parser doesn't know RESET, but it can't touch a table.
+        let message = simple_query("RESET ALL");
+        assert!(qr.parse(&message).is_err());
+        assert!(!qr.rejects_unparsed(&message));
+        assert!(!qr.rejects_unparsed(&simple_query("reset search_path;")));
+        assert!(!qr.rejects_unparsed(&parse_message("", "RESET ALL", &[])));
     }
 
     #[tokio::test]

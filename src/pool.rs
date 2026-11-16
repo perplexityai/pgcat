@@ -24,12 +24,14 @@ use crate::config::{
     get_config, Address, DefaultShard, General, LoadBalancingMode, Plugins, PoolMode, Role, User,
 };
 use crate::errors::Error;
+use crate::identity::TenantGuard;
 
 use crate::auth_passthrough::AuthPassthrough;
 use crate::messages::Parse;
 use crate::plugins::prewarmer;
 use crate::server::{Server, ServerParameters};
 use crate::sharding::ShardingFunction;
+use crate::sql_observer::SqlObserver;
 use crate::stats::{AddressStats, ClientStats, ServerStats};
 
 pub type ProcessId = i32;
@@ -45,6 +47,14 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 /// This is atomic and safe and read-optimized.
 /// The pool is recreated dynamically when the config is reloaded.
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
+
+/// Counts the times `POOLS` was replaced, so a client can tell a reload
+/// happened without looking its pool up on every message.
+static POOLS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn pools_generation() -> u64 {
+    POOLS_GENERATION.load(Ordering::Acquire)
+}
 
 // Reasons for banning a server.
 #[derive(Debug, PartialEq, Clone)]
@@ -226,6 +236,27 @@ pub struct PoolSettings {
     pub auth_query_user: Option<String>,
     pub auth_query_password: Option<String>,
 
+    /// Reject unparseable queries when plugins are configured.
+    pub plugins_require_parse: bool,
+
+    /// Longest a plugin hook may run for one statement.
+    pub plugin_hook_timeout: std::time::Duration,
+
+    /// Plugins that support it reject the statements they cover without a
+    /// caller identity (`PluginContext::identity_required`).
+    pub identity_required_for_plugins: bool,
+
+    /// Refuses statements that would set the session parameter pgcat sets to
+    /// the tenant of the client's verified identity (`identity_tenant_parameter`).
+    pub tenant_guard: Option<TenantGuard>,
+
+    /// Batch size (rows, bytes) for plugins that rewrite result rows.
+    pub plugin_response_batch_rows: usize,
+    pub plugin_response_batch_bytes: usize,
+
+    /// Counts the SQL statements clients send (`sql_observer_enabled`).
+    pub sql_observer: SqlObserver,
+
     /// Plugins
     pub plugins: Option<Plugins>,
 }
@@ -260,6 +291,15 @@ impl Default for PoolSettings {
             auth_query: None,
             auth_query_user: None,
             auth_query_password: None,
+            plugins_require_parse: false,
+            plugin_hook_timeout: std::time::Duration::from_millis(
+                crate::config::Pool::default_plugin_hook_timeout(),
+            ),
+            identity_required_for_plugins: false,
+            tenant_guard: None,
+            plugin_response_batch_rows: crate::config::Pool::default_plugin_response_batch_rows(),
+            plugin_response_batch_bytes: crate::config::Pool::default_plugin_response_batch_bytes(),
+            sql_observer: SqlObserver::default(),
             plugins: None,
         }
     }
@@ -316,14 +356,14 @@ impl ConnectionPool {
         let mut address_id: usize = 0;
 
         for (pool_name, pool_config) in &config.pools {
-            let new_pool_hash_value = pool_config.hash_value();
+            let new_pool_hash_value = pool_config.hash_value_inheriting(config.plugins.as_ref());
 
             // There is one pool per database/user pair.
             for user in pool_config.users.values() {
                 let old_pool_ref = get_pool(pool_name, &user.username);
                 let identifier = PoolIdentifier::new(pool_name, &user.username);
 
-                if let Some(pool) = old_pool_ref {
+                if let Some(pool) = &old_pool_ref {
                     // If the pool hasn't changed, get existing reference and insert it into the new_pools.
                     // We replace all pools at the end, but if the reference is kept, the pool won't get re-created (bb8).
                     if pool.config_hash == new_pool_hash_value {
@@ -452,10 +492,9 @@ impl ConnectionPool {
                             &shard.database,
                             client_server_map.clone(),
                             pool_auth_hash.clone(),
-                            match pool_config.plugins {
-                                Some(ref plugins) => Some(plugins.clone()),
-                                None => config.plugins.clone(),
-                            },
+                            pool_config
+                                .plugins_inheriting(config.plugins.as_ref())
+                                .cloned(),
                             pool_config.cleanup_server_connections,
                             pool_config.log_client_parameter_status_changes,
                             pool_config.prepared_statements_cache_size,
@@ -584,10 +623,27 @@ impl ConnectionPool {
                         auth_query: pool_config.auth_query.clone(),
                         auth_query_user: pool_config.auth_query_user.clone(),
                         auth_query_password: pool_config.auth_query_password.clone(),
-                        plugins: match pool_config.plugins {
-                            Some(ref plugins) => Some(plugins.clone()),
-                            None => config.plugins.clone(),
+                        plugins_require_parse: pool_config.plugins_require_parse,
+                        plugin_hook_timeout: std::time::Duration::from_millis(
+                            pool_config.plugin_hook_timeout,
+                        ),
+                        identity_required_for_plugins: pool_config.identity_required_for_plugins,
+                        tenant_guard: match pool_config.identity_tenant_parameter {
+                            Some(ref parameter) => Some(TenantGuard::new(parameter)?),
+                            None => None,
                         },
+                        plugin_response_batch_rows: pool_config.plugin_response_batch_rows,
+                        plugin_response_batch_bytes: pool_config.plugin_response_batch_bytes,
+                        sql_observer: SqlObserver::new(
+                            pool_config.sql_observer_enabled,
+                            old_pool_ref
+                                .as_ref()
+                                .map(|pool| &pool.settings.sql_observer),
+                            &identifier,
+                        ),
+                        plugins: pool_config
+                            .plugins_inheriting(config.plugins.as_ref())
+                            .cloned(),
                     }),
                     validated: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
@@ -610,12 +666,21 @@ impl ConnectionPool {
                     });
                 }
 
-                // There is one pool per database/user pair.
                 new_pools.insert(PoolIdentifier::new(pool_name, &user.username), pool);
             }
         }
 
-        POOLS.store(Arc::new(new_pools.clone()));
+        // Install the relation hubs and publish the pools in one step, so a
+        // published pool's hub is always live.
+        let published = Arc::new(new_pools.clone());
+        let candidates: Vec<_> = new_pools
+            .values()
+            .map(|pool| &pool.settings.sql_observer)
+            .collect();
+        crate::sql_observer::publish(&candidates, || {
+            POOLS.store(published.clone());
+            POOLS_GENERATION.fetch_add(1, Ordering::Release);
+        });
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 //! table as part of their query. If they can't, the query will not be routed.
 
 use async_trait::async_trait;
-use sqlparser::ast::{visit_relations, Statement};
+use sqlparser::ast::{visit_relations, CopySource, ObjectName, Statement};
 
 use crate::{
     errors::Error,
@@ -31,18 +31,23 @@ impl<'a> Plugin for TableAccess<'a> {
         }
 
         let mut found = None;
-
         let _ = visit_relations(ast, |relation| {
-            let relation = relation.to_string();
-            let parts = relation.split('.').collect::<Vec<&str>>();
-            let table_name = parts.last().unwrap();
-
-            if self.tables.contains(&table_name.to_string()) {
-                found = Some(table_name.to_string());
-                ControlFlow::<()>::Break(())
-            } else {
-                ControlFlow::<()>::Continue(())
+            found = self.forbidden(relation);
+            match found {
+                Some(_) => ControlFlow::<()>::Break(()),
+                None => ControlFlow::<()>::Continue(()),
             }
+        });
+
+        // `visit_relations` doesn't visit the table of `COPY t`.
+        let found = found.or_else(|| {
+            ast.iter().find_map(|statement| match statement {
+                Statement::Copy {
+                    source: CopySource::Table { table_name, .. },
+                    ..
+                } => self.forbidden(table_name),
+                _ => None,
+            })
         });
 
         if let Some(found) = found {
@@ -58,9 +63,50 @@ impl<'a> Plugin for TableAccess<'a> {
     }
 }
 
+impl TableAccess<'_> {
+    /// The table's name, if it is one of the forbidden tables.
+    fn forbidden(&self, relation: &ObjectName) -> Option<String> {
+        let table = relation.0.last()?;
+        // Postgres folds a name to lower case unless it's quoted.
+        let name = match table.quote_style {
+            Some(_) => table.value.clone(),
+            None => table.value.to_ascii_lowercase(),
+        };
+        self.tables.contains(&name).then_some(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    async fn refused(sql: &str) -> bool {
+        let tables = vec!["secrets".to_string()];
+        let mut plugin = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        matches!(
+            plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
+            PluginOutput::Deny(_)
+        )
+    }
+
+    #[tokio::test]
+    async fn test_copy_of_a_forbidden_table_is_refused() {
+        for sql in [
+            "SELECT * FROM secrets",
+            "COPY secrets TO STDOUT",
+            "COPY public.secrets (a) TO STDOUT",
+            "COPY (SELECT a FROM secrets) TO STDOUT",
+        ] {
+            assert!(refused(sql).await, "{}", sql);
+        }
+        assert!(!refused("COPY other TO STDOUT").await);
+    }
 
     #[test]
     fn test_table_access_struct_creation() {

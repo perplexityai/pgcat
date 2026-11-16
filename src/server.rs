@@ -149,6 +149,24 @@ impl std::fmt::Display for CleanupState {
     }
 }
 
+/// What pgcat knows about the tenant parameter (`identity_tenant_parameter`) on
+/// a server connection. Postgres doesn't report custom parameters back to the
+/// client, so pgcat keeps track of what it set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TenantParameter {
+    /// Reset by pgcat.
+    Unset,
+
+    /// Set by pgcat to this tenant.
+    Set(String),
+
+    /// Can't tell: a new connection (a role or database default may set it), a
+    /// client checked the connection out, reset the session or sent a statement
+    /// that names it, or a transaction in which pgcat set it ended (a ROLLBACK
+    /// undoes the SET). pgcat sets or resets it before it's used.
+    Unknown,
+}
+
 static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut set = HashSet::new();
     set.insert("client_encoding".to_string());
@@ -229,6 +247,10 @@ impl ServerParameters {
         diff
     }
 
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.parameters.get(key).map(String::as_str)
+    }
+
     pub fn get_application_name(&self) -> &String {
         // Can unwrap because we set it in the constructor
         self.parameters.get("application_name").unwrap()
@@ -296,6 +318,20 @@ pub struct Server {
 
     /// If server connection requires reset statements before checkin
     cleanup_state: CleanupState,
+
+    /// The last ReadyForQuery said the transaction failed.
+    transaction_failed: bool,
+
+    /// The tenant parameter, as far as pgcat knows.
+    tenant: TenantParameter,
+
+    /// pgcat set the tenant parameter inside the current transaction.
+    tenant_set_in_transaction: bool,
+
+    /// What the last `recv` saw, for the SQL observer: an ErrorResponse, and
+    /// the ReadyForQuery status byte.
+    reply_error: bool,
+    reply_rfq: Option<u8>,
 
     /// Mapping of clients and servers used for query cancellation.
     client_server_map: ClientServerMap,
@@ -400,15 +436,15 @@ impl Server {
                     debug!("Connecting to server using TLS");
 
                     let mut root_store = RootCertStore::empty();
-                    root_store.add_server_trust_anchors(
-                        webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+                    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(
+                        |ta| {
                             OwnedTrustAnchor::from_subject_spki_name_constraints(
                                 ta.subject,
                                 ta.spki,
                                 ta.name_constraints,
                             )
-                        }),
-                    );
+                        },
+                    ));
 
                     let mut tls_config = rustls::ClientConfig::builder()
                         .with_safe_defaults()
@@ -808,6 +844,11 @@ impl Server {
                         data_available: false,
                         bad: false,
                         cleanup_state: CleanupState::new(),
+                        transaction_failed: false,
+                        tenant: TenantParameter::Unknown,
+                        tenant_set_in_transaction: false,
+                        reply_error: false,
+                        reply_rfq: None,
                         client_server_map,
                         addr_set,
                         connected_at: chrono::offset::Utc::now().naive_utc(),
@@ -899,6 +940,12 @@ impl Server {
         }
     }
 
+    /// Whether the last `recv` saw an ErrorResponse, and the ReadyForQuery
+    /// status byte it saw, if any.
+    pub fn last_reply(&self) -> (bool, Option<u8>) {
+        (self.reply_error, self.reply_rfq)
+    }
+
     /// Receive data from the server in response to a client request.
     /// This method must be called multiple times while `self.is_data_available()` is true
     /// in order to receive all data the server has to offer.
@@ -906,6 +953,9 @@ impl Server {
         &mut self,
         mut client_server_parameters: Option<&mut ServerParameters>,
     ) -> Result<BytesMut, Error> {
+        self.reply_error = false;
+        self.reply_rfq = None;
+
         loop {
             let mut message = match read_message(&mut self.stream).await {
                 Ok(message) => message,
@@ -927,25 +977,39 @@ impl Server {
 
             trace!("Message: {}", code);
 
+            if code == 'E' {
+                self.reply_error = true;
+            }
+
             match code {
                 // ReadyForQuery
                 'Z' => {
                     let transaction_state = message.get_u8() as char;
+                    self.reply_rfq = Some(transaction_state as u8);
 
                     match transaction_state {
                         // In transaction.
                         'T' => {
                             self.in_transaction = true;
+                            self.transaction_failed = false;
                         }
 
                         // Idle, transaction over.
                         'I' => {
                             self.in_transaction = false;
+                            self.transaction_failed = false;
+
+                            // Committed or rolled back: pgcat can't tell which.
+                            if self.tenant_set_in_transaction {
+                                self.tenant_set_in_transaction = false;
+                                self.tenant = TenantParameter::Unknown;
+                            }
                         }
 
                         // Some error occurred, the transaction was rolled back.
                         'E' => {
                             self.in_transaction = true;
+                            self.transaction_failed = true;
                         }
 
                         // Something totally unexpected, this is not a Postgres server we know.
@@ -1027,6 +1091,18 @@ impl Server {
                                 "PREPARE" => {
                                     debug!("Server connection marked for clean up");
                                     self.cleanup_state.needs_cleanup_prepare = true;
+                                }
+
+                                // ROLLBACK TO SAVEPOINT undoes a SET made after the
+                                // savepoint, the tenant parameter's included.
+                                "ROLLBACK" if self.tenant_set_in_transaction => {
+                                    self.tenant = TenantParameter::Unknown;
+                                }
+
+                                // RESET ALL and DISCARD ALL reset it however they were
+                                // sent. A RESET of another parameter costs a SET.
+                                "RESET" | "DISCARD ALL" => {
+                                    self.tenant = TenantParameter::Unknown;
                                 }
                                 _ => (),
                             }
@@ -1220,6 +1296,50 @@ impl Server {
         self.in_transaction
     }
 
+    /// The transaction status as a ReadyForQuery reports it: `I` idle, `T` in a
+    /// transaction, `E` in a failed one.
+    pub fn transaction_status(&self) -> u8 {
+        match (self.in_transaction, self.transaction_failed) {
+            (false, _) => b'I',
+            (true, false) => b'T',
+            (true, true) => b'E',
+        }
+    }
+
+    /// pgcat refused one of the client's statements inside its transaction: fail
+    /// the transaction on the server too, as Postgres would have, so the rest of
+    /// it can't commit. The client can only roll it back.
+    pub async fn fail_transaction(&mut self) -> Result<(), Error> {
+        if !self.in_transaction || self.transaction_failed {
+            return Ok(());
+        }
+        // A connection marked bad isn't used again: its transaction is lost.
+        if self.bad {
+            self.transaction_failed = true;
+            return Ok(());
+        }
+
+        self.run_statement(
+            "SELECT 'pgcat refused a statement in this transaction'::pg_catalog.int4",
+        )
+        .await?;
+
+        if !self.transaction_failed {
+            self.mark_bad("could not fail the transaction of a refused statement");
+            return Err(Error::ServerError);
+        }
+        Ok(())
+    }
+
+    /// A connection marked bad won't be used again: the transaction pgcat
+    /// opened on it is gone with it, as far as the client is concerned.
+    pub fn forget_transaction(&mut self) {
+        if self.bad {
+            self.in_transaction = false;
+            self.transaction_failed = false;
+        }
+    }
+
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
@@ -1283,6 +1403,95 @@ impl Server {
         res
     }
 
+    /// Make the tenant parameter hold `tenant`, or nothing, unless pgcat knows it
+    /// already does. Called before a client's statements are sent, so the
+    /// connection carries the client's tenant only while the client has it.
+    pub async fn sync_tenant(
+        &mut self,
+        parameter: &str,
+        tenant: Option<&str>,
+    ) -> Result<(), Error> {
+        let wanted = match tenant {
+            Some(tenant) => TenantParameter::Set(tenant.to_string()),
+            None => TenantParameter::Unset,
+        };
+
+        if self.tenant == wanted {
+            return Ok(());
+        }
+
+        // Nothing runs in a failed transaction, SET included. The client can only
+        // end it, and the parameter is set again before its next statement.
+        if self.transaction_failed {
+            self.tenant = TenantParameter::Unknown;
+            return Ok(());
+        }
+
+        // Both were validated (`valid_tenant_parameter`, `valid_tenant`), so they
+        // can go in the statement as they are.
+        let query = match tenant {
+            Some(tenant) => format!("SET {} TO '{}'", parameter, tenant),
+            None => format!("RESET {}", parameter),
+        };
+
+        // This isn't the client changing the session: keep the cleanup state.
+        let cleanup_state = self.cleanup_state;
+        let result = self.query_checked(&query).await;
+        self.cleanup_state = cleanup_state;
+
+        match result {
+            Ok(()) => {
+                self.tenant = wanted;
+                if self.in_transaction {
+                    self.tenant_set_in_transaction = true;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.tenant = TenantParameter::Unknown;
+                self.mark_bad("failed to set the tenant parameter");
+                Err(err)
+            }
+        }
+    }
+
+    /// A client statement may change the tenant parameter: set it again before
+    /// it's used.
+    pub fn forget_tenant(&mut self) {
+        self.tenant = TenantParameter::Unknown;
+    }
+
+    /// Run a statement and fail if the server answers with an error. The query
+    /// isn't logged.
+    pub(crate) async fn query_checked(&mut self, query: &str) -> Result<(), Error> {
+        match self.run_statement(query).await? {
+            Some(_) => Err(Error::ServerError),
+            None => Ok(()),
+        }
+    }
+
+    /// Run a statement; the server's ErrorResponse if it failed. The query isn't
+    /// logged.
+    pub(crate) async fn run_statement(&mut self, query: &str) -> Result<Option<BytesMut>, Error> {
+        self.send(&simple_query(query)).await?;
+
+        let mut error = None;
+        loop {
+            let response = self.recv(None).await?;
+            for message in split_messages(&response)? {
+                if message.first() == Some(&b'E') && error.is_none() {
+                    error = Some(message);
+                }
+            }
+
+            if !self.data_available {
+                break;
+            }
+        }
+
+        Ok(error)
+    }
+
     /// Indicate that this server connection cannot be re-used and must be discarded.
     pub fn mark_bad(&mut self, reason: &str) {
         error!("Server {:?} marked bad, reason: {}", self.address, reason);
@@ -1327,6 +1536,13 @@ impl Server {
     /// Perform any necessary cleanup before putting the server
     /// connection back in the pool
     pub async fn checkin_cleanup(&mut self) -> Result<(), Error> {
+        // The client left mid-COPY: the server reads the next client's
+        // messages as COPY data, or as a protocol violation.
+        if self.in_copy_mode() {
+            self.mark_bad("returned while still in copy mode");
+            return Ok(());
+        }
+
         // Client disconnected with an open transaction on the server connection.
         // Pgbouncer behavior is to close the server connection but that can cause
         // server connection thrashing if clients repeatedly do this.
@@ -1359,10 +1575,7 @@ impl Server {
 
             self.query(&reset_string).await?;
             self.cleanup_state.reset();
-        }
-
-        if self.in_copy_mode() {
-            warn!(target: "pgcat::server::cleanup", "Server returned while still in copy-mode");
+            self.tenant = TenantParameter::Unknown;
         }
 
         Ok(())

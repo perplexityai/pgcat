@@ -98,7 +98,12 @@ The project is being actively developed and looking for additional contributors 
 2. `cargo build --release` (to get better benchmarks).
 3. Change the config in `pgcat.toml` to fit your setup (optional given next step).
 4. Install Postgres and run `psql -f tests/sharding/query_routing_setup.sql` (user/password may be required depending on your setup)
-5. `RUST_LOG=info cargo run --release` You're ready to go!
+5. `RUST_LOG=info ./target/release/pgcat` You're ready to go!
+
+The standalone entry point and allocator live in `src/bin/pgcat.rs`, outside
+the reusable library. Normal Cargo commands work without mode flags or a build
+helper. See [plugin registration](docs/plugin-registration.md) for the embedding
+API and external build-system wiring.
 
 ### Tests
 
@@ -289,4 +294,3 @@ Many thanks to our amazing contributors!
 <a href = "https://github.com/postgresml/pgcat/graphs/contributors">
   <img src = "https://contrib.rocks/image?repo=postgresml/pgcat"/>
 </a>
-

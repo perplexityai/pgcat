@@ -2,13 +2,40 @@ name: publish-ci-docker-image
 on:
   push:
     branches: [ main ]
+  # Build the image on PRs that change it, so a broken Dockerfile.ci is caught before merge.
+  pull_request:
+    paths:
+      - Dockerfile.ci
+      - .github/workflows/publish-ci-docker-image.yml
+permissions:
+  contents: read
 jobs:
-  publish-ci-docker-image:
+  # The image is published under the upstream postgresml namespace, which only
+  # postgresml/pgcat can write to. Elsewhere, and on PRs, it is built and run
+  # without a write token.
+  build-ci-docker-image:
+    if: github.event_name == 'pull_request' || github.repository != 'postgresml/pgcat'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build CI Docker image
+        run: |
+          docker build . -f Dockerfile.ci --tag pgcat-ci:test
+          docker run pgcat-ci:test
+  publish-ci-docker-image:
+    if: github.event_name == 'push' && github.repository == 'postgresml/pgcat'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v1
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

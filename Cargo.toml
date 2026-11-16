@@ -2,8 +2,18 @@
 name = "pgcat"
 version = "1.3.0"
 edition = "2021"
+# The toolchain the Dockerfile and CI build with.
+rust-version = "1.97.1"
+# src/main.rs is upstream's startup loop, kept as a module of the library
+# (src/lib.rs); the binary is src/bin/pgcat.rs. Tools that infer targets, such
+# as cargo-chef in Dockerfile.dev, would otherwise see a second `pgcat` binary.
+autobins = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "pgcat"
+path = "src/bin/pgcat.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
@@ -62,3 +72,20 @@ jemallocator = "0.5.0"
 
 [dev-dependencies]
 serial_test = "*"
+# Paused clocks for timer tests; never a production feature.
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[example]]
+name = "registered_plugin"
+path = "tests/fixtures/registered_plugin.rs"
+required-features = ["test-plugins"]
+
+[[example]]
+name = "configured_plugin"
+path = "tests/fixtures/configured_plugin.rs"
+required-features = ["test-plugins"]
+
+[features]
+# Compiles in `plugins::testing`, a plugin used by the integration tests to
+# exercise the plugin hooks. Never enable it in production builds.
+test-plugins = []

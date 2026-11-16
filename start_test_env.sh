@@ -16,7 +16,7 @@ while ! docker compose exec main ls; do
 done
 echo "==================================="
 docker compose exec -e LOG_LEVEL=error -d main toxiproxy-server
-docker compose exec --workdir /app main cargo build
+docker compose exec --workdir /app main cargo build || exit $?
 docker compose exec -d --workdir /app main ./target/debug/pgcat ./.circleci/pgcat.toml
 docker compose exec --workdir /app/tests/ruby main bundle install
 docker compose exec --workdir /app/tests/python main pip3 install -r requirements.txt

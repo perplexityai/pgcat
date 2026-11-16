@@ -1,0 +1,18 @@
+ statement_timeout 
+-------------------
+ 0
+(1 row)
+
+ statement_timeout 
+-------------------
+ 1234ms
+(1 row)
+
+     src      
+--------------
+ from PREPARE
+(1 row)
+
+
+--- stderr ---
+psql:tests/psql/transaction_pool_session_set.sql:14: ERROR:  prepared statement "sql_prepared" does not exist

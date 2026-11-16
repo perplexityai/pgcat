@@ -45,7 +45,7 @@ export RUSTDOCFLAGS="-Cpanic=abort"
 
 cd /app/
 cargo clean
-cargo build
+cargo build || exit $?
 cargo test --tests
 
 bash .circleci/run_tests.sh

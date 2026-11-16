@@ -107,7 +107,10 @@ cd ../..
 # These tests will start and stop the pgcat server so it will need to be restarted after the tests
 #
 pip3 install -r tests/python/requirements.txt
-pytest || exit 1
+# The plugin hook tests need the test-only plugin compiled in.
+cargo build --features test-plugins
+cargo build --features test-plugins --example registered_plugin
+PGCAT_TEST_PLUGINS=1 pytest || exit 1
 
 
 #

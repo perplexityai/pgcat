@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::dns_cache::CachedResolver;
 use crate::errors::Error;
+use crate::plugins::registry::{self, PluginRegistry, PluginSection};
 use crate::pool::{ClientServerMap, ConnectionPool};
 use crate::sharding::ShardingFunction;
 use crate::stats::AddressStats;
@@ -327,6 +328,11 @@ pub struct General {
     #[serde(default = "General::default_worker_threads")]
     pub worker_threads: usize,
 
+    /// Most plugin hooks running at once in the whole process. A hook waits
+    /// for a slot within its pool's `plugin_hook_timeout`. Read at start.
+    #[serde(default = "General::default_plugin_hook_concurrency")]
+    pub plugin_hook_concurrency: usize,
+
     #[serde(default)] // None
     pub autoreload: Option<u64>,
 
@@ -418,6 +424,10 @@ impl General {
         60
     }
 
+    pub fn default_plugin_hook_concurrency() -> usize {
+        256
+    }
+
     pub fn default_worker_threads() -> usize {
         4
     }
@@ -464,6 +474,7 @@ impl Default for General {
             server_lifetime: Self::default_server_lifetime(),
             server_round_robin: Self::default_server_round_robin(),
             worker_threads: Self::default_worker_threads(),
+            plugin_hook_concurrency: Self::default_plugin_hook_concurrency(),
             autoreload: None,
             tls_certificate: None,
             tls_private_key: None,
@@ -610,6 +621,40 @@ pub struct Pool {
     #[serde(default = "Pool::default_table_mutation_cache_ms_ttl")]
     pub table_mutation_cache_ms_ttl: u64,
 
+    /// Reject queries that the parser can't handle (syntax errors, or longer
+    /// than `query_parser_max_length`) instead of forwarding them unchecked.
+    /// Only applies when plugins are configured.
+    #[serde(default)] // False
+    pub plugins_require_parse: bool,
+
+    /// Longest a plugin hook may run for one statement, in milliseconds,
+    /// waiting for a free hook slot included. The statement fails after that.
+    #[serde(default = "Pool::default_plugin_hook_timeout")]
+    pub plugin_hook_timeout: u64,
+
+    /// Plugins that support it reject the statements they cover when the client
+    /// hasn't set `SET PGCAT_IDENTITY`. The built-in plugins ignore it.
+    #[serde(default)] // False
+    pub identity_required_for_plugins: bool,
+
+    /// Session parameter, e.g. `app.tenant`, that pgcat sets on the server
+    /// connection to the tenant of the client's verified identity. Clients
+    /// can't set it themselves.
+    #[serde(default)]
+    pub identity_tenant_parameter: Option<String>,
+
+    /// Plugins that rewrite result rows get them in batches of up to this many rows...
+    #[serde(default = "Pool::default_plugin_response_batch_rows")]
+    pub plugin_response_batch_rows: usize,
+
+    /// ...or this many bytes, whichever comes first.
+    #[serde(default = "Pool::default_plugin_response_batch_bytes")]
+    pub plugin_response_batch_bytes: usize,
+
+    /// Count the SQL statements clients send, as Prometheus metrics.
+    #[serde(default)] // False
+    pub sql_observer_enabled: bool,
+
     pub plugins: Option<Plugins>,
     pub shards: BTreeMap<String, Shard>,
     pub users: BTreeMap<String, User>,
@@ -622,6 +667,28 @@ impl Pool {
     pub fn hash_value(&self) -> u64 {
         let mut s = DefaultHasher::new();
         self.hash(&mut s);
+        s.finish()
+    }
+
+    /// The `[plugins]` the pool runs: its own or, without them, the global
+    /// ones, never the two merged.
+    pub fn plugins_inheriting<'a>(
+        &'a self,
+        global_plugins: Option<&'a Plugins>,
+    ) -> Option<&'a Plugins> {
+        self.plugins.as_ref().or(global_plugins)
+    }
+
+    /// What decides whether a reload recreates the pool: its settings and,
+    /// without `plugins` of its own, the global ones it runs. Otherwise a
+    /// reload that changes only a global section leaves the pool running the
+    /// old one.
+    pub fn hash_value_inheriting(&self, global_plugins: Option<&Plugins>) -> u64 {
+        let mut s = DefaultHasher::new();
+        self.hash(&mut s);
+        if self.plugins.is_none() {
+            global_plugins.hash(&mut s);
+        }
         s.finish()
     }
 
@@ -682,7 +749,48 @@ impl Pool {
         50
     }
 
-    pub fn validate(&mut self) -> Result<(), Error> {
+    pub fn default_plugin_hook_timeout() -> u64 {
+        // 5 seconds
+        5000
+    }
+
+    pub fn default_plugin_response_batch_rows() -> usize {
+        500
+    }
+
+    pub fn default_plugin_response_batch_bytes() -> usize {
+        // 1 MB
+        1024 * 1024
+    }
+
+    /// `global_plugins` is the config's `[plugins]`, which a pool without its own runs.
+    pub fn validate(&mut self, global_plugins: Option<&Plugins>) -> Result<(), Error> {
+        self.validate_with_plugins(global_plugins, &registry::process_plugins())
+    }
+
+    /// `validate`, with the configured plugins of `plugins` parsing and checking
+    /// the pool's `[plugins.<name>]` sections. `global_plugins` must already be
+    /// loaded, as `Config::validate_with_plugins` does.
+    pub fn validate_with_plugins(
+        &mut self,
+        global_plugins: Option<&Plugins>,
+        plugins: &PluginRegistry,
+    ) -> Result<(), Error> {
+        if let Some(ref mut own) = self.plugins {
+            plugins.load_sections(own)?;
+        }
+
+        if let Some(ref parameter) = self.identity_tenant_parameter {
+            if !crate::identity::valid_tenant_parameter(parameter) {
+                error!(
+                    "identity_tenant_parameter must be a custom parameter like 'app.tenant' \
+                     (lowercase letters, digits and underscores), got: '{}'",
+                    parameter
+                );
+                return Err(Error::BadConfig);
+            }
+        }
+
         match self.default_role.as_ref() {
             "any" => (),
             "primary" => (),
@@ -781,6 +889,11 @@ impl Pool {
             }
         }
 
+        // Last, so plugins check the pool's settings as validated.
+        if let Some(sections) = self.plugins_inheriting(global_plugins) {
+            plugins.validate_sections(sections, self)?;
+        }
+
         Ok(())
     }
 }
@@ -815,6 +928,13 @@ impl Default for Pool {
             db_activity_init_delay: Self::default_db_activity_init_delay(),
             db_activity_ttl: Self::default_db_activity_ttl(),
             table_mutation_cache_ms_ttl: Self::default_table_mutation_cache_ms_ttl(),
+            plugins_require_parse: false,
+            plugin_hook_timeout: Self::default_plugin_hook_timeout(),
+            identity_required_for_plugins: false,
+            identity_tenant_parameter: None,
+            plugin_response_batch_rows: Self::default_plugin_response_batch_rows(),
+            plugin_response_batch_bytes: Self::default_plugin_response_batch_bytes(),
+            sql_observer_enabled: false,
             plugins: None,
             shards: BTreeMap::from([(String::from("1"), Shard::default())]),
             users: BTreeMap::default(),
@@ -940,12 +1060,24 @@ impl Default for Shard {
     }
 }
 
+/// A new built-in field also goes in `BUILT_IN_SECTIONS` (plugins/registry.rs),
+/// which a test checks, so no configured plugin can take its name.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, Hash, Eq)]
 pub struct Plugins {
     pub intercept: Option<Intercept>,
     pub table_access: Option<TableAccess>,
     pub query_logger: Option<QueryLogger>,
     pub prewarmer: Option<Prewarmer>,
+
+    /// Test-only plugin used to exercise the plugin hooks end to end.
+    #[cfg(any(test, feature = "test-plugins"))]
+    pub testing: Option<Testing>,
+
+    /// Every other section, `[plugins.<name>]`, belongs to the configured
+    /// plugin registered under that name, which parses it. A section without
+    /// one fails the config.
+    #[serde(flatten)]
+    pub configured: BTreeMap<String, PluginSection>,
 }
 
 pub trait Plugin {
@@ -968,7 +1100,12 @@ impl std::fmt::Display for Plugins {
             is_enabled(self.table_access.as_ref()),
             is_enabled(self.query_logger.as_ref()),
             is_enabled(self.prewarmer.as_ref()),
-        )
+        )?;
+        // Whether each is on, never its settings.
+        for (name, section) in &self.configured {
+            write!(f, ", {:?}: {}", name, section)?;
+        }
+        Ok(())
     }
 }
 
@@ -1014,6 +1151,53 @@ pub struct Prewarmer {
 }
 
 impl Plugin for Prewarmer {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// Test-only plugin config, see `plugins::testing`.
+#[cfg(any(test, feature = "test-plugins"))]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, Hash, Eq)]
+pub struct Testing {
+    pub enabled: bool,
+
+    /// Lowercase query -> replacement SQL.
+    #[serde(default)]
+    pub rewrites: BTreeMap<String, String>,
+
+    /// Lowercase query -> how long the plugin takes on it, in milliseconds.
+    #[serde(default)]
+    pub delays: BTreeMap<String, u64>,
+    /// Inserts into `table` that set column `from` also set column `to`,
+    /// with a parameter the plugin adds and fills with the value of `from`.
+    pub copy_param: Option<TestingCopyParam>,
+
+    /// Selects from this table don't return their last column. A row whose
+    /// first column is `fail` makes the plugin fail.
+    pub drop_last_column: Option<String>,
+
+    /// `SELECT 'whoami'` returns the caller identity the plugin sees.
+    #[serde(default)]
+    pub whoami: bool,
+
+    /// Verify identity tokens: `tenant:<id>[#<anything>]` names a tenant,
+    /// `expires:<unix seconds>:tenant:<id>` expires, `invalid...` is refused,
+    /// anything else is valid without a tenant.
+    #[serde(default)]
+    pub verify_identity: bool,
+}
+
+#[cfg(any(test, feature = "test-plugins"))]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, Hash, Eq)]
+pub struct TestingCopyParam {
+    pub table: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[cfg(any(test, feature = "test-plugins"))]
+impl Plugin for Testing {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -1147,6 +1331,22 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                     (
                         format!("pools.{}.query_parser_read_write_splitting", pool_name),
                         pool.query_parser_read_write_splitting.to_string(),
+                    ),
+                    (
+                        format!("pools.{}.plugins_require_parse", pool_name),
+                        pool.plugins_require_parse.to_string(),
+                    ),
+                    (
+                        format!("pools.{}.identity_required_for_plugins", pool_name),
+                        pool.identity_required_for_plugins.to_string(),
+                    ),
+                    (
+                        format!("pools.{}.identity_tenant_parameter", pool_name),
+                        pool.identity_tenant_parameter.clone().unwrap_or_default(),
+                    ),
+                    (
+                        format!("pools.{}.sql_observer_enabled", pool_name),
+                        pool.sql_observer_enabled.to_string(),
                     ),
                     (
                         format!("pools.{}.default_role", pool_name),
@@ -1394,6 +1594,14 @@ impl Config {
                     None => "not configured".into(),
                 }
             );
+            info!(
+                "[pool: {}] Plugins require parse: {}",
+                pool_name, pool_config.plugins_require_parse
+            );
+            info!(
+                "[pool: {}] Plugin hook timeout: {}ms",
+                pool_name, pool_config.plugin_hook_timeout
+            );
 
             for user in &pool_config.users {
                 info!(
@@ -1451,6 +1659,12 @@ impl Config {
     }
 
     pub fn validate(&mut self) -> Result<(), Error> {
+        self.validate_with_plugins(&registry::process_plugins())
+    }
+
+    /// `validate`, with the configured plugins of `plugins` parsing and checking
+    /// the `[plugins.<name>]` sections.
+    pub fn validate_with_plugins(&mut self, plugins: &PluginRegistry) -> Result<(), Error> {
         // Validation for auth_query feature
         if self.general.auth_query.is_some()
             && (self.general.auth_query_user.is_none()
@@ -1527,8 +1741,17 @@ impl Config {
             }
         };
 
-        for pool in self.pools.values_mut() {
-            pool.validate()?;
+        // Global sections are parsed even if no pool inherits them: an unknown
+        // or invalid one fails the config either way.
+        if let Some(ref mut global) = self.plugins {
+            plugins.load_sections(global)?;
+        }
+
+        for (name, pool) in self.pools.iter_mut() {
+            if let Err(err) = pool.validate_with_plugins(self.plugins.as_ref(), plugins) {
+                error!("Error in pool {{ {} }}", name);
+                return Err(err);
+            }
         }
 
         Ok(())
@@ -1614,6 +1837,25 @@ pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, E
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_identity_tenant_parameter_is_validated() {
+        let mut pool = Pool {
+            identity_tenant_parameter: Some("app.tenant".into()),
+            ..Default::default()
+        };
+        assert!(pool.validate(None).is_ok());
+
+        for name in [
+            "tenant",
+            "app.tenant; RESET ALL",
+            "APP.TENANT",
+            "app.ten ant",
+        ] {
+            pool.identity_tenant_parameter = Some(name.into());
+            assert!(pool.validate(None).is_err(), "{}", name);
+        }
+    }
 
     #[tokio::test]
     async fn test_config() {
@@ -2038,6 +2280,40 @@ mod test {
 
         // Different config should have different hash
         assert_ne!(pool1.hash_value(), pool3.hash_value());
+    }
+
+    #[test]
+    fn test_pool_hash_value_covers_the_global_plugins_it_inherits() {
+        let global = |toml: &str| toml::from_str::<Plugins>(toml).unwrap();
+        let on = global("[table_access]\nenabled = true\ntables = [\"t\"]");
+        let off = global("[table_access]\nenabled = false\ntables = [\"t\"]");
+        let section = global("[synthetic]\nanswer = 5");
+        let changed_section = global("[synthetic]\nanswer = 6");
+
+        let inherits = Pool::default();
+        assert_ne!(
+            inherits.hash_value_inheriting(Some(&on)),
+            inherits.hash_value_inheriting(Some(&off))
+        );
+        assert_ne!(
+            inherits.hash_value_inheriting(Some(&section)),
+            inherits.hash_value_inheriting(Some(&changed_section))
+        );
+        assert_ne!(
+            inherits.hash_value_inheriting(Some(&on)),
+            inherits.hash_value_inheriting(None)
+        );
+
+        // A pool with plugins of its own doesn't run the global ones.
+        let own = Pool {
+            plugins: Some(Plugins::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            own.hash_value_inheriting(Some(&on)),
+            own.hash_value_inheriting(Some(&off))
+        );
+        assert_eq!(own.hash_value_inheriting(None), own.hash_value());
     }
 
     // ==================== Plugin Tests ====================
