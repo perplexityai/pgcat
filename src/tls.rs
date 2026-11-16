@@ -4,33 +4,43 @@ use rustls_pemfile::{certs, read_one, Item};
 use std::iter;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
 use tokio_rustls::rustls::{
     self,
-    client::{ServerCertVerified, ServerCertVerifier},
-    Certificate, PrivateKey, ServerName,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{self, CryptoProvider},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    DigitallySignedStruct, SignatureScheme,
 };
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::get_config;
 use crate::errors::Error;
 
-// TLS
-pub fn load_certs(path: &Path) -> std::io::Result<Vec<Certificate>> {
-    certs(&mut std::io::BufReader::new(std::fs::File::open(path)?))
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid cert"))
-        .map(|mut certs| certs.drain(..).map(Certificate).collect())
+/// The crypto provider for every TLS config pgcat builds: rustls' ring
+/// provider, with its default cipher suites and key exchange groups.
+///
+/// Configs name it explicitly instead of relying on a process-wide default,
+/// which rustls can't pick when more than one provider is compiled in.
+pub fn crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(crypto::ring::default_provider())
 }
 
-pub fn load_keys(path: &Path) -> std::io::Result<Vec<PrivateKey>> {
+// TLS
+pub fn load_certs(path: &Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    certs(&mut std::io::BufReader::new(std::fs::File::open(path)?))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid cert"))
+}
+
+pub fn load_keys(path: &Path) -> std::io::Result<Vec<PrivateKeyDer<'static>>> {
     let mut rd = std::io::BufReader::new(std::fs::File::open(path)?);
 
     iter::from_fn(|| read_one(&mut rd).transpose())
         .filter_map(|item| match item {
             Err(err) => Some(Err(err)),
-            Ok(Item::RSAKey(key)) => Some(Ok(PrivateKey(key))),
-            Ok(Item::ECKey(key)) => Some(Ok(PrivateKey(key))),
-            Ok(Item::PKCS8Key(key)) => Some(Ok(PrivateKey(key))),
+            Ok(Item::Pkcs1Key(key)) => Some(Ok(key.into())),
+            Ok(Item::Sec1Key(key)) => Some(Ok(key.into())),
+            Ok(Item::Pkcs8Key(key)) => Some(Ok(key.into())),
             _ => None,
         })
         .collect()
@@ -54,12 +64,15 @@ impl Tls {
             Err(_) => return Err(Error::TlsError),
         };
 
-        let config = match rustls::ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(certs, keys.remove(0))
+        let config = match rustls::ServerConfig::builder_with_provider(crypto_provider())
+            .with_safe_default_protocol_versions()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
-        {
+            .and_then(|builder| {
+                builder
+                    .with_no_client_auth()
+                    .with_single_cert(certs, keys.remove(0))
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+            }) {
             Ok(c) => c,
             Err(_) => return Err(Error::TlsError),
         };
@@ -70,19 +83,71 @@ impl Tls {
     }
 }
 
-pub struct NoCertificateVerification;
+/// Accepts any server certificate. Handshake signatures are still checked
+/// against the certificate's key, as rustls does by default.
+#[derive(Debug)]
+pub struct NoCertificateVerification {
+    provider: Arc<CryptoProvider>,
+}
+
+impl NoCertificateVerification {
+    pub fn new() -> Self {
+        NoCertificateVerification {
+            provider: crypto_provider(),
+        }
+    }
+}
+
+impl Default for NoCertificateVerification {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: SystemTime,
+        _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -162,49 +227,37 @@ mod tests {
 
     #[test]
     fn test_no_certificate_verification_always_succeeds() {
-        let verifier = NoCertificateVerification;
+        let verifier = NoCertificateVerification::new();
 
         // Create a dummy certificate
         let cert_data = vec![0u8; 100];
-        let cert = Certificate(cert_data);
+        let cert = CertificateDer::from(cert_data);
 
         // Create a dummy server name
         let server_name = ServerName::try_from("example.com").unwrap();
 
-        // Empty iterator for SCTs
-        let mut scts_iter = std::iter::empty::<&[u8]>();
-
-        let result = verifier.verify_server_cert(
-            &cert,
-            &[],
-            &server_name,
-            &mut scts_iter,
-            &[],
-            SystemTime::now(),
-        );
+        let result = verifier.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now());
 
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_no_certificate_verification_with_intermediates() {
-        let verifier = NoCertificateVerification;
+        let verifier = NoCertificateVerification::new();
 
         let cert_data = vec![0u8; 100];
-        let cert = Certificate(cert_data);
-        let intermediate1 = Certificate(vec![1u8; 50]);
-        let intermediate2 = Certificate(vec![2u8; 50]);
+        let cert = CertificateDer::from(cert_data);
+        let intermediate1 = CertificateDer::from(vec![1u8; 50]);
+        let intermediate2 = CertificateDer::from(vec![2u8; 50]);
 
         let server_name = ServerName::try_from("test.local").unwrap();
-        let mut scts_iter = std::iter::empty::<&[u8]>();
 
         let result = verifier.verify_server_cert(
             &cert,
             &[intermediate1, intermediate2],
             &server_name,
-            &mut scts_iter,
             &[],
-            SystemTime::now(),
+            UnixTime::now(),
         );
 
         assert!(result.is_ok());
@@ -212,23 +265,30 @@ mod tests {
 
     #[test]
     fn test_no_certificate_verification_with_ocsp_response() {
-        let verifier = NoCertificateVerification;
+        let verifier = NoCertificateVerification::new();
 
-        let cert = Certificate(vec![0u8; 100]);
+        let cert = CertificateDer::from(vec![0u8; 100]);
         let server_name = ServerName::try_from("example.org").unwrap();
-        let mut scts_iter = std::iter::empty::<&[u8]>();
         let ocsp_response = vec![1u8, 2u8, 3u8, 4u8];
 
-        let result = verifier.verify_server_cert(
-            &cert,
-            &[],
-            &server_name,
-            &mut scts_iter,
-            &ocsp_response,
-            SystemTime::now(),
-        );
+        let result =
+            verifier.verify_server_cert(&cert, &[], &server_name, &ocsp_response, UnixTime::now());
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_no_certificate_verification_offers_provider_schemes() {
+        let verifier = NoCertificateVerification::new();
+        let schemes = verifier.supported_verify_schemes();
+
+        assert!(!schemes.is_empty());
+        assert_eq!(
+            schemes,
+            crypto_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        );
     }
 
     // ==================== Certificate/PrivateKey Type Tests ====================
@@ -236,15 +296,15 @@ mod tests {
     #[test]
     fn test_certificate_creation() {
         let data = vec![1u8, 2u8, 3u8, 4u8, 5u8];
-        let cert = Certificate(data.clone());
-        assert_eq!(cert.0, data);
+        let cert = CertificateDer::from(data.clone());
+        assert_eq!(cert.as_ref(), &data[..]);
     }
 
     #[test]
     fn test_private_key_creation() {
         let data = vec![10u8, 20u8, 30u8, 40u8, 50u8];
-        let key = PrivateKey(data.clone());
-        assert_eq!(key.0, data);
+        let key = PrivateKeyDer::Pkcs8(data.clone().into());
+        assert_eq!(key.secret_der(), &data[..]);
     }
 
     // ==================== Integration-style Tests ====================

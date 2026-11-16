@@ -5,7 +5,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use bytes::BytesMut;
 use hmac::{Hmac, Mac};
-use rand::{self, Rng};
+use rand::RngExt;
 use sha2::digest::FixedOutput;
 use sha2::{Digest, Sha256};
 
@@ -42,10 +42,10 @@ impl ScramSha256 {
     /// Create the Scram state from a password. It'll automatically
     /// generate a nonce.
     pub fn new(password: &str) -> ScramSha256 {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let nonce = (0..NONCE_LENGTH)
             .map(|_| {
-                let mut v = rng.gen_range(0x21u8..0x7e);
+                let mut v = rng.random_range(0x21u8..0x7e);
                 if v == 0x2c {
                     v = 0x7e
                 }

@@ -66,7 +66,7 @@ impl<'a> Plugin for TableAccess<'a> {
 impl TableAccess<'_> {
     /// The table's name, if it is one of the forbidden tables.
     fn forbidden(&self, relation: &ObjectName) -> Option<String> {
-        let table = relation.0.last()?;
+        let table = relation.0.last()?.as_ident()?;
         // Postgres folds a name to lower case unless it's quoted.
         let name = match table.quote_style {
             Some(_) => table.value.clone(),

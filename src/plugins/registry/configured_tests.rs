@@ -1689,14 +1689,16 @@ impl ConfiguredPlugin for Guard {
         _context: &PluginContext<'_>,
         statements: &[Statement],
     ) -> Result<PluginResult, Error> {
-        use sqlparser::ast::SetExpr;
+        use sqlparser::ast::{Expr, Ident, SetExpr};
 
         match statements {
             [statement] if config.rewrite && statement.to_string() == "SELECT 1" => {
+                // A WHERE without a condition: it names the table, but its
+                // SQL can't be parsed.
                 let mut rewrite = parse(&format!("SELECT 1 FROM {}", config.table));
                 if let Statement::Query(query) = &mut rewrite[0] {
                     if let SetExpr::Select(select) = query.body.as_mut() {
-                        select.projection.clear();
+                        select.selection = Some(Expr::Identifier(Ident::new("")));
                     }
                 }
                 Ok(PluginOutput::Overwrite(rewrite).into())
@@ -1798,7 +1800,7 @@ async fn a_plugin_that_checks_rewrites_refuses_another_plugins_but_not_its_own()
     let own = "[guard]\nenabled = true\ntable = \"guarded\"\nrewrite = true";
     match rewritten(&registry, own, false).await {
         PluginOutput::Overwrite(statements) => {
-            assert_eq!(statements_to_sql(&statements), "SELECT  FROM guarded")
+            assert_eq!(statements_to_sql(&statements), "SELECT 1 FROM guarded WHERE ")
         }
         output => panic!("{:?}", output),
     }
@@ -1814,7 +1816,7 @@ async fn a_rewrite_checked_as_built_isnt_parsed_again() {
     // table_access checks the rewrite as the plugin built it.
     match rewritten(&registry, &format!("{}true", own), true).await {
         PluginOutput::Overwrite(statements) => {
-            assert_eq!(statements_to_sql(&statements), "SELECT  FROM guarded")
+            assert_eq!(statements_to_sql(&statements), "SELECT 1 FROM guarded WHERE ")
         }
         output => panic!("{:?}", output),
     }

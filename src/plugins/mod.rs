@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use sqlparser::ast::{visit_expressions, Expr, Statement, Value};
+use sqlparser::ast::{visit_expressions, Expr, Statement, Value, ValueWithSpan};
 use std::any::Any;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -412,7 +412,11 @@ pub fn max_placeholder(ast: &[Statement]) -> usize {
 
     for statement in ast {
         let _ = visit_expressions(statement, |expr| {
-            if let Expr::Value(Value::Placeholder(placeholder)) = expr {
+            if let Expr::Value(ValueWithSpan {
+                value: Value::Placeholder(placeholder),
+                ..
+            }) = expr
+            {
                 if let Some(n) = placeholder
                     .strip_prefix('$')
                     .map(|n| n.parse::<usize>().unwrap_or(usize::MAX))

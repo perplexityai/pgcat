@@ -7,8 +7,8 @@ use once_cell::sync::{Lazy, OnceCell};
 use regex::{Regex, RegexSet};
 use sqlparser::ast::Statement::{Delete, Insert, Query, StartTransaction, Update};
 use sqlparser::ast::{
-    Assignment, BinaryOperator, Expr, Ident, JoinConstraint, JoinOperator, SetExpr, Statement,
-    TableFactor, TableWithJoins, Value,
+    Assignment, BinaryOperator, Expr, Ident, JoinConstraint, JoinOperator, ObjectName, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -185,7 +185,9 @@ fn names_only(statement: &Statement) -> bool {
     let mut found = false;
     let _ = sqlparser::ast::visit_relations(statement, |relation| {
         found |= matches!(relation.0.as_slice(),
-            [name] if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("only"));
+        [name] if name.as_ident().is_some_and(|name| {
+            name.quote_style.is_none() && name.value.eq_ignore_ascii_case("only")
+        }));
         std::ops::ControlFlow::<()>::Continue(())
     });
     found
@@ -401,7 +403,7 @@ impl QueryRouter {
 
             Command::SetShard => {
                 self.active_shard = match value.to_ascii_uppercase().as_ref() {
-                    "ANY" => Some(rand::random::<usize>() % self.pool_settings.shards),
+                    "ANY" => Some(rand::random_range(0..self.pool_settings.shards)),
                     _ => Some(value.parse::<usize>().unwrap()),
                 };
             }
@@ -754,9 +756,18 @@ impl QueryRouter {
                 assert!(i.partitioned.is_none());
                 assert!(i.after_columns.is_empty());
 
-                Self::process_table(&i.table_name, &mut table_names);
+                let TableObject::TableName(table_name) = &i.table else {
+                    return None;
+                };
+                Self::process_table(table_name, &mut table_names);
                 if let Some(source) = &i.source {
-                    Self::process_query(source, &mut exprs, &mut table_names, &Some(&i.columns));
+                    // Columns are plain names in postgres.
+                    let columns = i
+                        .columns
+                        .iter()
+                        .map(Self::single_ident)
+                        .collect::<Option<Vec<_>>>()?;
+                    Self::process_query(source, &mut exprs, &mut table_names, &Some(&columns));
                 }
             }
             Delete(d) => {
@@ -776,20 +787,23 @@ impl QueryRouter {
                 }
                 Self::process_selection(&d.selection, &mut exprs);
             }
-            Update {
-                table,
-                assignments,
-                from,
-                selection,
-                returning: _,
-            } => {
-                Self::process_table_with_join(table, &mut exprs, &mut table_names);
-                if let Some(from_tbl) = from {
-                    Self::process_table_with_join(from_tbl, &mut exprs, &mut table_names);
+            Update(update) => {
+                Self::process_table_with_join(&update.table, &mut exprs, &mut table_names);
+                match &update.from {
+                    // Postgres takes FROM after SET only.
+                    Some(UpdateTableFromKind::AfterSet(from_tbls)) => {
+                        // One table, as the parser read FROM before 0.53.
+                        let [from_tbl] = from_tbls.as_slice() else {
+                            return None;
+                        };
+                        Self::process_table_with_join(from_tbl, &mut exprs, &mut table_names);
+                    }
+                    Some(UpdateTableFromKind::BeforeSet(_)) => return None,
+                    None => (),
                 }
-                Self::process_selection(selection, &mut exprs);
+                Self::process_selection(&update.selection, &mut exprs);
 
-                assignments_opt = Some(assignments);
+                assignments_opt = Some(&update.assignments);
             }
             _ => return None,
         };
@@ -922,8 +936,23 @@ impl QueryRouter {
         }
     }
 
-    fn process_table(name: &sqlparser::ast::ObjectName, table_names: &mut Vec<Vec<Ident>>) {
-        table_names.push(name.0.clone())
+    fn process_table(name: &ObjectName, table_names: &mut Vec<Vec<Ident>>) {
+        if let Some(idents) = name
+            .0
+            .iter()
+            .map(|part| part.as_ident().cloned())
+            .collect::<Option<Vec<_>>>()
+        {
+            table_names.push(idents)
+        }
+    }
+
+    /// The identifier of a one-part name.
+    fn single_ident(name: &ObjectName) -> Option<Ident> {
+        match name.0.as_slice() {
+            [part] => part.as_ident().cloned(),
+            _ => None,
+        }
     }
 
     /// Parse the shard number from the Bind message
@@ -1182,7 +1211,10 @@ impl QueryRouter {
 
             match &**right {
                 Expr::BinaryOp { .. } => result.extend(self.selection_parser(right, table_names)),
-                Expr::Value(Value::Number(value, ..)) => {
+                Expr::Value(ValueWithSpan {
+                    value: Value::Number(value, ..),
+                    ..
+                }) => {
                     if found {
                         match value.parse::<i64>() {
                             Ok(value) => result.push(ShardingKey::Value(value)),
@@ -1193,17 +1225,18 @@ impl QueryRouter {
                     }
                 }
 
-                Expr::Value(Value::Placeholder(placeholder)) => {
-                    match placeholder.replace('$', "").parse::<i16>() {
-                        Ok(placeholder) => result.push(ShardingKey::Placeholder(placeholder)),
-                        Err(_) => {
-                            debug!(
-                                "Prepared statement didn't have integer placeholders: {}",
-                                placeholder
-                            );
-                        }
+                Expr::Value(ValueWithSpan {
+                    value: Value::Placeholder(placeholder),
+                    ..
+                }) => match placeholder.replace('$', "").parse::<i16>() {
+                    Ok(placeholder) => result.push(ShardingKey::Placeholder(placeholder)),
+                    Err(_) => {
+                        debug!(
+                            "Prepared statement didn't have integer placeholders: {}",
+                            placeholder
+                        );
                     }
-                }
+                },
                 _ => (),
             };
         }
@@ -3425,9 +3458,9 @@ mod test {
             assert!(!qr.rejects_unparsed(&message), "{}", query);
         }
 
-        // The parser doesn't know RESET, but it can't touch a table.
+        // RESET can't touch a table, parsed or not.
         let message = simple_query("RESET ALL");
-        assert!(qr.parse(&message).is_err());
+        assert!(qr.parse(&message).is_ok());
         assert!(!qr.rejects_unparsed(&message));
         assert!(!qr.rejects_unparsed(&simple_query("reset search_path;")));
         assert!(!qr.rejects_unparsed(&parse_message("", "RESET ALL", &[])));
