@@ -273,7 +273,7 @@ psql -h 127.0.0.1 -p 6432 -d pgbouncer -c 'SHOW DATABASES'
 
 Additionally, Prometheus statistics are available at `/metrics` via HTTP.
 
-The same server answers readiness probes at `/ready`: 503 until every pool has opened its `min_pool_size` connections, 200 from then on, and 503 again once a graceful shutdown (SIGINT) starts draining clients.
+The same server answers readiness probes at `/ready`: 503 until every shard of every pool has a server (primary or replica) with its `min_pool_size` connections open, 200 from then on, and 503 again once a graceful shutdown (SIGINT) starts draining clients.
 
 We also have a [basic Grafana dashboard](https://github.com/postgresml/pgcat/blob/main/grafana_dashboard.json) based on Prometheus metrics that you can import into Grafana and build on it or use it for monitoring.
 

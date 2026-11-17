@@ -16,9 +16,13 @@ METRICS_PORT = 9943
 # The Postgres the pools connect to (the repo fixtures use 5432).
 PG_PORT = int(os.environ.get("PGCAT_TEST_PG_PORT", "5432"))
 USER = "sharding_user"
+# Nothing listens here, so a server on it never opens a connection.
+DEAD_PORT = 1
 
 
-def config(pg_port):
+def config(*servers):
+    """A one-shard pool over `servers`, given as (port, role) pairs."""
+    servers = ", ".join(f'["127.0.0.1", {port}, "{role}"]' for port, role in servers)
     return f"""
 [general]
 host = "127.0.0.1"
@@ -37,7 +41,7 @@ pool_size = 5
 min_pool_size = 2
 
 [pools.shard0.shards.0]
-servers = [["127.0.0.1", {pg_port}, "primary"]]
+servers = [{servers}]
 database = "shard0"
 """
 
@@ -65,8 +69,7 @@ def wait_for_status(expected):
 
 
 def test_not_ready_while_pools_lack_min_connections():
-    # Nothing listens on port 1, so the pool never opens a connection.
-    pgcat = utils.PgcatProcess(config(pg_port=1), PORT).start()
+    pgcat = utils.PgcatProcess(config((DEAD_PORT, "primary")), PORT).start()
     try:
         time.sleep(1)
         assert ready_status() == 503
@@ -74,8 +77,18 @@ def test_not_ready_while_pools_lack_min_connections():
         pgcat.stop()
 
 
+def test_ready_with_a_down_replica():
+    # pgcat routes around the replica, so readiness should too.
+    servers = [(PG_PORT, "primary"), (DEAD_PORT, "replica")]
+    pgcat = utils.PgcatProcess(config(*servers), PORT).start()
+    try:
+        wait_for_status(200)
+    finally:
+        pgcat.stop()
+
+
 def test_ready_once_warm_and_not_ready_once_draining():
-    pgcat = utils.PgcatProcess(config(PG_PORT), PORT).start()
+    pgcat = utils.PgcatProcess(config((PG_PORT, "primary")), PORT).start()
     try:
         wait_for_status(200)
 
