@@ -3225,6 +3225,13 @@ mod test {
             "CREATE FOREIGN TABLE f (a int) INHERITS (other, secrets) SERVER s",
             "CREATE FUNCTION f() RETURNS void LANGUAGE sql \
              BEGIN ATOMIC ALTER TABLE p INHERIT secrets; END",
+            // Rows inserted into f are read from secrets.
+            "CREATE TABLE f INHERITS (secrets)",
+            "CREATE TABLE f (a int) INHERITS (other, public.\"secrets\")",
+            "CREATE UNLOGGED TABLE f () INHERITS (other, public.secrets)",
+            "CREATE UNLOGGED TABLE f (a int) INHERITS (secrets); INSERT INTO f VALUES (7)",
+            "DROP FOREIGN TABLE secrets",
+            "DROP FOREIGN TABLE IF EXISTS other, secrets CASCADE",
         ] {
             assert!(matches!(run(sql).await, PluginOutput::Deny(_)), "{}", sql);
         }
@@ -3233,6 +3240,9 @@ mod test {
             "ALTER TABLE p ATTACH PARTITION \"Secrets\" DEFAULT",
             "ALTER TABLE p INHERIT other",
             "CREATE FOREIGN TABLE f (a int) INHERITS (other) SERVER s",
+            "CREATE TABLE f INHERITS (other)",
+            "CREATE UNLOGGED TABLE f () INHERITS (other)",
+            "DROP FOREIGN TABLE other",
         ] {
             assert_eq!(run(sql).await, PluginOutput::Allow, "{}", sql);
         }
