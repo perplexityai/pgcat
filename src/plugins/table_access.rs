@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use sqlparser::ast::{
-    visit_relations, visit_statements, AlterTableOperation, CopySource, ObjectName, Statement,
-    VacuumStatement,
+    visit_relations, visit_statements, AlterTableOperation, CopySource, ObjectName, ObjectType,
+    Statement, VacuumStatement,
 };
 
 use crate::{
@@ -98,8 +98,8 @@ impl<'a> Plugin for TableAccess<'a> {
 
 /// Tables a statement names that `visit_relations` doesn't visit: the table an
 /// ALTER TABLE attaches or detaches as a partition, the parent it adds or
-/// removes with INHERIT or NO INHERIT, and the parents a CREATE FOREIGN TABLE
-/// inherits from.
+/// removes with INHERIT or NO INHERIT, the parents a CREATE TABLE or CREATE
+/// FOREIGN TABLE inherits from, and the tables a DROP FOREIGN TABLE drops.
 fn unvisited_relations(statement: &Statement) -> Vec<&ObjectName> {
     match statement {
         Statement::AlterTable(alter) => alter
@@ -113,7 +113,13 @@ fn unvisited_relations(statement: &Statement) -> Vec<&ObjectName> {
                 _ => None,
             })
             .collect(),
+        Statement::CreateTable(table) => table.inherits.iter().flatten().collect(),
         Statement::CreateForeignTable(table) => table.inherits.iter().flatten().collect(),
+        Statement::Drop {
+            object_type: ObjectType::ForeignTable,
+            names,
+            ..
+        } => names.iter().collect(),
         _ => Vec::new(),
     }
 }
