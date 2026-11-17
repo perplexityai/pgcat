@@ -34,7 +34,7 @@ use log::{info, warn};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use sqlparser::ast::{
-    CopySource, Delete, FromTable, Ident, ObjectName, Query, Set, SetExpr, Statement, Table,
+    CopySource, Delete, Expr, FromTable, Ident, ObjectName, Query, Set, SetExpr, Statement, Table,
     TableFactor, TableObject, Update, Visit, Visitor,
 };
 
@@ -1006,17 +1006,17 @@ impl Run<'_> {
         ControlFlow::Continue(())
     }
 
-    /// sqlparser keeps no quoting for a TABLE command's names: only names
-    /// that read the same either way are labeled.
+    /// Only a TABLE command's names that read the same quoted or not are
+    /// labeled.
     fn table_command(&mut self, table: &Table) -> ControlFlow<()> {
-        let Some(name) = table.table_name.as_deref() else {
+        let Some(name) = table.table_name.as_ref().map(|name| name.value.as_str()) else {
             return self.fail();
         };
         if !bare(name)
             || table
                 .schema_name
-                .as_deref()
-                .is_some_and(|schema| !bare(schema))
+                .as_ref()
+                .is_some_and(|schema| !bare(&schema.value))
         {
             return self.fail();
         }
@@ -1039,7 +1039,16 @@ impl Run<'_> {
                     return self.fail();
                 }
                 if let Some(into) = &select.into {
-                    return self.direct(&into.name);
+                    // PostgreSQL's SELECT INTO has one target, the new table.
+                    return match into.targets.as_slice() {
+                        [Expr::Identifier(name)] => {
+                            self.direct(&ObjectName::from(vec![name.clone()]))
+                        }
+                        [Expr::CompoundIdentifier(name)] => {
+                            self.direct(&ObjectName::from(name.clone()))
+                        }
+                        _ => self.fail(),
+                    };
                 }
                 ControlFlow::Continue(())
             }
@@ -1124,7 +1133,7 @@ impl Visitor for Run<'_> {
                 partitions,
                 json_path,
                 sample,
-                index_hints,
+                index_directives,
                 ..
             } => {
                 if !with_hints.is_empty()
@@ -1132,7 +1141,7 @@ impl Visitor for Run<'_> {
                     || !partitions.is_empty()
                     || json_path.is_some()
                     || sample.is_some()
-                    || !index_hints.is_empty()
+                    || !index_directives.is_empty()
                 {
                     return self.fail();
                 }
