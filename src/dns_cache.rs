@@ -449,8 +449,10 @@ mod tests {
             vec![mock_name_server(None).await.0, silent_name_server().await],
         );
         let resolver = resolver_with(config, ResolverOpts::default()).unwrap();
-        let response = resolver.lookup_ip("db.example.").await;
-        assert!(matches!(response, Err(e) if e.is_nx_domain()));
+        // Well before the silent one's timeout (5 s).
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), resolver.lookup_ip("db.example.")).await;
+        assert!(matches!(response, Ok(Err(e)) if e.is_nx_domain()));
     }
 
     #[tokio::test]
