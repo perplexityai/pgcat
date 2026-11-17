@@ -11,7 +11,7 @@ host = "0.0.0.0"
 # Port to run on, same as PgBouncer used in this example.
 port = 6432
 
-# Whether to enable prometheus exporter or not.
+# Whether to enable prometheus exporter or not. The exporter also serves the `/ready` readiness probe.
 enable_prometheus_exporter = true
 
 # Port at which prometheus exporter listens on.
