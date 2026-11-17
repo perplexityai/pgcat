@@ -22,16 +22,15 @@ fn system_resolver() -> Result<TokioResolver, NetError> {
     resolver_with(config, options)
 }
 
-/// A resolver with these nameservers and options. What hickory-resolver 0.26
-/// changed the defaults of is set as 0.24 had it.
+/// A resolver with these nameservers and options. The options whose defaults
+/// hickory-resolver 0.26 changed are set as 0.24 had them. An NXDOMAIN stays
+/// final, as in glibc, which resolves the host when the connection is opened:
+/// if 0.26 asks the other nameservers instead, one that doesn't answer turns
+/// the NXDOMAIN into a timeout.
 fn resolver_with(
-    mut config: ResolverConfig,
+    config: ResolverConfig,
     mut options: ResolverOpts,
 ) -> Result<TokioResolver, NetError> {
-    // 0.24 asked the other nameservers after one answered NXDOMAIN.
-    for name_server in &mut config.name_servers {
-        name_server.trust_negative_responses = false;
-    }
     options.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
     options.cache_size = 32;
     // 0.24 didn't read `options edns0` from resolv.conf.
@@ -381,6 +380,21 @@ mod tests {
         (name_server, queries)
     }
 
+    /// A nameserver on a local UDP port that never answers.
+    async fn silent_name_server() -> NameServerConfig {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut name_server = NameServerConfig::udp(IpAddr::from([127, 0, 0, 1]));
+        name_server.connections[0].port = socket.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let mut query = [0; 512];
+            loop {
+                socket.recv_from(&mut query).await.unwrap();
+            }
+        });
+        name_server
+    }
+
     /// The response to a query with one question (RFC 1035, section 4.1).
     fn mock_response(query: &[u8], answer: Option<[u8; 4]>) -> Vec<u8> {
         // The question's name is labels up to an empty one, then its type
@@ -417,17 +431,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nxdomain_from_one_nameserver_falls_back_to_the_others() {
-        let (first, first_queries) = mock_name_server(None).await;
+    async fn nxdomain_from_the_first_nameserver_is_final() {
+        let (first, _) = mock_name_server(None).await;
         let (second, second_queries) = mock_name_server(Some([192, 0, 2, 7])).await;
         let resolver = resolver_for(vec![first, second]);
-        let lookup = resolver.lookup_ip("db.example.").await.unwrap();
-        assert_eq!(
-            lookup.iter().collect::<Vec<_>>(),
-            vec![IpAddr::from([192, 0, 2, 7])]
+        let response = resolver.lookup_ip("db.example.").await;
+        assert!(matches!(response, Err(e) if e.is_nx_domain()));
+        assert_eq!(second_queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nxdomain_is_not_held_for_a_silent_nameserver() {
+        // The default options ask both nameservers at once.
+        let config = ResolverConfig::from_parts(
+            None,
+            vec![],
+            vec![mock_name_server(None).await.0, silent_name_server().await],
         );
-        assert_eq!(first_queries.load(Ordering::SeqCst), 1);
-        assert_eq!(second_queries.load(Ordering::SeqCst), 1);
+        let resolver = resolver_with(config, ResolverOpts::default()).unwrap();
+        let response = resolver.lookup_ip("db.example.").await;
+        assert!(matches!(response, Err(e) if e.is_nx_domain()));
     }
 
     #[tokio::test]
