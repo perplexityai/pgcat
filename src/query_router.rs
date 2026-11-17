@@ -73,11 +73,13 @@ enum ParameterFormat {
 static TABLE_FREE_UNPARSED_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)^\s*RESET\s+[a-z_][a-z0-9_.]*\s*;?\s*$").unwrap());
 
-/// The first word of a query, after the whitespace and comments before it.
+/// The first word of a query, after the whitespace, comments and empty
+/// statements before it.
 fn first_word(query: &str) -> &str {
     let mut rest = query;
     loop {
-        rest = rest.trim_start();
+        // Postgres drops empty statements, so the first word can follow `;`.
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
         if let Some(comment) = rest.strip_prefix("--") {
             rest = comment.find(['\n', '\r']).map_or("", |end| &comment[end..]);
         } else if rest.starts_with("/*") {
@@ -212,7 +214,8 @@ struct ExtractedExprsAndTables<'a> {
     assignments_opt: Option<&'a Vec<Assignment>>,
 }
 
-/// A statement names a table `ONLY`: the parser's reading of `ONLY t`. An
+/// A statement names a table `ONLY`: the parser's reading of `ONLY t` where it
+/// doesn't take ONLY as the inheritance marker, as in `INSERT INTO ONLY t`. An
 /// unquoted ONLY is a reserved word, never a table's name.
 fn names_only(statement: &Statement) -> bool {
     let mut found = false;
@@ -547,8 +550,9 @@ impl QueryRouter {
 
     fn parse_sql(query: &str) -> Result<Vec<Statement>, Error> {
         match Parser::parse_sql(&PostgreSqlDialect {}, query) {
-            // The parser reads `FROM ONLY t` as a table named ONLY, aliased t:
-            // what plugins check wouldn't be the table the server reads.
+            // `FROM ONLY t` and `UPDATE ONLY t` name t, so plugins check t, but
+            // the parser reads `INSERT INTO ONLY t` as a table named ONLY,
+            // aliased t: what plugins check wouldn't be the table the server reads.
             Ok(ast) if ast.iter().any(names_only) => Err(Error::QueryRouterParserError(
                 "ONLY before a table name isn't supported".into(),
             )),
@@ -3177,6 +3181,99 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_only_checks_the_real_table() {
+        let qr = forbidding_secrets();
+        for sql in [
+            "SELECT * FROM ONLY secrets",
+            "SELECT * FROM ONLY (secrets)",
+            "SELECT * FROM other JOIN ONLY public.secrets s ON true",
+            "SELECT * FROM secrets *",
+            "UPDATE ONLY Secrets SET a = 1",
+            "DELETE FROM ONLY secrets",
+            "MERGE INTO ONLY secrets USING other ON true WHEN MATCHED THEN DELETE",
+        ] {
+            let ast = qr.parse(&simple_query(sql)).expect(sql);
+            assert!(
+                matches!(qr.execute_plugins(&ast).await, Ok(PluginOutput::Deny(_))),
+                "{}",
+                sql
+            );
+        }
+        let ast = qr.parse(&simple_query("SELECT * FROM ONLY other")).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), PluginOutput::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_partitions_and_parents_are_checked() {
+        let qr = forbidding_secrets();
+        let run = |sql: &str| {
+            let ast = qr.parse(&simple_query(sql)).expect(sql);
+            let qr = &qr;
+            async move { qr.execute_plugins(&ast).await.unwrap() }
+        };
+        for sql in [
+            // Reads secrets through p.
+            "CREATE TABLE p (LIKE secrets) PARTITION BY LIST (a); \
+             ALTER TABLE p ATTACH PARTITION secrets DEFAULT; SELECT * FROM p",
+            "ALTER TABLE p ATTACH PARTITION public.secrets FOR VALUES IN (1); SELECT * FROM p",
+            "ALTER TABLE p ATTACH PARTITION \"secrets\" DEFAULT",
+            "ALTER TABLE p ATTACH PARTITION secrets FOR VALUES WITH (MODULUS 1, REMAINDER 0)",
+            "ALTER TABLE p DETACH PARTITION secrets CONCURRENTLY",
+            "ALTER TABLE p INHERIT secrets",
+            "ALTER TABLE IF EXISTS ONLY p ADD COLUMN b int, NO INHERIT Secrets",
+            "ALTER FOREIGN TABLE p INHERIT secrets",
+            "CREATE FOREIGN TABLE f (a int) INHERITS (other, secrets) SERVER s",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql \
+             BEGIN ATOMIC ALTER TABLE p INHERIT secrets; END",
+            // Rows inserted into f are read from secrets.
+            "CREATE TABLE f INHERITS (secrets)",
+            "CREATE TABLE f (a int) INHERITS (other, public.\"secrets\")",
+            "CREATE UNLOGGED TABLE f () INHERITS (other, public.secrets)",
+            "CREATE UNLOGGED TABLE f (a int) INHERITS (secrets); INSERT INTO f VALUES (7)",
+            "DROP FOREIGN TABLE secrets",
+            "DROP FOREIGN TABLE IF EXISTS other, secrets CASCADE",
+        ] {
+            assert!(matches!(run(sql).await, PluginOutput::Deny(_)), "{}", sql);
+        }
+        for sql in [
+            "ALTER TABLE p ATTACH PARTITION other DEFAULT",
+            "ALTER TABLE p ATTACH PARTITION \"Secrets\" DEFAULT",
+            "ALTER TABLE p INHERIT other",
+            "CREATE FOREIGN TABLE f (a int) INHERITS (other) SERVER s",
+            "CREATE TABLE f INHERITS (other)",
+            "CREATE UNLOGGED TABLE f () INHERITS (other)",
+            "DROP FOREIGN TABLE other",
+        ] {
+            assert_eq!(run(sql).await, PluginOutput::Allow, "{}", sql);
+        }
+    }
+
+    #[test]
+    fn test_nested_calls_parse_in_bounded_time() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let nested = |open: &str, close: &str, depth: usize| {
+            format!("SELECT {}1{}", open.repeat(depth), close.repeat(depth))
+        };
+        for (sql, parses) in [
+            (nested("f(", ")", 30), true),
+            (nested("ROW(", ")", 30), true),
+            (nested("POSITION(", ")", 30), true),
+            // Past the parser's recursion limit: an error, but a quick one.
+            (nested("ARRAY[", "]", 48), false),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let query = sql.clone();
+            // A slow parse is left running: the test fails without waiting for it.
+            std::thread::spawn(move || {
+                let _ = tx.send(QueryRouter::parse_sql(&query).is_ok());
+            });
+            let result = rx.recv_timeout(Duration::from_secs(1));
+            assert_eq!(result, Ok(parses), "{}", &sql[..20]);
+        }
+    }
+
+    #[tokio::test]
     async fn test_table_access_plugin() {
         use crate::config::{Plugins, TableAccess};
         let table_access = TableAccess {
@@ -3605,8 +3702,7 @@ mod test {
         for query in [
             "SELEKT * FROM secrets",
             "SELECT 1 FROM a_very_long_table_name, and_another_one",
-            "SELECT * FROM ONLY secrets",
-            "UPDATE ONLY Secrets SET a = 1",
+            "INSERT INTO ONLY secrets VALUES (1)",
             "SELEKT * FROM U&\"\\0073ecrets\"",
         ] {
             let message = simple_query(query);
@@ -3620,7 +3716,7 @@ mod test {
         }
 
         // These can't: forwarded, for the server to answer.
-        for query in ["SELEKT 1", "SELECT * FROM ONLY other"] {
+        for query in ["SELEKT 1", "INSERT INTO ONLY other VALUES (1)"] {
             let message = simple_query(query);
             assert!(qr.parse(&message).is_err(), "{}", query);
             assert!(!qr.rejects_unparsed(&message), "{}", query);
@@ -3656,6 +3752,13 @@ mod test {
             "VACUUM FREEZE VERBOSE",
             "  -- comment\n\tVACUUM VERBOSE ANALYZE",
             "/* a /* nested */ comment */ VACUUM(FULL)",
+            ";VACUUM (FULL)",
+            "; ;VACUUM (FULL)",
+            ";;VACUUM (FULL)",
+            "/* c */;VACUUM (FULL)",
+            "; -- c\nVACUUM (FULL)",
+            "/* a */;/* b */VACUUM (FULL)",
+            "\x0c;\x0bVACUUM (FULL)",
         ];
         qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
         for query in vacuums {
