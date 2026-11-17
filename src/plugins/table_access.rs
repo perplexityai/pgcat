@@ -2,7 +2,10 @@
 //! table as part of their query. If they can't, the query will not be routed.
 
 use async_trait::async_trait;
-use sqlparser::ast::{visit_relations, CopySource, ObjectName, Statement, VacuumStatement};
+use sqlparser::ast::{
+    visit_relations, visit_statements, AlterTableOperation, CopySource, ObjectName, Statement,
+    VacuumStatement,
+};
 
 use crate::{
     errors::Error,
@@ -51,6 +54,21 @@ impl<'a> Plugin for TableAccess<'a> {
             })
         });
 
+        // Nor the tables in `unvisited_relations`, in any statement.
+        let found = found.or_else(|| {
+            let mut found = None;
+            let _ = visit_statements(ast, |statement| {
+                found = unvisited_relations(statement)
+                    .into_iter()
+                    .find_map(|relation| self.forbidden(relation));
+                match found {
+                    Some(_) => ControlFlow::<()>::Break(()),
+                    None => ControlFlow::<()>::Continue(()),
+                }
+            });
+            found
+        });
+
         // A VACUUM without a table processes every table, forbidden ones too.
         if found.is_none()
             && !self.tables.is_empty()
@@ -75,6 +93,28 @@ impl<'a> Plugin for TableAccess<'a> {
         } else {
             Ok(PluginOutput::Allow)
         }
+    }
+}
+
+/// Tables a statement names that `visit_relations` doesn't visit: the table an
+/// ALTER TABLE attaches or detaches as a partition, the parent it adds or
+/// removes with INHERIT or NO INHERIT, and the parents a CREATE FOREIGN TABLE
+/// inherits from.
+fn unvisited_relations(statement: &Statement) -> Vec<&ObjectName> {
+    match statement {
+        Statement::AlterTable(alter) => alter
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                AlterTableOperation::AttachPartitionOf { partition, .. }
+                | AlterTableOperation::DetachPartitionOf { partition, .. } => Some(partition),
+                AlterTableOperation::Inherit { parent }
+                | AlterTableOperation::NoInherit { parent } => Some(parent),
+                _ => None,
+            })
+            .collect(),
+        Statement::CreateForeignTable(table) => table.inherits.iter().flatten().collect(),
+        _ => Vec::new(),
     }
 }
 

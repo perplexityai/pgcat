@@ -3260,6 +3260,41 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn test_partitions_and_parents_are_checked() {
+        let qr = forbidding_secrets();
+        let run = |sql: &str| {
+            let ast = qr.parse(&simple_query(sql)).expect(sql);
+            let qr = &qr;
+            async move { qr.execute_plugins(&ast).await.unwrap() }
+        };
+        for sql in [
+            // Reads secrets through p.
+            "CREATE TABLE p (LIKE secrets) PARTITION BY LIST (a); \
+             ALTER TABLE p ATTACH PARTITION secrets DEFAULT; SELECT * FROM p",
+            "ALTER TABLE p ATTACH PARTITION public.secrets FOR VALUES IN (1); SELECT * FROM p",
+            "ALTER TABLE p ATTACH PARTITION \"secrets\" DEFAULT",
+            "ALTER TABLE p ATTACH PARTITION secrets FOR VALUES WITH (MODULUS 1, REMAINDER 0)",
+            "ALTER TABLE p DETACH PARTITION secrets CONCURRENTLY",
+            "ALTER TABLE p INHERIT secrets",
+            "ALTER TABLE IF EXISTS ONLY p ADD COLUMN b int, NO INHERIT Secrets",
+            "ALTER FOREIGN TABLE p INHERIT secrets",
+            "CREATE FOREIGN TABLE f (a int) INHERITS (other, secrets) SERVER s",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql \
+             BEGIN ATOMIC ALTER TABLE p INHERIT secrets; END",
+        ] {
+            assert!(matches!(run(sql).await, PluginOutput::Deny(_)), "{}", sql);
+        }
+        for sql in [
+            "ALTER TABLE p ATTACH PARTITION other DEFAULT",
+            "ALTER TABLE p ATTACH PARTITION \"Secrets\" DEFAULT",
+            "ALTER TABLE p INHERIT other",
+            "CREATE FOREIGN TABLE f (a int) INHERITS (other) SERVER s",
+        ] {
+            assert_eq!(run(sql).await, PluginOutput::Allow, "{}", sql);
+        }
+    }
+
     #[test]
     fn test_nested_calls_parse_in_bounded_time() {
         use std::sync::mpsc;
