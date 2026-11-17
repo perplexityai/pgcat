@@ -31,6 +31,7 @@ pub mod plugins;
 pub mod pool;
 pub mod prometheus;
 pub mod query_router;
+pub mod readiness;
 pub mod relations;
 pub mod runtime;
 pub mod scram;

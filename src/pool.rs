@@ -1128,6 +1128,16 @@ impl ConnectionPool {
         self.databases[shard][server].state()
     }
 
+    /// Whether every shard has a server with at least `min_pool_size`
+    /// connections open. A down replica doesn't count against its shard,
+    /// since queries are routed around it.
+    pub fn has_min_connections(&self) -> bool {
+        let min = self.settings.user.min_pool_size.unwrap_or(0);
+        self.databases
+            .iter()
+            .all(|shard| shard.iter().any(|server| server.state().connections >= min))
+    }
+
     /// Get the address information for a shard server.
     pub fn address(&self, shard: usize, server: usize) -> &Address {
         &self.addresses[shard][server]

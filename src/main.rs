@@ -240,6 +240,7 @@ pub(crate) fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     admin_only = true;
+                    pgcat::readiness::start_draining();
 
                     // Broadcast that client tasks need to finish
                     let _ = shutdown_tx.send(());

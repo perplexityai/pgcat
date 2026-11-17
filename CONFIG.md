@@ -23,7 +23,7 @@ path: general.enable_prometheus_exporter
 default: true
 ```
 
-Whether to enable prometheus exporter or not.
+Whether to enable prometheus exporter or not. The exporter also serves the `/ready` readiness probe.
 
 ### prometheus_exporter_port
 ```

@@ -351,6 +351,13 @@ async fn prometheus_stats(
                 .header("content-type", "text/plain; version=0.0.4")
                 .body(lines.join("\n").into())
         }
+        (&Method::GET, "/ready") => {
+            let status = match crate::readiness::is_ready() {
+                true => StatusCode::OK,
+                false => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            Response::builder().status(status).body("".into())
+        }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body("".into()),
