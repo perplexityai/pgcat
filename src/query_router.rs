@@ -229,6 +229,20 @@ fn names_only(statement: &Statement) -> bool {
     found
 }
 
+/// A statement has data for `COPY ... FROM STDIN` in the query text. The parser
+/// takes the text from the line after the COPY as that data, but the server
+/// reads it as more statements: COPY data comes in CopyData messages. Blank
+/// text can't be a statement.
+fn copies_inline_data(statement: &Statement) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_statements(statement, |statement| {
+        found |= matches!(statement, Statement::Copy { payload: Some(payload), .. }
+            if !payload.data.bytes().all(|byte| byte.is_ascii_whitespace()));
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
 impl QueryRouter {
     /// One-time initialization of regexes
     /// that parse our custom SQL protocol.
@@ -555,6 +569,10 @@ impl QueryRouter {
             // aliased t: what plugins check wouldn't be the table the server reads.
             Ok(ast) if ast.iter().any(names_only) => Err(Error::QueryRouterParserError(
                 "ONLY before a table name isn't supported".into(),
+            )),
+            // Statements the parser took as COPY data: plugins wouldn't see them.
+            Ok(ast) if ast.iter().any(copies_inline_data) => Err(Error::QueryRouterParserError(
+                "text after COPY FROM STDIN on a new line isn't supported".into(),
             )),
             Ok(ast) => Ok(ast),
             Err(_) => {
@@ -3201,6 +3219,45 @@ mod test {
         }
         let ast = qr.parse(&simple_query("SELECT * FROM ONLY other")).unwrap();
         assert_eq!(qr.execute_plugins(&ast).await.unwrap(), PluginOutput::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_statements_after_copy_from_stdin_are_checked() {
+        let qr = forbidding_secrets();
+        // The server runs the INSERT after the COPY in each of these.
+        for sql in [
+            "COPY labels FROM STDIN; INSERT INTO secrets VALUES (1)",
+            "COPY labels FROM STDIN;\nINSERT INTO secrets VALUES (1)",
+            "COPY labels FROM STDIN; SELECT 1;\nINSERT INTO secrets VALUES (1)",
+            "COPY labels FROM STDIN;\n\nINSERT INTO secrets VALUES (1)",
+        ] {
+            // Refused unread, or read and denied: never forwarded unchecked.
+            let message = simple_query(sql);
+            match qr.parse(&message) {
+                Ok(ast) => assert!(
+                    matches!(qr.execute_plugins(&ast).await, Ok(PluginOutput::Deny(_))),
+                    "{:?}",
+                    sql
+                ),
+                Err(_) => assert!(qr.rejects_unparsed(&message), "{:?}", sql),
+            }
+        }
+        // Text on a new line is refused whatever it names.
+        for sql in [
+            "COPY labels FROM STDIN;\nSELECT 1",
+            "COPY labels FROM STDIN;\n-- c",
+        ] {
+            assert!(QueryRouter::parse_sql(sql).is_err(), "{:?}", sql);
+        }
+        // Blank text isn't.
+        for sql in [
+            "COPY labels FROM STDIN",
+            "COPY labels FROM STDIN;\n",
+            "COPY labels FROM STDIN;\n\n",
+            "COPY labels FROM STDIN;\n    ",
+        ] {
+            assert!(QueryRouter::parse_sql(sql).is_ok(), "{:?}", sql);
+        }
     }
 
     #[test]
