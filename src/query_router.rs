@@ -3242,6 +3242,23 @@ mod test {
                 Err(_) => assert!(qr.rejects_unparsed(&message), "{:?}", sql),
             }
         }
+        // A CRLF ends the line too: refused unread.
+        let message = simple_query("COPY labels FROM STDIN;\r\nINSERT INTO secrets VALUES (1)");
+        assert!(qr.parse(&message).is_err());
+        assert!(qr.rejects_unparsed(&message));
+        // The parser reads SQL again after `\.`, and after a comment across the
+        // line break: read and denied.
+        for sql in [
+            "COPY labels FROM STDIN;\n\\.\nINSERT INTO secrets VALUES (1)",
+            "COPY labels FROM STDIN; /*\n*/ INSERT INTO secrets VALUES (1)",
+        ] {
+            let ast = qr.parse(&simple_query(sql)).expect(sql);
+            assert!(
+                matches!(qr.execute_plugins(&ast).await, Ok(PluginOutput::Deny(_))),
+                "{:?}",
+                sql
+            );
+        }
         // Text on a new line is refused whatever it names.
         for sql in [
             "COPY labels FROM STDIN;\nSELECT 1",
