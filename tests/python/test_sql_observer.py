@@ -862,10 +862,10 @@ def test_reset_all_and_identity_with_the_observer_on(pgcat):
 
     assert delta(CACHED_DB, after) == {"absent": 1}
 
-    # Simple protocol: counted under the identity it ran with, and the
-    # identity goes.
+    # Simple protocol: the identity goes before the query runs, so it's
+    # counted without one.
     raw.simple(f"SET PGCAT_IDENTITY TO '{tenant_token('resetter')}'")
-    assert delta(CACHED_DB, lambda: raw.simple("RESET ALL")) == {"present": 1}
+    assert delta(CACHED_DB, lambda: raw.simple("RESET ALL")) == {"absent": 1}
     assert not raw.identity_set()
     raw.close()
 
