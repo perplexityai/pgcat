@@ -108,18 +108,22 @@ library callers and isolated tests. It does not install a process-wide registry.
   `plugins_require_parse = false`. A configured plugin's own rewrite is
   checked as it built it if its `rewrite_checked_as_built` says so (below).
 - Table access checks the original statements and the final rewrite. A rewrite
-  that reaches a blocked table is refused with 42501
+  that reaches a table listed in table access is refused with 42501
   `permission denied for rewritten statement`, which does not name the table.
-- Table access goes by name. It refuses a statement that names a blocked table
-  anywhere, nested statements included: as a relation it reads or writes, or
-  as the target of `COPY`, `DROP`, `GRANT`/`REVOKE`, `COMMENT`, a trigger, a
-  foreign key, `LIKE`, `SELECT INTO` or a rename. `VACUUM` without a table and
-  `GRANT`/`REVOKE` on all tables in a schema are refused while any table is
-  blocked. It doesn't follow objects that exist on the server: a view, a
-  parent or partitioned table, a function, a rule or a trigger that reaches a
-  blocked table is allowed by its own name, and names inside strings (a
-  foreign table's `OPTIONS`, `dblink`, a function body given as a string)
-  aren't read. Block those on the server, with privileges.
+- Table access goes by name. It refuses a statement, nested statements
+  included, that names a table listed in table access as a relation it reads
+  or writes (in a nested `TABLE t` too; a top-level one doesn't parse), or as
+  the table of `COPY`, `DROP`, `GRANT`/`REVOKE`, `COMMENT`, a trigger, a
+  foreign key, `LIKE` or `SELECT INTO`, or as either name of a rename
+  (`ALTER INDEX` included: Postgres renames a table with it). An index or
+  sequence created with a listed table's name is allowed, since it isn't the
+  table. `VACUUM` without a table and `GRANT`/`REVOKE` on all
+  tables in any schema are refused while any table is listed. It doesn't
+  follow objects that exist on the server: a view, a parent or partitioned
+  table, a function, a rule or a trigger that reaches a listed table is
+  allowed by its own name, and names inside strings (a foreign table's
+  `OPTIONS`, `dblink`, `table_to_xml`/`query_to_xml`, a function body given
+  as a string) aren't read. Block those on the server, with privileges.
 - A configured plugin that checks rewrites refuses another plugin's final
   rewrite that reaches what it covers (below). SQL that a plan's
   `on_execute_query` hook sends isn't parsed again or checked: plugins are

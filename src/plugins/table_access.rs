@@ -2,21 +2,22 @@
 //! table as part of their query. If they can't, the query will not be routed.
 //!
 //! The check goes by name: a statement is refused if it names a forbidden
-//! table anywhere, as a relation it reads or writes, or as the target of DDL,
-//! a privilege, a comment, a trigger, a foreign key, `LIKE`, `SELECT INTO` or
-//! a new name. It doesn't follow objects that already exist on the server. A
-//! view, a parent table or partition tree, a function, a rule or a trigger
-//! that reaches a forbidden table is used by its own name, so a statement
-//! naming only it is allowed. Neither does it read names inside strings:
-//! a foreign table's `OPTIONS (table_name '...')`, `dblink` or a string
-//! function body. Block those on the server, with privileges, if they matter.
+//! table as a relation it reads or writes, or as the table of DDL, a
+//! privilege, a comment, a trigger, a foreign key, `LIKE`, `SELECT INTO`,
+//! `TABLE t` or a rename. It doesn't follow objects that already exist on the
+//! server. A view, a parent table or partition tree, a function, a rule or a
+//! trigger that reaches a forbidden table is used by its own name, so a
+//! statement naming only it is allowed. Neither does it read names inside
+//! strings: a foreign table's `OPTIONS (table_name '...')`, `dblink`,
+//! `table_to_xml`/`query_to_xml` or a string function body. Block those on
+//! the server, with privileges, if they matter.
 
 use async_trait::async_trait;
 use sqlparser::ast::{
     visit_relations, visit_statements, AlterIndexOperation, AlterTableOperation,
-    AlterViewOperation, ColumnOption, CommentObject, CopySource, CreateFunction,
-    CreateFunctionBody, CreateProcedureBody, CreateTableLikeKind, Expr, GrantObjects, Ident,
-    ObjectName, ObjectType, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint,
+    AlterViewOperation, ColumnDef, ColumnOption, CommentObject, CopySource, CreateFunction,
+    CreateFunctionBody, CreateProcedureBody, CreateTableLikeKind, DataType, Expr, GrantObjects,
+    Ident, ObjectName, ObjectType, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint,
     VacuumStatement, Visit, Visitor,
 };
 
@@ -71,11 +72,12 @@ impl<'a> Plugin for TableAccess<'a> {
             found
         });
 
-        // Nor the tables `SELECT ... INTO` creates, in any query.
+        // Nor the tables `SELECT ... INTO` creates or `TABLE t` reads, in any
+        // query.
         let found = found.or_else(|| {
-            let mut targets = SelectIntoTargets(Vec::new());
-            let _ = ast.visit(&mut targets);
-            targets.0.iter().find_map(|name| self.forbidden_name(name))
+            let mut names = QueryNames(Vec::new());
+            let _ = ast.visit(&mut names);
+            names.0.iter().find_map(|name| self.forbidden_name(name))
         });
 
         // A VACUUM without a table processes every table, and a GRANT or
@@ -133,12 +135,12 @@ impl<'a> Plugin for TableAccess<'a> {
 /// - the table of `CREATE TRIGGER` and `DROP TRIGGER`, and the one a
 ///   constraint trigger's `FROM` references;
 /// - the parents a `CREATE TABLE` or `CREATE FOREIGN TABLE` inherits from, the
-///   table it copies with `LIKE`, and the tables its foreign keys reference;
+///   tables it copies with `LIKE`, and the tables its foreign keys reference;
 /// - the table an `ALTER TABLE` attaches or detaches as a partition, the
 ///   parent it adds or removes with `INHERIT` or `NO INHERIT`, the tables the
 ///   foreign keys it adds reference, and the new name it renames the table to;
-/// - the new name of `ALTER VIEW` or `ALTER INDEX ... RENAME TO`, and both
-///   names of `RENAME TABLE`.
+/// - the new name of `ALTER VIEW`, both names of `ALTER INDEX ... RENAME TO`,
+///   and both names of `RENAME TABLE`.
 fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
     let names: Vec<&ObjectName> = match statement {
         Statement::Copy {
@@ -200,6 +202,7 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
                 .iter()
                 .flatten()
                 .chain(like)
+                .chain(table.columns.iter().filter_map(misparsed_like))
                 .chain(
                     table
                         .columns
@@ -239,10 +242,11 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
             AlterViewOperation::RenameTo { new_name } => vec![new_name],
             _ => Vec::new(),
         },
+        // Postgres runs `ALTER INDEX t RENAME TO n` on a table too.
         Statement::AlterIndex {
+            name,
             operation: AlterIndexOperation::RenameIndex { index_name },
-            ..
-        } => vec![index_name],
+        } => vec![name, index_name],
         Statement::RenameTable(renames) => renames
             .iter()
             .flat_map(|rename| [&rename.old_name, &rename.new_name])
@@ -262,6 +266,21 @@ fn granted(objects: Option<&GrantObjects>) -> Vec<&ObjectName> {
             | GrantObjects::Sequences(names),
         ) => names.iter().collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The table a `LIKE` that isn't a table's first element copies. The parser
+/// reads `CREATE TABLE c (a int, LIKE t)` as a column named `like` of type `t`;
+/// Postgres reads an unquoted `like` there as `LIKE`, never as a column name.
+fn misparsed_like(column: &ColumnDef) -> Option<&ObjectName> {
+    match &column.data_type {
+        DataType::Custom(name, _)
+            if column.name.quote_style.is_none()
+                && column.name.value.eq_ignore_ascii_case("like") =>
+        {
+            Some(name)
+        }
+        _ => None,
     }
 }
 
@@ -285,10 +304,11 @@ fn last_part(name: &ObjectName) -> Option<&Ident> {
     name.0.last()?.as_ident()
 }
 
-/// The tables `SELECT ... INTO` creates, in every query.
-struct SelectIntoTargets(Vec<Ident>);
+/// The tables `SELECT ... INTO` creates and `TABLE t` reads, in every query:
+/// neither is an `ObjectName`, so `visit_relations` doesn't visit them.
+struct QueryNames(Vec<Ident>);
 
-impl SelectIntoTargets {
+impl QueryNames {
     fn body(&mut self, body: &SetExpr) {
         match body {
             SetExpr::Select(select) => {
@@ -299,6 +319,7 @@ impl SelectIntoTargets {
                     _ => None,
                 }));
             }
+            SetExpr::Table(table) => self.0.extend(table.table_name.clone()),
             SetExpr::SetOperation { left, right, .. } => {
                 self.body(left);
                 self.body(right);
@@ -309,7 +330,7 @@ impl SelectIntoTargets {
     }
 }
 
-impl Visitor for SelectIntoTargets {
+impl Visitor for QueryNames {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
@@ -637,15 +658,25 @@ mod tests {
             "ALTER VIEW other RENAME TO secrets",
             "ALTER MATERIALIZED VIEW other RENAME TO secrets",
             "ALTER INDEX other RENAME TO secrets",
+            // Postgres renames a table with ALTER INDEX too.
+            "ALTER INDEX secrets RENAME TO other",
+            "ALTER INDEX public.secrets RENAME TO other",
+            // A LIKE after a column.
+            "CREATE TABLE c (a int, LIKE secrets)",
+            "CREATE TABLE c (a int, like public.secrets)",
             // Nested statements.
             "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
              COPY secrets TO STDOUT; END",
             "CREATE PROCEDURE p() BEGIN ATOMIC VACUUM secrets; END",
             "CREATE RULE r AS ON INSERT TO other DO ALSO COPY secrets TO STDOUT",
             "CREATE PROCEDURE p() BEGIN ATOMIC DROP TABLE secrets; END",
-            // These reach every table in the schema.
+            // These reach every table in the schema, in any schema: the
+            // forbidden names have none. A REVOKE is refused like a GRANT.
             "GRANT SELECT ON ALL TABLES IN SCHEMA public TO r",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA other_schema TO r",
             "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM r",
+            "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC",
+            "REVOKE SELECT ON secrets FROM r",
         ] {
             assert!(refused(sql).await, "{}", sql);
         }
@@ -662,9 +693,61 @@ mod tests {
             "CREATE TABLE c (id int REFERENCES other(id))",
             "SELECT 1 INTO other",
             "ALTER TABLE other RENAME TO another",
+            "ALTER INDEX other RENAME TO another",
+            "CREATE TABLE c (a int, LIKE other)",
+            r#"CREATE TABLE c (a int, "like" secrets)"#,
+            // Not the table, though they share its name.
+            "CREATE INDEX secrets ON other (a)",
+            "CREATE SEQUENCE secrets",
             "GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO r",
         ] {
             assert!(!refused(sql).await, "{}", sql);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_table_command_is_checked() {
+        // `TABLE t` reads t. Nested queries are visited on their own.
+        for sql in [
+            "WITH x AS (TABLE secrets) SELECT * FROM x",
+            "CREATE TABLE c AS TABLE secrets",
+            "SELECT * FROM other WHERE id IN (TABLE secrets)",
+            "SELECT * FROM other WHERE id IN (TABLE public.secrets)",
+            r#"WITH x AS (TABLE "secrets") SELECT * FROM x"#,
+            "SELECT * FROM (TABLE secrets) s",
+            "SELECT 1 UNION TABLE secrets",
+        ] {
+            assert!(refused(sql).await, "{}", sql);
+        }
+        for sql in [
+            "WITH x AS (TABLE other) SELECT * FROM x",
+            "CREATE TABLE c AS TABLE other",
+            r#"WITH x AS (TABLE "SECRETS") SELECT * FROM x"#,
+        ] {
+            assert!(!refused(sql).await, "{}", sql);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_every_table_grants_are_refused_only_with_a_forbidden_table() {
+        let tables = vec![];
+        let mut plugin = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        for sql in [
+            "GRANT SELECT ON ALL TABLES IN SCHEMA public TO r",
+            "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC",
+        ] {
+            let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+            assert!(
+                matches!(
+                    plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
+                    PluginOutput::Allow
+                ),
+                "{}",
+                sql
+            );
         }
     }
 
