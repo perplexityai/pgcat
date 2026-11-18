@@ -410,13 +410,15 @@ a plugin checks are rejected with an error instead of being forwarded to the ser
 plugins seeing them. A query might touch such a table if its text names one (in any case), or has
 Unicode escapes (`U&"..."`), which can spell any name. While any table is checked, so might a
 `VACUUM`, which can process every table, a `DO` block, `CREATE FUNCTION` or `CREATE PROCEDURE`,
-whose body is a string that can name any table, or text pgcat can't split into tokens. Other
-queries the parser can't handle are forwarded, for the server to answer. `ONLY` before a table name
-counts as something the parser can't handle: it reads `FROM ONLY t` as a table named `ONLY`.
+whose body is a string that can name any table, or text with one of those words that pgcat can't
+split into tokens. Other queries the parser can't handle are forwarded, for the server to answer.
+`ONLY` before a table name counts as something the parser can't handle: it reads `FROM ONLY t` as a
+table named `ONLY`.
 
-Without this setting, those queries are forwarded too. Table access refuses a string-bodied
-`CREATE FUNCTION` only when the parser reads it, so a `DO` block, or a `CREATE FUNCTION` with an
-option the parser can't read (such as `COST`), still reaches the server.
+With this setting, while table access lists any table, it also refuses a `CREATE FUNCTION` or
+`CREATE PROCEDURE` the parser reads whose body is a string, so no string body reaches the server.
+Without it, table access checks names only: those queries are forwarded, and so is a string-bodied
+function the parser reads.
 
 A plugin configured in a pool's `[plugins.<name>]` section refuses, while it's on, every query the
 parser can't handle on that pool, with or without this setting, unless it declares that it checks

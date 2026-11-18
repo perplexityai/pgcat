@@ -217,18 +217,20 @@ enabled = true
   others are forwarded without its hooks; without it, every unparsed query is
   forwarded. That check reads the text, so SQL outside those statements that
   builds a name (`'secr' || 'ets'`) passes it.
-- While any table is listed in table access, table access refuses a
-  `CREATE FUNCTION` it parses whose body is a string (`AS $$...$$` or
+- With `plugins_require_parse`, while any table is listed in table access, no
+  string body reaches the server. Table access refuses a `CREATE FUNCTION` or
+  `CREATE PROCEDURE` it parses whose body is a string (`AS $$...$$` or
   `AS '...'`, in any language), which it can't read. A body given as SQL
   (`BEGIN ATOMIC`, `RETURN`) is parsed and checked by the tables it names.
   `DO`, a string-bodied `CREATE PROCEDURE`, and a `CREATE FUNCTION` with an
-  option the parser can't read (such as `COST` or `ROWS`) don't parse. With
-  `plugins_require_parse`, they're refused as unparsed queries that might
-  touch a listed table (CONFIG.md). Without it, they're forwarded, so the
-  refusal is a guarantee only with `plugins_require_parse`: a `DO` block can
-  still read a listed table, and a `CREATE FUNCTION ... COST 1 AS $$...$$`
-  can still create a function that does. Either way, functions that run SQL
-  given as text, such as `query_to_xml`, aren't refused.
+  option the parser can't read (such as `COST` or `ROWS`) don't parse, and
+  are refused as unparsed queries that might touch a listed table
+  (CONFIG.md). Without `plugins_require_parse`, table access checks names
+  only: a string body is forwarded, parsed or not, and can read a listed
+  table. Either way, functions that run SQL given as text, such as
+  `query_to_xml`, aren't refused. The refusal covers the tables listed in
+  table access: a configured plugin sees a parsed string-bodied function like
+  any statement, and refuses it itself if its tables need that.
 - `withholds_server_text` is for pools whose rows hold protected values, which
   Postgres quotes in its diagnostics (a constraint violation's DETAIL is the
   whole row). The client then gets only the severity, SQLSTATE and object

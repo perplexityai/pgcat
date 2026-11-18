@@ -111,8 +111,20 @@ fn first_word(query: &str) -> &str {
 
 /// Whether a query has a statement that runs a string as code: `DO`, or
 /// `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE`, whose bodies are strings
-/// the parser doesn't read. One that can't be tokenized might.
+/// the parser doesn't read. One that has one of those words and can't be
+/// tokenized might.
 fn runs_string_body(query: &str) -> bool {
+    // Keywords can't be escaped, so a statement can only start with these if
+    // the text has them. That skips tokenizing most long queries.
+    let has = |word: &[u8]| {
+        query
+            .as_bytes()
+            .windows(word.len())
+            .any(|window| window.eq_ignore_ascii_case(word))
+    };
+    if !has(b"do") && !has(b"function") && !has(b"procedure") {
+        return false;
+    }
     let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, query).tokenize() else {
         return true;
     };
@@ -3936,10 +3948,18 @@ mod test {
             "SELEKT 1; /* DO */ SELEKT 2",
             "SELEKT \"do\" $$ $$",
             "SELEKT 1 -- CREATE FUNCTION",
+            // Text that can't be tokenized only might run one if it has
+            // one of the words.
+            "SELEKT 'unterminated",
         ] {
             let message = simple_query(query);
             assert!(qr.parse(&message).is_err(), "{}", query);
             assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+        for query in ["SELEKT 'Do", "SELEKT 1 $$ function"] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
         }
 
         qr.update_pool_settings(&with_gated(vec![]));
@@ -3948,8 +3968,8 @@ mod test {
         }
 
         // Without plugins_require_parse they're forwarded, even one whose
-        // body names a gated table: table access refuses only a string body
-        // it parses.
+        // body names a gated table, like a string body the parser reads:
+        // table access then checks names only.
         let mut settings = with_gated(vec!["secrets".into()]);
         settings.plugins_require_parse = false;
         qr.update_pool_settings(&settings);
@@ -3960,6 +3980,35 @@ mod test {
             assert!(qr.parse(&message).is_err(), "{}", query);
             assert!(!qr.rejects_unparsed(&message), "{}", query);
         }
+    }
+
+    #[tokio::test]
+    async fn test_parsed_string_bodies_are_refused_only_with_plugins_require_parse() {
+        let mut qr = forbidding_secrets();
+        let string_body = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+                           AS $$ SELECT count(*) FROM secrets $$";
+        let sql_body = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+                        RETURN (SELECT count(*) FROM secrets)";
+        let refusal =
+            PluginOutput::Deny("permission for a function body given as a string denied".into());
+
+        let ast = qr.parse(&simple_query(string_body)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), refusal);
+
+        // Without plugins_require_parse, with secrets still listed, table
+        // access checks names only: the string body is sent, and the body
+        // given as SQL is checked by the table it names.
+        let mut settings = qr.pool_settings().clone();
+        settings.plugins_require_parse = false;
+        qr.update_pool_settings(&settings);
+        assert!(!qr.plugins_require_parse());
+        let ast = qr.parse(&simple_query(string_body)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), PluginOutput::Allow);
+        let ast = qr.parse(&simple_query(sql_body)).unwrap();
+        assert_eq!(
+            qr.execute_plugins(&ast).await.unwrap(),
+            PluginOutput::Deny("permission for table \"secrets\" denied".into())
+        );
     }
 
     #[tokio::test]
