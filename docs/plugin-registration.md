@@ -225,10 +225,10 @@ enabled = true
   option the parser can't read (such as `COST` or `ROWS`) don't parse. With
   `plugins_require_parse`, they're refused as unparsed queries that might
   touch a listed table (CONFIG.md). Without it, they're forwarded, so the
-  refusal is a guarantee only with `plugins_require_parse`: a `DO` block, or
-  a `CREATE FUNCTION ... COST 1 AS $$...$$`, can still create a function
-  whose body reads a listed table. Either way, functions that run SQL given
-  as text, such as `query_to_xml`, aren't refused.
+  refusal is a guarantee only with `plugins_require_parse`: a `DO` block can
+  still read a listed table, and a `CREATE FUNCTION ... COST 1 AS $$...$$`
+  can still create a function that does. Either way, functions that run SQL
+  given as text, such as `query_to_xml`, aren't refused.
 - `withholds_server_text` is for pools whose rows hold protected values, which
   Postgres quotes in its diagnostics (a constraint violation's DETAIL is the
   whole row). The client then gets only the severity, SQLSTATE and object
