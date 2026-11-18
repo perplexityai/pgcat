@@ -247,8 +247,14 @@ pub(crate) fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     let exit_tx = exit_tx.clone();
                     let _ = drain_tx.send(0).await;
 
+                    // Clients draw their drain delay from the live
+                    // shutdown_drain_spread, which config validation keeps
+                    // below the live shutdown_timeout: read both after the
+                    // same reloads, not this one from startup.
+                    let shutdown_timeout = get_config().general.shutdown_timeout;
+
                     tokio::task::spawn(async move {
-                        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(config.general.shutdown_timeout));
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(shutdown_timeout));
 
                         // First tick fires immediately.
                         interval.tick().await;

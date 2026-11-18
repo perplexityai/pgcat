@@ -120,7 +120,7 @@ path: general.shutdown_timeout
 default: 60000 # milliseconds
 ```
 
-How much time to give clients during shutdown before forcibly killing client connections (ms).
+How much time to give clients during shutdown before forcibly killing client connections (ms). The value in effect at SIGINT applies, a reload's included.
 
 ### shutdown_drain_spread
 ```
