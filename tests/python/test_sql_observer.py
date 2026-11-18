@@ -829,8 +829,8 @@ def test_reset_all_and_identity_with_the_observer_on(pgcat):
 
     assert delta(CACHED_DB, commands) == {}
 
-    # RESET ALL is SQL the parser leaves unparsed (so a gap, with no identity
-    # label). Bound, not executed: nothing is counted and the identity stays.
+    # RESET ALL is SQL the parser reads. Bound, not executed: nothing is
+    # counted and the identity stays.
     def bound():
         raw.batch(msg_parse(b"r", b"RESET ALL"), msg_bind(b"pr", b"r"))
 
@@ -849,9 +849,9 @@ def test_reset_all_and_identity_with_the_observer_on(pgcat):
         codes, _ = raw.batch(msg_execute(b"pr"))
         assert codes == [b"C", b"Z"]
 
-    # Executed: one unparsed_statement gap (no identity label), and the
-    # identity goes with the session reset.
-    assert delta(CACHED_DB, executed) == {"unparsed_statement": 1}
+    # Executed: counted under the identity it ran with, and the identity goes
+    # with the session reset.
+    assert delta(CACHED_DB, executed) == {"present": 1}
     assert not raw.identity_set()
     raw.simple("COMMIT")
 
@@ -862,9 +862,10 @@ def test_reset_all_and_identity_with_the_observer_on(pgcat):
 
     assert delta(CACHED_DB, after) == {"absent": 1}
 
-    # Simple protocol: one unparsed_query gap, and the identity goes.
+    # Simple protocol: the identity goes before the query runs, so it's
+    # counted without one.
     raw.simple(f"SET PGCAT_IDENTITY TO '{tenant_token('resetter')}'")
-    assert delta(CACHED_DB, lambda: raw.simple("RESET ALL")) == {"unparsed_query": 1}
+    assert delta(CACHED_DB, lambda: raw.simple("RESET ALL")) == {"absent": 1}
     assert not raw.identity_set()
     raw.close()
 

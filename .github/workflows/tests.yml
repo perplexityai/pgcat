@@ -1,0 +1,208 @@
+# Runs on every pull request and on main: formatting, the build, Rust unit
+# tests, the Python tests that start their own pgcat, the Go cancellation
+# tests, and the release images. The inherited CircleCI client/failover matrix
+# (.circleci/) isn't run here.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its superseded run; main runs finish.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Keep target/ small: no incremental artifacts, and slim debug info. With the
+# toolchain-scoped cache keys below this keeps the hosted runner's disk from
+# filling up.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_TOOLCHAIN: 1.97.1
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_INITDB_ARGS="--auth-local=md5 --auth-host=md5" \
+            postgres:14 -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-
+
+      # The Python and Go tests run target/debug/pgcat, and the plugin tests
+      # need it built with test-plugins.
+      - name: Build
+        run: |
+          cargo build --features test-plugins --bins --examples
+          bash tests/check_allocator_build.sh
+
+      - name: Set up the database
+        run: |
+          for i in $(seq 1 60); do
+            docker exec postgres pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 1
+          done
+          docker exec -i -e PGPASSWORD=postgres postgres \
+            psql -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres < tests/sharding/query_routing_setup.sql
+
+      - name: Rust tests
+        run: cargo test --features test-plugins
+
+      # Before the Python tests, so a Python failure doesn't skip them. They
+      # need only Postgres and target/debug/pgcat.
+      - name: Install Go 1.21.3
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Match the existing integration-test toolchain.
+          go-version: '1.21.3'
+          cache: false
+
+      - name: Go cancellation tests
+        working-directory: tests/go
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go test -mod=readonly -count=1 -timeout=60s -v \
+            -run '^(TestVerifiedTLSCancelStopsBackend|TestPlainCancelCompatibilityAndKeyValidation)$' .
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # tests/psql scenarios need psql 18's pipeline and prepared-statement
+      # meta-commands; the runner's psql is older.
+      - name: Install psql 18
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-18
+
+      - name: Python tests
+        env:
+          PGCAT_TEST_PLUGINS: "1"
+          PGCAT_TEST_PSQL: /usr/lib/postgresql/18/bin/psql
+        run: |
+          pip install -r tests/python/requirements.txt
+          pytest -q tests/python \
+            --ignore=tests/python/test_auth.py \
+            --ignore=tests/python/test_pgcat.py \
+            --ignore=tests/python/test_asyncpg.py
+
+      - name: Disk usage
+        if: always()
+        run: df -h / && du -sh target ~/.cargo 2>/dev/null || true
+
+  rustfmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same toolchain as the test job; rustfmt output can change between releases.
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+
+      # tests/rust is a separate crate outside the workspace.
+      - name: Check formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --all --check --manifest-path tests/rust/Cargo.toml
+
+  image:
+    # The release images, as build-and-push.yaml and local development build
+    # them, run as they ship (their CMD and pgcat.toml): they serve a query,
+    # and refuse a config naming a plugin that isn't registered.
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile, Dockerfile.dev]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_INITDB_ARGS="--auth-local=md5 --auth-host=md5" \
+            postgres:14
+
+      - name: Build ${{ matrix.dockerfile }}
+        run: docker build -f ${{ matrix.dockerfile }} -t pgcat:ci .
+
+      - name: Set up the database
+        run: |
+          for i in $(seq 1 60); do
+            docker exec postgres pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 1
+          done
+          docker exec -i -e PGPASSWORD=postgres postgres \
+            psql -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres < tests/sharding/query_routing_setup.sql
+
+      - name: Run the image
+        run: |
+          docker image inspect --format 'cmd={{json .Config.Cmd}} workdir={{.Config.WorkingDir}}' pgcat:ci
+          docker run --rm --entrypoint sh pgcat:ci -c 'command -v pgcat && ls -l /usr/bin/pgcat /etc/pgcat/pgcat.toml'
+          docker run -d --name pgcat --network host pgcat:ci
+          for i in $(seq 1 60); do
+            docker logs pgcat > pgcat.log 2>&1
+            grep -q "Waiting for clients" pgcat.log && break
+            sleep 1
+          done
+          tail -n 40 pgcat.log
+          grep -q "Waiting for clients" pgcat.log
+          test "$(docker inspect -f '{{.State.Running}}' pgcat)" = true
+          PGPASSWORD=simple_user psql -h 127.0.0.1 -p 6432 -U simple_user -d simple_db -tAc 'SELECT 1'
+
+      - name: Refuse an unregistered plugin
+        run: |
+          docker run --rm --entrypoint cat pgcat:ci /etc/pgcat/pgcat.toml > plugin.toml
+          printf '\n[pools.simple_db.plugins.unregistered]\nenabled = true\n' >> plugin.toml
+          status=0
+          # Bounded: an image that accepts the section would serve until the
+          # job's timeout.
+          timeout 120 docker run --rm --name pgcat-plugin \
+            -v "$PWD/plugin.toml:/etc/pgcat/pgcat.toml:ro" pgcat:ci \
+            > plugin.log 2>&1 || status=$?
+          if [ "$status" = 124 ]; then
+            docker rm -f pgcat-plugin
+            echo "the image kept running with an unregistered plugin" >&2
+          fi
+          tail -n 20 plugin.log
+          # exitcode::CONFIG
+          test "$status" = 78
+          grep -qF 'plugins."unregistered": no plugin of that name is registered' plugin.log

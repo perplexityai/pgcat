@@ -164,9 +164,8 @@ def still_works(message, sock):
         (f"COPY {FORBIDDEN.upper()} TO STDOUT", "42501"),
         (f'COPY "{FORBIDDEN}" TO STDOUT', "42501"),
         (f"COPY (SELECT secret FROM {FORBIDDEN}) TO STDOUT", "42501"),
-        # The parser can't read COPY ... FROM STDIN. Its text names a table a
-        # plugin checks, so it's refused unread.
-        (f"COPY {FORBIDDEN} FROM STDIN", "0A000"),
+        # The parser reads COPY ... FROM STDIN, so the plugin checks its table.
+        (f"COPY {FORBIDDEN} FROM STDIN", "42501"),
     ],
 )
 def test_copy_of_a_forbidden_table_is_refused(pgcat, sql, refused_with):
