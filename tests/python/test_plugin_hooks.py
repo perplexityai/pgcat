@@ -212,13 +212,18 @@ def test_require_parse_rejects_unparseable_sql(pgcat):
     for query in [
         "SELEKT * FROM plugin_forbidden",
         'SELEKT * FROM U&"plugin\\005fforbidden"',
-        # The parser reads `ONLY t` as a table named ONLY: table_access
-        # wouldn't have seen plugin_forbidden.
-        "SELECT * FROM ONLY plugin_forbidden",
+        # The parser reads `INSERT INTO ONLY t` as a table named ONLY:
+        # table_access wouldn't have seen plugin_forbidden.
+        "INSERT INTO ONLY plugin_forbidden VALUES (1)",
     ]:
         with pytest.raises(psycopg2.Error, match="could not parse") as error:
             cur.execute(query)
         assert error.value.pgcode == "0A000"
+
+    # The parser reads `FROM ONLY t` as t, so table_access checks it.
+    with pytest.raises(psycopg2.Error, match="permission") as error:
+        cur.execute("SELECT * FROM ONLY plugin_forbidden")
+    assert error.value.pgcode == "42501"
 
     # The connection is still usable.
     cur.execute("SELECT 1")
@@ -229,7 +234,7 @@ def test_require_parse_rejects_unparseable_sql(pgcat):
         cur.execute("SELEKT 1")
     cur.execute("SELECT count(*) FROM ONLY plugin_rows")
 
-    # The parser doesn't know RESET, but it can't touch a table.
+    # RESET can't touch a table.
     cur.execute("RESET ALL")
     conn.close()
 
