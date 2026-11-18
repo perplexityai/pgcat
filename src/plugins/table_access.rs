@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use sqlparser::ast::{
-    visit_relations, visit_statements, AlterTableOperation, CopySource, ObjectName, ObjectType,
-    Statement, VacuumStatement,
+    visit_relations, visit_statements, AlterTableOperation, CopySource, CreateFunction,
+    CreateFunctionBody, ObjectName, ObjectType, Statement, VacuumStatement,
 };
 
 use crate::{
@@ -83,6 +83,17 @@ impl<'a> Plugin for TableAccess<'a> {
             ));
         }
 
+        // A function body given as a string isn't parsed, so the tables it
+        // names can't be checked. One given as SQL (`BEGIN ATOMIC`, `RETURN`)
+        // is, above.
+        if found.is_none() && !self.tables.is_empty() && has_string_body(ast) {
+            debug!("Blocking a function body given as a string");
+
+            return Ok(PluginOutput::Deny(
+                "permission for a function body given as a string denied".into(),
+            ));
+        }
+
         if let Some(found) = found {
             debug!("Blocking access to table \"{}\"", found);
 
@@ -122,6 +133,24 @@ fn unvisited_relations(statement: &Statement) -> Vec<&ObjectName> {
         } => names.iter().collect(),
         _ => Vec::new(),
     }
+}
+
+/// Whether a statement, or one nested in it, creates a function whose body is
+/// a string: `AS 'body'` or `AS $$body$$`, in any language, an object file's
+/// too.
+fn has_string_body(ast: &Vec<Statement>) -> bool {
+    visit_statements(ast, |statement| match statement {
+        Statement::CreateFunction(CreateFunction {
+            function_body:
+                Some(
+                    CreateFunctionBody::AsBeforeOptions { .. }
+                    | CreateFunctionBody::AsAfterOptions(_),
+                ),
+            ..
+        }) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// The table a VACUUM processes, or `None` when it processes every table.
@@ -185,6 +214,51 @@ mod tests {
             assert!(refused(sql).await, "{}", sql);
         }
         assert!(!refused("COPY other TO STDOUT").await);
+    }
+
+    #[tokio::test]
+    async fn test_string_function_bodies_are_refused_while_a_table_is_forbidden() {
+        for sql in [
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql AS $$ SELECT count(*) FROM secrets $$",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+            "CREATE OR REPLACE FUNCTION f() RETURNS int AS $body$ SELECT 1 $body$ LANGUAGE sql",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
+            "CREATE FUNCTION f() RETURNS int AS 'MODULE_PATHNAME', 'f' LANGUAGE c",
+            "SELECT 1; CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+            // A body given as SQL is checked by the tables it names.
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+             RETURN (SELECT count(*) FROM secrets)",
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql BEGIN ATOMIC \
+             SELECT count(*) FROM secrets; END",
+        ] {
+            assert!(refused(sql).await, "{}", sql);
+        }
+
+        for sql in [
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+             RETURN (SELECT count(*) FROM other)",
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql BEGIN ATOMIC \
+             SELECT count(*) FROM other; END",
+            "CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; END",
+        ] {
+            assert!(!refused(sql).await, "{}", sql);
+        }
+
+        // Nothing to protect, nothing refused.
+        let tables = vec![];
+        let mut plugin = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        let ast = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        )
+        .unwrap();
+        assert_eq!(
+            plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
+            PluginOutput::Allow
+        );
     }
 
     #[tokio::test]

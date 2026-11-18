@@ -12,6 +12,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -106,6 +107,37 @@ fn first_word(query: &str) -> &str {
             return &rest[..end];
         }
     }
+}
+
+/// Whether a query has a statement that runs a string as code: `DO`, or
+/// `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE`, whose bodies are strings
+/// the parser doesn't read. One that can't be tokenized might.
+fn runs_string_body(query: &str) -> bool {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, query).tokenize() else {
+        return true;
+    };
+    tokens
+        .split(|token| *token == Token::SemiColon)
+        .any(|statement| {
+            let words: Vec<String> = statement
+                .iter()
+                .filter(|token| !matches!(token, Token::Whitespace(_)))
+                .take(4)
+                .map(|token| match token {
+                    Token::Word(word) if word.quote_style.is_none() => {
+                        word.value.to_ascii_lowercase()
+                    }
+                    _ => String::new(),
+                })
+                .collect();
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            matches!(
+                words.as_slice(),
+                ["do", ..]
+                    | ["create", "function" | "procedure", ..]
+                    | ["create", "or", "replace", "function" | "procedure", ..]
+            )
+        })
 }
 
 /// Quickly test for match when a query is received.
@@ -2042,12 +2074,14 @@ impl QueryRouter {
     /// its text has a name a plugin gates (a table's, or a function's that
     /// runs SQL given as text, which can build any name), or Unicode escapes
     /// (`U&"..."`), which can spell any name. A VACUUM without a table name
-    /// processes every table, so any VACUUM might.
+    /// processes every table, so any VACUUM might, as might a `DO` block or a
+    /// function or procedure whose body is a string.
     fn might_touch_gated(&self, query: &str) -> bool {
         let query = query.to_ascii_lowercase();
         let gated = self.gated_tables();
         query.contains("u&")
             || (!gated.is_empty() && first_word(&query) == "vacuum")
+            || (!gated.is_empty() && runs_string_body(&query))
             || gated
                 .iter()
                 .any(|table| query.contains(&table.to_ascii_lowercase()))
@@ -3853,6 +3887,62 @@ mod test {
 
         qr.update_pool_settings(&with_gated(vec![]));
         for query in vacuums {
+            assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
+        }
+    }
+
+    #[test]
+    fn test_unparsed_string_bodies_are_rejected_while_a_table_is_gated() {
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        let with_gated = |tables: Vec<String>| {
+            let mut settings = testing_plugin_settings(true);
+            if let Some(ref mut plugins) = settings.plugins {
+                plugins.table_access = Some(crate::config::TableAccess {
+                    enabled: true,
+                    tables,
+                });
+            }
+            settings
+        };
+
+        // The parser can't read these, and their bodies can name any table.
+        let bodies = [
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "do language plpgsql 'BEGIN PERFORM 1; END'",
+            "/* c */ DO $x$ BEGIN PERFORM 1; END $x$",
+            "SELECT 1; DO $$ BEGIN PERFORM 1; END $$",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN PERFORM 1; END $$",
+            "create or replace procedure p() language sql as 'SELECT 1'",
+            "CREATE OR REPLACE FUNCTION f() RETURNS SETOF record LANGUAGE sql \
+             AS $$ SELECT 1 $$ ROWS 10",
+            // Unterminated: the server reads up to the end.
+            "DO $$ BEGIN PERFORM 1",
+        ];
+        qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
+        for query in bodies {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{}",
+                query
+            );
+        }
+        for query in [
+            "SELEKT 'DO $$ $$'",
+            "SELEKT 1; /* DO */ SELEKT 2",
+            "SELEKT \"do\" $$ $$",
+            "SELEKT 1 -- CREATE FUNCTION",
+        ] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+
+        qr.update_pool_settings(&with_gated(vec![]));
+        for query in bodies {
             assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
         }
     }

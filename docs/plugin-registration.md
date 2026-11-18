@@ -212,9 +212,17 @@ enabled = true
   some tables can return true from `allows_unparsed_outside_gated_tables` to
   keep the table-scoped rule instead: with `plugins_require_parse`, an
   unparsed query is refused only if its text names one of its `gated_tables`
-  (in any case), or has a Unicode escape (`U&`), and others are forwarded
-  without its hooks; without it, every unparsed query is forwarded. That check
-  reads the text, so SQL that builds a name (`'secr' || 'ets'`) passes it.
+  (in any case), has a Unicode escape (`U&`), or has a `DO` block or a
+  `CREATE FUNCTION` or `CREATE PROCEDURE` (their bodies are strings), and
+  others are forwarded without its hooks; without it, every unparsed query is
+  forwarded. That check reads the text, so SQL that builds a name
+  (`'secr' || 'ets'`) passes it.
+- While table access blocks any table, it refuses a `CREATE FUNCTION` whose
+  body is a string (`AS $$...$$` or `AS '...'`, in any language), which it
+  can't read. A body given as SQL (`BEGIN ATOMIC`, `RETURN`) is parsed and
+  checked by the tables it names. `DO` and a string-bodied `CREATE
+  PROCEDURE` don't parse: with `plugins_require_parse`, they're refused as
+  unparsed queries that might touch a blocked table (CONFIG.md).
 - `withholds_server_text` is for pools whose rows hold protected values, which
   Postgres quotes in its diagnostics (a constraint violation's DETAIL is the
   whole row). The client then gets only the severity, SQLSTATE and object

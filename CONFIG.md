@@ -408,7 +408,9 @@ If plugins are configured and this setting is enabled, queries the query parser 
 (syntax it doesn't understand, or longer than `query_parser_max_length`) that might touch a table
 a plugin checks are rejected with an error instead of being forwarded to the server without the
 plugins seeing them. A query might touch such a table if its text names one (in any case), or has
-Unicode escapes (`U&"..."`), which can spell any name. Other queries the parser can't handle are
+Unicode escapes (`U&"..."`), which can spell any name. While any table is checked, so might a
+`VACUUM`, which can process every table, and a `DO` block, `CREATE FUNCTION` or `CREATE PROCEDURE`,
+whose body is a string that can name any table. Other queries the parser can't handle are
 forwarded, for the server to answer. `ONLY` before a table name counts as something the parser
 can't handle: it reads `FROM ONLY t` as a table named `ONLY`.
 
