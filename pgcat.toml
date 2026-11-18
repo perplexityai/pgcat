@@ -38,6 +38,9 @@ healthcheck_delay = 30000 # milliseconds
 # How much time to give clients during shutdown before forcibly killing client connections (ms).
 shutdown_timeout = 60000 # milliseconds
 
+# On SIGINT, close each idle client after a random delay between 0 and this value, instead of closing them all at once. This spreads their reconnects to other instances over the window. Must be less than `shutdown_timeout`. 0 closes idle clients right away.
+shutdown_drain_spread = 0 # milliseconds
+
 # How long to ban a server if it fails a health check (seconds).
 ban_time = 60 # seconds
 

@@ -137,6 +137,10 @@ pub struct Client<S, T> {
     /// Used to notify clients about an impending shutdown
     shutdown: Receiver<()>,
 
+    /// When a draining client disconnects. Each client picks its own time in
+    /// the drain window, so clients don't all reconnect elsewhere at once.
+    drain_at: Option<tokio::time::Instant>,
+
     /// Whether prepared statements are enabled for this client
     prepared_statements_enabled: bool,
 
@@ -1121,6 +1125,7 @@ where
             username: username.clone(),
             server_parameters,
             shutdown,
+            drain_at: None,
             prepared_statements_enabled,
             extended_protocol_data_buffer: VecDeque::new(),
             local_statements: HashMap::new(),
@@ -1191,6 +1196,7 @@ where
             username: String::from("undefined"),
             server_parameters: ServerParameters::new(),
             shutdown,
+            drain_at: None,
             prepared_statements_enabled: false,
             extended_protocol_data_buffer: VecDeque::new(),
             local_statements: HashMap::new(),
@@ -1303,24 +1309,37 @@ where
             // in case the client is sending some custom protocol messages, e.g.
             // SET SHARDING KEY TO 'bigint';
 
-            let mut message = tokio::select! {
-                _ = self.shutdown.recv() => {
-                    if !self.admin {
-                        error_response_terminal(
-                            &mut self.write,
-                            "terminating connection due to administrator command"
-                        ).await?;
+            // read_message isn't cancel-safe, so the same future is polled until
+            // it completes: the client keeps serving while it waits to drain.
+            let mut message = {
+                let read = read_message(&mut self.read);
+                tokio::pin!(read);
+                loop {
+                    tokio::select! {
+                        // Admin clients ignore shutdown.
+                        _ = self.shutdown.recv(), if !self.admin && self.drain_at.is_none() => {
+                            let spread = get_config().general.shutdown_drain_spread;
+                            let delay = rand::random_range(0..=spread);
+                            self.drain_at = Some(
+                                tokio::time::Instant::now()
+                                    + tokio::time::Duration::from_millis(delay),
+                            );
+                        },
+                        // select! builds every branch's future, even a disabled one.
+                        _ = tokio::time::sleep_until(
+                            self.drain_at.unwrap_or_else(tokio::time::Instant::now)
+                        ), if self.drain_at.is_some() => {
+                            error_response_terminal(
+                                &mut self.write,
+                                "terminating connection due to administrator command"
+                            ).await?;
 
-                        self.stats.disconnect();
-                        return Ok(());
+                            self.stats.disconnect();
+                            return Ok(());
+                        },
+                        message_result = &mut read => break message_result?,
                     }
-
-                    // Admin clients ignore shutdown.
-                    else {
-                        read_message(&mut self.read).await?
-                    }
-                },
-                message_result = read_message(&mut self.read) => message_result?
+                }
             };
 
             if message[0] as char == 'X' {
