@@ -43,15 +43,15 @@ def test_idle_clients_disconnect_spread_over_the_window():
             selector.register(sock, selectors.EVENT_READ, bytearray())
 
         pgcat.process.send_signal(signal.SIGINT)
-        start = time.time()
+        start = time.monotonic()
 
         closed_after = []
-        while len(closed_after) < CLIENTS and time.time() - start < TIMEOUT + 2:
+        while len(closed_after) < CLIENTS and time.monotonic() - start < TIMEOUT + 2:
             for key, _ in selector.select(timeout=0.1):
                 data = key.fileobj.recv(4096)
                 key.data.extend(data)
                 if not data:
-                    closed_after.append(time.time() - start)
+                    closed_after.append(time.monotonic() - start)
                     selector.unregister(key.fileobj)
                     # pgcat closed it, not the hard exit at shutdown_timeout.
                     assert key.data.startswith(b"E"), bytes(key.data)
@@ -91,5 +91,50 @@ def test_a_message_split_across_sigint_is_answered():
             answered += codes == [b"T", b"D", b"C", b"Z"]
 
         assert answered >= 5, answered
+    finally:
+        pgcat.stop()
+
+
+def test_a_reload_raising_both_settings_moves_the_hard_exit():
+    # Startup allows a short window; a reload raises the spread and the
+    # timeout together. The hard exit must use the reloaded timeout, or it
+    # closes clients still waiting out the reloaded spread.
+    short = CONFIG.replace(
+        f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 500"
+    ).replace(f"shutdown_timeout = {int(TIMEOUT * 1000)}", "shutdown_timeout = 1000")
+    # Both replacements matched. The newline keeps "shutdown_timeout = 10000"
+    # from passing for 1000.
+    assert "shutdown_drain_spread = 500\n" in short, short
+    assert "shutdown_timeout = 1000\n" in short, short
+    pgcat = utils.PgcatProcess(short, PORT).start()
+    try:
+        pgcat.write_config(CONFIG)
+        # Returns once the reloaded config is stored.
+        utils.admin_reload(PORT)
+
+        socks = [utils.raw_connection(PORT, "shard0")[0] for _ in range(CLIENTS)]
+        selector = selectors.DefaultSelector()
+        for sock in socks:
+            selector.register(sock, selectors.EVENT_READ, bytearray())
+
+        pgcat.process.send_signal(signal.SIGINT)
+        start = time.monotonic()
+
+        closed_after = []
+        while len(closed_after) < CLIENTS and time.monotonic() - start < TIMEOUT + 2:
+            for key, _ in selector.select(timeout=0.1):
+                data = key.fileobj.recv(4096)
+                key.data.extend(data)
+                if not data:
+                    closed_after.append(time.monotonic() - start)
+                    selector.unregister(key.fileobj)
+                    # The exit at the startup timeout closes without a notice.
+                    assert b"administrator command" in key.data, (
+                        time.monotonic() - start,
+                        bytes(key.data),
+                    )
+
+        assert len(closed_after) == CLIENTS
+        assert max(closed_after) > 2, closed_after
     finally:
         pgcat.stop()

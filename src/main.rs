@@ -247,8 +247,15 @@ pub(crate) fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     let exit_tx = exit_tx.clone();
                     let _ = drain_tx.send(0).await;
 
+                    // Read the live value, as clients do for
+                    // shutdown_drain_spread, which config validation keeps
+                    // below it, so a reload before SIGINT moves both. A
+                    // reload that runs at the same time as SIGINT can still
+                    // split them.
+                    let shutdown_timeout = get_config().general.shutdown_timeout;
+
                     tokio::task::spawn(async move {
-                        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(config.general.shutdown_timeout));
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(shutdown_timeout));
 
                         // First tick fires immediately.
                         interval.tick().await;

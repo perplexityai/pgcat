@@ -120,7 +120,7 @@ path: general.shutdown_timeout
 default: 60000 # milliseconds
 ```
 
-How much time to give clients during shutdown before forcibly killing client connections (ms).
+How much time to give clients during shutdown before forcibly killing client connections (ms). pgcat uses the value in effect when it receives SIGINT, including one set by a reload. A reload after SIGINT doesn't change it.
 
 ### shutdown_drain_spread
 ```
