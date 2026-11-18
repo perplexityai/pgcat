@@ -307,6 +307,9 @@ pub struct General {
     #[serde(default = "General::default_shutdown_timeout")]
     pub shutdown_timeout: u64,
 
+    #[serde(default = "General::default_shutdown_drain_spread")]
+    pub shutdown_drain_spread: u64,
+
     #[serde(default = "General::default_healthcheck_timeout")]
     pub healthcheck_timeout: u64,
 
@@ -408,6 +411,10 @@ impl General {
         60000
     }
 
+    pub fn default_shutdown_drain_spread() -> u64 {
+        0
+    }
+
     pub fn default_dns_max_ttl() -> u64 {
         30
     }
@@ -467,6 +474,7 @@ impl Default for General {
             dns_cache_enabled: false,
             dns_max_ttl: Self::default_dns_max_ttl(),
             shutdown_timeout: Self::default_shutdown_timeout(),
+            shutdown_drain_spread: Self::default_shutdown_drain_spread(),
             healthcheck_timeout: Self::default_healthcheck_timeout(),
             healthcheck_delay: Self::default_healthcheck_delay(),
             ban_time: Self::default_ban_time(),
@@ -1397,6 +1405,10 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                 config.general.shutdown_timeout.to_string(),
             ),
             (
+                "shutdown_drain_spread".to_string(),
+                config.general.shutdown_drain_spread.to_string(),
+            ),
+            (
                 "healthcheck_delay".to_string(),
                 config.general.healthcheck_delay.to_string(),
             ),
@@ -1440,6 +1452,10 @@ impl Config {
             self.general.log_client_disconnections
         );
         info!("Shutdown timeout: {}ms", self.general.shutdown_timeout);
+        info!(
+            "Shutdown drain spread: {}ms",
+            self.general.shutdown_drain_spread
+        );
         info!("Healthcheck delay: {}ms", self.general.healthcheck_delay);
         info!(
             "Default max server lifetime: {}ms",
@@ -1675,6 +1691,17 @@ impl Config {
                 you need to provide a value \
                 for `auth_query_user`, \
                 `auth_query_password`"
+            );
+
+            return Err(Error::BadConfig);
+        }
+
+        // The hard exit at shutdown_timeout would close clients still waiting
+        // for their turn to disconnect.
+        if self.general.shutdown_drain_spread >= self.general.shutdown_timeout {
+            error!(
+                "shutdown_drain_spread ({}ms) must be less than shutdown_timeout ({}ms)",
+                self.general.shutdown_drain_spread, self.general.shutdown_timeout
             );
 
             return Err(Error::BadConfig);
@@ -2392,6 +2419,18 @@ mod test {
         assert_eq!(config.path, "pgcat.toml");
         assert!(config.pools.is_empty());
         assert!(config.plugins.is_none());
+    }
+
+    #[test]
+    fn test_config_rejects_drain_spread_not_below_shutdown_timeout() {
+        let mut config = Config::default();
+        config.general.shutdown_timeout = 10000;
+
+        config.general.shutdown_drain_spread = 9999;
+        assert!(config.validate().is_ok());
+
+        config.general.shutdown_drain_spread = 10000;
+        assert!(config.validate().is_err());
     }
 
     #[test]

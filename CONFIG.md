@@ -122,6 +122,14 @@ default: 60000 # milliseconds
 
 How much time to give clients during shutdown before forcibly killing client connections (ms).
 
+### shutdown_drain_spread
+```
+path: general.shutdown_drain_spread
+default: 0 # milliseconds
+```
+
+On SIGINT, close each idle client after a random delay between 0 and this value, instead of closing them all at once. This spreads their reconnects to other instances over the window. Must be less than `shutdown_timeout`. 0 closes idle clients right away.
+
 ### ban_time
 ```
 path: general.ban_time
