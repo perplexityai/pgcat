@@ -3916,6 +3916,7 @@ mod test {
             "create or replace procedure p() language sql as 'SELECT 1'",
             "CREATE OR REPLACE FUNCTION f() RETURNS SETOF record LANGUAGE sql \
              AS $$ SELECT 1 $$ ROWS 10",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql COST 1 AS $$ SELECT 1 $$",
             // Unterminated: the server reads up to the end.
             "DO $$ BEGIN PERFORM 1",
         ];
@@ -3944,6 +3945,20 @@ mod test {
         qr.update_pool_settings(&with_gated(vec![]));
         for query in bodies {
             assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
+        }
+
+        // Without plugins_require_parse they're forwarded, even one whose
+        // body names a gated table: table access refuses only a string body
+        // it parses.
+        let mut settings = with_gated(vec!["secrets".into()]);
+        settings.plugins_require_parse = false;
+        qr.update_pool_settings(&settings);
+        let names_it = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql COST 1 \
+                        AS $$ SELECT count(*) FROM secrets $$";
+        for query in bodies.into_iter().chain([names_it]) {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
         }
     }
 
