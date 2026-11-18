@@ -20,6 +20,7 @@ use sqlparser::ast::{
     Ident, ObjectName, ObjectType, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint,
     VacuumStatement, Visit, Visitor,
 };
+use std::borrow::Cow;
 
 use crate::{
     errors::Error,
@@ -62,7 +63,7 @@ impl<'a> Plugin for TableAccess<'a> {
             let mut found = None;
             let _ = visit_statements(ast, |statement| {
                 found = unvisited_names(statement)
-                    .into_iter()
+                    .iter()
                     .find_map(|name| self.forbidden_name(name));
                 match found {
                     Some(_) => ControlFlow::<()>::Break(()),
@@ -141,7 +142,7 @@ impl<'a> Plugin for TableAccess<'a> {
 ///   foreign keys it adds reference, and the new name it renames the table to;
 /// - the new name of `ALTER VIEW`, both names of `ALTER INDEX ... RENAME TO`,
 ///   and both names of `RENAME TABLE`.
-fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
+fn unvisited_names(statement: &Statement) -> Vec<Cow<'_, Ident>> {
     let names: Vec<&ObjectName> = match statement {
         Statement::Copy {
             source: CopySource::Table { table_name, .. },
@@ -173,7 +174,10 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
                 | CommentObject::View
                 | CommentObject::MaterializedView
                 | CommentObject::Index
-                | CommentObject::Sequence => last_part(object_name).into_iter().collect(),
+                | CommentObject::Sequence => last_part(object_name)
+                    .map(Cow::Borrowed)
+                    .into_iter()
+                    .collect(),
                 // `table.column`, or `schema.table.column`.
                 CommentObject::Column => object_name
                     .0
@@ -181,6 +185,7 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
                     .rev()
                     .nth(1)
                     .and_then(|part| part.as_ident())
+                    .map(Cow::Borrowed)
                     .into_iter()
                     .collect(),
                 _ => Vec::new(),
@@ -197,12 +202,11 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
                 ) => Some(&like.name),
                 None => None,
             };
-            table
+            let names = table
                 .inherits
                 .iter()
                 .flatten()
                 .chain(like)
-                .chain(table.columns.iter().filter_map(misparsed_like))
                 .chain(
                     table
                         .columns
@@ -211,9 +215,19 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
                         .filter_map(|option| references(&option.option)),
                 )
                 .chain(table.constraints.iter().filter_map(referenced))
-                .collect()
+                .filter_map(last_part)
+                .map(Cow::Borrowed);
+            return names
+                .chain(table.columns.iter().filter_map(misparsed_like))
+                .collect();
         }
-        Statement::CreateForeignTable(table) => table.inherits.iter().flatten().collect(),
+        Statement::CreateForeignTable(table) => {
+            let names = table.inherits.iter().flatten().filter_map(last_part);
+            return names
+                .map(Cow::Borrowed)
+                .chain(table.columns.iter().filter_map(misparsed_like))
+                .collect();
+        }
         Statement::AlterTable(alter) => alter
             .operations
             .iter()
@@ -253,7 +267,11 @@ fn unvisited_names(statement: &Statement) -> Vec<&Ident> {
             .collect(),
         _ => Vec::new(),
     };
-    names.into_iter().filter_map(last_part).collect()
+    names
+        .into_iter()
+        .filter_map(last_part)
+        .map(Cow::Borrowed)
+        .collect()
 }
 
 /// The objects a GRANT or REVOKE names, of kinds that share the namespace of
@@ -269,18 +287,19 @@ fn granted(objects: Option<&GrantObjects>) -> Vec<&ObjectName> {
     }
 }
 
-/// The table a `LIKE` that isn't a table's first element copies. The parser
-/// reads `CREATE TABLE c (a int, LIKE t)` as a column named `like` of type `t`;
-/// Postgres reads an unquoted `like` there as `LIKE`, never as a column name.
-fn misparsed_like(column: &ColumnDef) -> Option<&ObjectName> {
+/// The table a `LIKE` the parser reads as a column copies. It reads
+/// `CREATE TABLE c (a int, LIKE t)`, and any `LIKE` in `CREATE FOREIGN TABLE`,
+/// as a column named `like` of type `t`. Postgres reads an unquoted `like`
+/// there as `LIKE`, never as a column name. A `t` the parser knows as a type
+/// name (`json`, `text`, `timestamptz`) becomes that type, which prints as the
+/// word it read.
+fn misparsed_like(column: &ColumnDef) -> Option<Cow<'_, Ident>> {
+    if column.name.quote_style.is_some() || !column.name.value.eq_ignore_ascii_case("like") {
+        return None;
+    }
     match &column.data_type {
-        DataType::Custom(name, _)
-            if column.name.quote_style.is_none()
-                && column.name.value.eq_ignore_ascii_case("like") =>
-        {
-            Some(name)
-        }
-        _ => None,
+        DataType::Custom(name, _) => last_part(name).map(Cow::Borrowed),
+        other => Some(Cow::Owned(Ident::new(other.to_string()))),
     }
 }
 
@@ -437,7 +456,15 @@ mod tests {
     }
 
     async fn refused_by(router: &QueryRouter, sql: &str) -> bool {
-        let tables = vec!["secrets".to_string()];
+        refused_by_with(router, &["secrets"], sql).await
+    }
+
+    async fn refused_with(tables: &[&str], sql: &str) -> bool {
+        refused_by_with(&QueryRouter::new(), tables, sql).await
+    }
+
+    async fn refused_by_with(router: &QueryRouter, tables: &[&str], sql: &str) -> bool {
+        let tables = tables.iter().map(|table| table.to_string()).collect();
         let mut plugin = TableAccess {
             enabled: true,
             tables: &tables,
@@ -664,6 +691,9 @@ mod tests {
             // A LIKE after a column.
             "CREATE TABLE c (a int, LIKE secrets)",
             "CREATE TABLE c (a int, like public.secrets)",
+            // The parser reads every LIKE in CREATE FOREIGN TABLE as a column.
+            "CREATE FOREIGN TABLE c (LIKE secrets) SERVER s",
+            "CREATE FOREIGN TABLE c (a int, LIKE public.secrets) SERVER s",
             // Nested statements.
             "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC \
              COPY secrets TO STDOUT; END",
@@ -696,6 +726,8 @@ mod tests {
             "ALTER INDEX other RENAME TO another",
             "CREATE TABLE c (a int, LIKE other)",
             r#"CREATE TABLE c (a int, "like" secrets)"#,
+            "CREATE FOREIGN TABLE c (LIKE other) SERVER s",
+            r#"CREATE FOREIGN TABLE c (a int, "like" secrets) SERVER s"#,
             // Not the table, though they share its name.
             "CREATE INDEX secrets ON other (a)",
             "CREATE SEQUENCE secrets",
@@ -703,6 +735,49 @@ mod tests {
         ] {
             assert!(!refused(sql).await, "{}", sql);
         }
+    }
+
+    #[tokio::test]
+    async fn test_like_of_a_table_named_as_a_type_is_refused() {
+        // The parser reads a LIKE after a column as a column named `like`, and
+        // a table named as a type it knows (`json`) as that type.
+        let tables = ["json", "string", "timestamptz"];
+        for sql in [
+            "CREATE TABLE c (a int, LIKE json)",
+            "CREATE TABLE c (a int, LIKE string)",
+            "CREATE TABLE c (a int, LIKE timestamptz)",
+            "CREATE TABLE c (a int, like JSON)",
+            "CREATE FOREIGN TABLE c (LIKE json) SERVER s",
+            "CREATE FOREIGN TABLE c (a int, LIKE timestamptz) SERVER s",
+        ] {
+            assert!(refused_with(&tables, sql).await, "{}", sql);
+        }
+        // A quoted "like" is a column, and a column of a type isn't a table.
+        for sql in [
+            r#"CREATE TABLE c (a int, "like" json)"#,
+            "CREATE TABLE c (a json, b string, c timestamptz)",
+            "CREATE TABLE c (a int, LIKE text)",
+        ] {
+            assert!(!refused_with(&tables, sql).await, "{}", sql);
+        }
+
+        // Each type name the parser knows prints as the word it read, so a
+        // table with that name is refused.
+        let mut types = 0;
+        for word in sqlparser::keywords::ALL_KEYWORDS {
+            let sql = format!("CREATE TABLE c (a int, LIKE {})", word.to_ascii_lowercase());
+            let Ok(ast) = Parser::parse_sql(&PostgreSqlDialect {}, &sql) else {
+                continue;
+            };
+            if let Statement::CreateTable(table) = &ast[0] {
+                if !matches!(table.columns[1].data_type, DataType::Custom(..)) {
+                    types += 1;
+                }
+            }
+            let table = word.to_ascii_lowercase();
+            assert!(refused_with(&[table.as_str()], &sql).await, "{}", sql);
+        }
+        assert!(types > 50, "{}", types);
     }
 
     #[tokio::test]
