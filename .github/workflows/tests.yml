@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its superseded run; main runs finish.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Keep target/ small: no incremental artifacts, and slim debug info. With the
 # toolchain-scoped cache keys below this keeps the hosted runner's disk from
 # filling up.
@@ -26,6 +31,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Start Postgres
         run: |
@@ -45,12 +52,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-incr${{ env.CARGO_INCREMENTAL }}-dbg${{ env.CARGO_PROFILE_DEV_DEBUG }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-incr${{ env.CARGO_INCREMENTAL }}-dbg${{ env.CARGO_PROFILE_DEV_DEBUG }}-
+          key: cargo-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-
 
+      # The Python and Go tests run target/debug/pgcat, and the plugin tests
+      # need it built with test-plugins.
       - name: Build
         run: |
-          cargo build
+          cargo build --features test-plugins --bins --examples
           bash tests/check_allocator_build.sh
 
       - name: Set up the database
@@ -65,6 +74,23 @@ jobs:
       - name: Rust tests
         run: cargo test --features test-plugins
 
+      # Before the Python tests, so a Python failure doesn't skip them. They
+      # need only Postgres and target/debug/pgcat.
+      - name: Install Go 1.21.3
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Match the existing integration-test toolchain.
+          go-version: '1.21.3'
+          cache: false
+
+      - name: Go cancellation tests
+        working-directory: tests/go
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go test -mod=readonly -count=1 -timeout=60s -v \
+            -run '^(TestVerifiedTLSCancelStopsBackend|TestPlainCancelCompatibilityAndKeyValidation)$' .
+
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -73,6 +99,7 @@ jobs:
       # meta-commands; the runner's psql is older.
       - name: Install psql 18
         run: |
+          sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y --no-install-recommends postgresql-client-18
@@ -89,25 +116,6 @@ jobs:
             --ignore=tests/python/test_asyncpg.py
 
       - name: Disk usage
-        if: always()
-        run: df -h / && du -sh target ~/.cargo 2>/dev/null || true
-
-      - name: Install Go 1.21.3
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          # Match the existing integration-test toolchain.
-          go-version: '1.21.3'
-          cache: false
-
-      - name: Go cancellation tests
-        working-directory: tests/go
-        env:
-          GOTOOLCHAIN: local
-        run: |
-          go test -mod=readonly -count=1 -timeout=60s -v \
-            -run '^(TestVerifiedTLSCancelStopsBackend|TestPlainCancelCompatibilityAndKeyValidation)$' .
-
-      - name: Disk usage (end)
         if: always()
         run: df -h / && du -sh target ~/.cargo 2>/dev/null || true
 
