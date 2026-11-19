@@ -410,16 +410,18 @@ a plugin checks are rejected with an error instead of being forwarded to the ser
 plugins seeing them. A query might touch such a table if its text names one (in any case), or has
 Unicode escapes (`U&"..."`), which can spell any name. While any table is checked, so might a
 `VACUUM`, which can process every table, a `DO` block, `CREATE FUNCTION` or `CREATE PROCEDURE`,
-whose body is a string that can name any table, or text with one of those words that pgcat can't
-split into tokens or whose inline `COPY ... FROM STDIN` data ends with a `\.` line or nests more
-than four COPYs. Other queries the parser can't handle are forwarded, for the server to answer.
+whose body is a string that can name any table, or, if its text has one of those words, a query
+that pgcat can't split into tokens or whose inline `COPY ... FROM STDIN` data ends with a `\.` line
+or nests more than four COPYs. Other queries the parser can't handle are forwarded, for the server
+to answer.
 `ONLY` before a table name counts as something the parser can't handle: it reads `FROM ONLY t` as a
 table named `ONLY`.
 
-With this setting, while table access lists any table, it also refuses a `CREATE FUNCTION` or
+With this setting, or while any process-wide plugin is registered (which makes pgcat require
+parsing on every pool), while table access lists any table, it also refuses a `CREATE FUNCTION` or
 `CREATE PROCEDURE` the parser reads whose body is a string, so no string body reaches the server.
-Without it, table access checks names only: those queries are forwarded, and so is a string-bodied
-function the parser reads.
+Without either, table access checks names only: those queries are forwarded, and so is a
+string-bodied function the parser reads.
 
 A plugin configured in a pool's `[plugins.<name>]` section refuses, while it's on, every query the
 parser can't handle on that pool, with or without this setting, unless it declares that it checks

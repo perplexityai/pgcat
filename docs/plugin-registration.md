@@ -214,8 +214,8 @@ enabled = true
   unparsed query is refused only if its text names one of its `gated_tables`
   (in any case), has a Unicode escape (`U&`), or, while `gated_tables` is
   non-empty, has a `DO` block or a `CREATE FUNCTION` or `CREATE PROCEDURE`
-  (their bodies are strings) or has one of those words and can't be
-  tokenized, or has inline `COPY ... FROM STDIN` data that ends with a `\.`
+  (their bodies are strings) or, if its text has one of those words, can't be
+  tokenized or has inline `COPY ... FROM STDIN` data that ends with a `\.`
   line or nests more than four COPYs, and others are forwarded without its
   hooks; without it, every unparsed query is forwarded. That check reads the
   text, so SQL outside those statements that builds a name
@@ -228,12 +228,13 @@ enabled = true
   `DO`, a string-bodied `CREATE PROCEDURE`, and a `CREATE FUNCTION` with an
   option the parser can't read (such as `COST` or `ROWS`) don't parse, and
   are refused as unparsed queries that might touch a listed table
-  (CONFIG.md). Without `plugins_require_parse`, table access checks names
-  only: a string body is forwarded, parsed or not, and can read a listed
-  table. Either way, functions that run SQL given as text, such as
-  `query_to_xml`, aren't refused. The refusal covers the tables listed in
-  table access: a configured plugin sees a parsed string-bodied function like
-  any statement, and refuses it itself if its tables need that.
+  (CONFIG.md). Without `plugins_require_parse`, and with no process-wide
+  plugin registered, table access checks names only: a string body is
+  forwarded, parsed or not, and can read a listed table. Either way,
+  functions that run SQL given as text, such as `query_to_xml`, aren't
+  refused. The refusal covers the tables listed in table access: a configured
+  plugin sees a parsed string-bodied function like any statement, and refuses
+  it itself if its tables need that.
 - `withholds_server_text` is for pools whose rows hold protected values, which
   Postgres quotes in its diagnostics (a constraint violation's DETAIL is the
   whole row). The client then gets only the severity, SQLSTATE and object

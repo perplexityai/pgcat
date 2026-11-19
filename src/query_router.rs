@@ -4026,8 +4026,9 @@ mod test {
             // The server reads the `\.` line as part of the comment.
             "COPY labels FROM STDIN;\n/*\n\\.\nhello */ DO $$ BEGIN PERFORM 1; END $$",
         ];
-        let deep = "COPY do_log FROM STDIN;\n".repeat(COPY_DATA_READS);
-        let too_deep = "COPY do_log FROM STDIN;\n".repeat(COPY_DATA_READS + 1);
+        // The docs say four nested COPYs are read and five are refused.
+        let deep = "COPY do_log FROM STDIN;\n".repeat(4);
+        let too_deep = "COPY do_log FROM STDIN;\n".repeat(5);
         for query in after_copy
             .into_iter()
             .chain([format!("{too_deep}SELECT 1").as_str()])
@@ -4099,6 +4100,33 @@ mod test {
             qr.execute_plugins(&ast).await.unwrap(),
             PluginOutput::Deny("permission for table \"secrets\" denied".into())
         );
+
+        // A registered process-wide plugin makes pgcat require parsing on
+        // every pool, whatever the pool sets. A string body that names no
+        // listed table is forwarded with no plugin registered, and refused
+        // with one.
+        struct AllowsAll;
+        #[async_trait::async_trait]
+        impl crate::plugins::registry::RegisteredPlugin for AllowsAll {
+            async fn on_query(
+                &self,
+                _context: &PluginContext<'_>,
+                _statements: &[Statement],
+            ) -> Result<PluginResult, Error> {
+                Ok(PluginOutput::Allow.into())
+            }
+        }
+        let unrelated = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'";
+        let ast = qr.parse(&simple_query(unrelated)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), PluginOutput::Allow);
+        let mut registry = crate::plugins::registry::PluginRegistry::default();
+        registry.register("allows_all", AllowsAll).unwrap();
+        let mut qr = QueryRouter::with_plugins(Arc::new(registry));
+        qr.update_pool_settings(&settings);
+        assert!(!qr.pool_settings().plugins_require_parse);
+        assert!(qr.plugins_require_parse());
+        let ast = qr.parse(&simple_query(unrelated)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), refusal);
     }
 
     #[tokio::test]
