@@ -12,7 +12,8 @@
 //! At ratio 0, the default, no exporter is built and each client message costs
 //! one atomic load. Spans go to an OTLP/HTTP endpoint through a bounded batch
 //! queue that drops spans when it's full; exporting never delays a statement,
-//! and a failed export only loses spans.
+//! and a failed export only loses spans. Requests carry only content headers:
+//! the SDK's `OTEL_EXPORTER_OTLP_*HEADERS` aren't sent over plain http.
 //!
 //! Nothing here logs or exports the comment, the statement, or anything else
 //! the client sent besides the trace and span ids: span attributes are pool,
@@ -34,7 +35,7 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::header::{HeaderValue, HOST};
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use hyper_util::rt::TokioIo;
 use log::{error, info, warn};
 use opentelemetry::trace::{
@@ -108,7 +109,7 @@ pub fn validate(general: &General) -> Result<(), Error> {
     if let Some(endpoint) = &general.trace_otlp_endpoint {
         if let Err(reason) = check_endpoint(endpoint) {
             error!(
-                "trace_otlp_endpoint must be an http:// URL with a host and no credentials: {}",
+                "trace_otlp_endpoint must be an http:// URL with a host, no credentials and no query: {}",
                 reason
             );
             return Err(Error::BadConfig);
@@ -118,6 +119,12 @@ pub fn validate(general: &General) -> Result<(), Error> {
 }
 
 fn check_endpoint(endpoint: &str) -> Result<(), &'static str> {
+    // OTLP/HTTP needs no query or fragment, and a query can carry a key that
+    // would be logged with the endpoint. The URI parser drops a fragment, so
+    // this checks the text.
+    if endpoint.contains(['?', '#']) {
+        return Err("it has a query or fragment");
+    }
     let uri: hyper::Uri = endpoint.parse().map_err(|_| "it isn't a URL")?;
     if uri.scheme_str() != Some("http") {
         return Err("its scheme isn't http");
@@ -159,8 +166,8 @@ pub fn configure(general: &General) {
                     }
                         EXPORTER.store(Some(Arc::new(exporter)));
                     }
-                    Err(err) => {
-                        error!("Statement tracing stays off: {}", err);
+                    Err(reason) => {
+                        error!("Statement tracing stays off: {}", reason);
                         ratio = 0.0;
                     }
                 }
@@ -196,8 +203,10 @@ pub async fn shutdown() {
     }
 }
 
-fn build(endpoint: Option<&str>) -> Result<Exporter, String> {
-    let runtime = Handle::try_current().map_err(|_| "no Tokio runtime".to_string())?;
+/// Fails with a fixed reason: the SDK's errors can quote an endpoint from the
+/// environment, which isn't validated and isn't logged.
+fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
+    let runtime = Handle::try_current().map_err(|_| "no Tokio runtime")?;
     let client = RuntimeHttpClient {
         runtime,
         failing: AtomicBool::new(false),
@@ -210,7 +219,9 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, String> {
     if let Some(endpoint) = endpoint {
         builder = builder.with_endpoint(endpoint);
     }
-    let exporter = builder.build().map_err(|err| err.to_string())?;
+    let exporter = builder
+        .build()
+        .map_err(|_| "the OTLP exporter can't be built from the endpoint settings")?;
     // The processor's queue is bounded (OTEL_BSP_MAX_QUEUE_SIZE, 2048 by
     // default) and drops spans when full, so a slow collector costs spans,
     // not memory or statement latency.
@@ -525,9 +536,20 @@ pub fn server_failed(
 
 impl ClientTraces {
     fn client_message(&mut self, message: &[u8], ratio: f64, now: SystemTime) {
+        // pgcat finishes a batch before it reads the next one, so a message
+        // that starts a batch while the last one is sealed means that batch
+        // got no ReadyForQuery from a server: pgcat answered it. COPY data
+        // (d, c, f) belongs to the sealed batch and doesn't end it.
+        if self.sealed
+            && matches!(
+                message.first(),
+                Some(b'Q' | b'P' | b'B' | b'E' | b'D' | b'C')
+            )
+        {
+            self.discard();
+        }
         match message.first() {
             Some(b'Q') => {
-                self.discard();
                 self.sealed = true;
                 if let Some(parent) = message
                     .get(5..)
@@ -558,7 +580,8 @@ impl ClientTraces {
                 let Some((portal, statement)) = bind_fields(message) else {
                     return;
                 };
-                match self.statements.get(statement).copied() {
+                // A statement name too long to track can't be a traced one.
+                match statement.and_then(|statement| self.statements.get(statement).copied()) {
                     Some(parent) => insert_bounded(&mut self.portals, portal, parent, MAX_PORTALS),
                     None => {
                         self.portals.remove(portal);
@@ -566,9 +589,6 @@ impl ClientTraces {
                 }
             }
             Some(b'E') => {
-                if self.sealed {
-                    self.discard();
-                }
                 let Some(portal) = message.get(5..).and_then(name) else {
                     return;
                 };
@@ -718,12 +738,11 @@ fn parse_fields(message: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((statement, &body[statement.len() + 1..]))
 }
 
-/// A Bind's portal and statement names.
-fn bind_fields(message: &[u8]) -> Option<(&[u8], &[u8])> {
+/// A Bind's portal name and, if it's short enough to track, statement name.
+fn bind_fields(message: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
     let body = message.get(5..)?;
     let portal = name(body)?;
-    let statement = name(&body[portal.len() + 1..])?;
-    Some((portal, statement))
+    Some((portal, name(&body[portal.len() + 1..])))
 }
 
 fn insert_bounded(map: &mut HashMap<Box<[u8]>, Parent>, key: &[u8], parent: Parent, cap: usize) {
@@ -822,6 +841,9 @@ async fn send_once(request: Request<Bytes>) -> Result<Response<Bytes>, HttpError
     if authority.as_str().contains('@') {
         return Err("the OTLP endpoint has credentials".into());
     }
+    if parts.uri.query().is_some() {
+        return Err("the OTLP endpoint has a query".into());
+    }
     let host = authority
         .host()
         .trim_start_matches('[')
@@ -837,9 +859,17 @@ async fn send_once(request: Request<Bytes>) -> Result<Response<Bytes>, HttpError
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .parse()?;
-    parts
-        .headers
-        .insert(HOST, HeaderValue::from_str(authority.as_str())?);
+    // Only the headers OTLP/HTTP needs. The SDK adds OTEL_EXPORTER_OTLP_HEADERS
+    // and OTEL_EXPORTER_OTLP_TRACES_HEADERS from the environment, which usually
+    // carry credentials; over plain http they'd go out in clear.
+    let mut headers = HeaderMap::with_capacity(3);
+    for header in [CONTENT_TYPE, CONTENT_ENCODING] {
+        if let Some(value) = parts.headers.remove(&header) {
+            headers.insert(header, value);
+        }
+    }
+    headers.insert(HOST, HeaderValue::from_str(authority.as_str())?);
+    parts.headers = headers;
     let response = sender
         .send_request(hyper::Request::from_parts(parts, Full::new(body)))
         .await?;
@@ -1237,6 +1267,26 @@ mod tests {
             ],
         );
         assert_eq!(traced(&traces), []);
+
+        // Binding a portal to a statement whose name is too long to track
+        // unbinds it from the traced statement it had.
+        run(
+            &mut traces,
+            &[
+                parse("s4", &sampled_sql(4)),
+                bind("", "s4"),
+                execute(""),
+                frame(b'S', b""),
+            ],
+        );
+        assert_eq!(traced(&traces), [(4, "extended")]);
+        assert!(ready(&mut traces).is_some());
+        let long = "n".repeat(MAX_NAME + 1);
+        run(
+            &mut traces,
+            &[parse(&long, "SELECT 1"), bind("", &long), execute("")],
+        );
+        assert_eq!(traced(&traces), []);
     }
 
     #[test]
@@ -1261,6 +1311,20 @@ mod tests {
         assert_eq!(traced(&traces), [(2, "extended"), (2, "extended")]);
         run(&mut traces, &[frame(b'S', b""), query(&sampled_sql(3))]);
         assert_eq!(traced(&traces), [(3, "simple")]);
+        // Any batch that reaches a server ends a batch pgcat answered, even
+        // one without an Execute, such as a driver's prepare step.
+        run(&mut traces, &[parse("", "SELECT 1"), frame(b'H', b"")]);
+        assert_eq!(traced(&traces), []);
+        // COPY data belongs to the batch it follows.
+        run(
+            &mut traces,
+            &[
+                query(&sampled_sql(4)),
+                frame(b'd', b"1\n"),
+                frame(b'c', b""),
+            ],
+        );
+        assert_eq!(traced(&traces), [(4, "simple")]);
     }
 
     #[test]
@@ -1365,6 +1429,9 @@ mod tests {
             "collector:4318",
             "/v1/traces",
             "http://user:secret@collector:4318/v1/traces",
+            "http://collector:4318/v1/traces?api_key=secret",
+            "http://collector:4318?api_key=secret",
+            "http://collector:4318/v1/traces#secret",
             "not a url",
         ] {
             assert!(

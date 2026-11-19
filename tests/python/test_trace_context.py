@@ -29,6 +29,7 @@ ENV = {"OTEL_BSP_SCHEDULE_DELAY": "50"}
 
 
 def config(ratio, endpoint, statement_timeout=0):
+    endpoint = "" if endpoint is None else f'trace_otlp_endpoint = "{endpoint}"'
     return f"""
 [general]
 host = "127.0.0.1"
@@ -36,7 +37,7 @@ port = {PORT}
 admin_username = "admin_user"
 admin_password = "admin_pass"
 trace_sample_ratio = {ratio}
-trace_otlp_endpoint = "{endpoint}"
+{endpoint}
 
 [pools.shard0]
 pool_mode = "transaction"
@@ -70,12 +71,15 @@ class Collector:
         self.requests = queue.Queue()
         self.status = 200
         self.spans = []
+        self.headers = []
         collector = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
-                collector.requests.put((self.path, self.headers.get("Content-Type"), body))
+                headers = {name.lower(): value for name, value in self.headers.items()}
+                collector.headers.append(headers)
+                collector.requests.put((self.path, headers.get("content-type"), body))
                 self.send_response(collector.status)
                 self.send_header("Content-Type", "application/x-protobuf")
                 self.send_header("Content-Length", "0")
@@ -337,6 +341,19 @@ def test_the_ratio_keeps_traces_by_trace_id(pgcat, collector):
     assert [span["trace_id"] for span in collector.spans_until(kept)] == [kept]
 
 
+def test_an_endpoint_change_takes_effect_at_restart(pgcat, collector):
+    second = Collector()
+    try:
+        reconfigure(pgcat, 1, second.endpoint)
+        trace = new_trace()
+        run(pgcat, f"{comment(trace)} SELECT 1")
+        only(collector.spans_until(trace), trace)
+        assert second.requests.empty()
+        assert "trace_otlp_endpoint changes take effect at restart" in pgcat.logs()
+    finally:
+        second.close()
+
+
 def test_ratio_zero_records_nothing_and_reloads(collector):
     pgcat = utils.PgcatProcess(config(0, collector.endpoint), PORT, env=ENV).start()
     try:
@@ -362,6 +379,35 @@ def test_ratio_zero_records_nothing_and_reloads(collector):
         assert [span["trace_id"] for span in collector.spans_until(on_again)] == [on, on_again]
     finally:
         pgcat.stop()
+
+
+def test_a_flush_ends_the_span(pgcat, collector):
+    # A driver's Flush gets the batch's replies without a Sync: pgcat syncs
+    # the server for it, and that ReadyForQuery ends the span.
+    trace = new_trace()
+    sock, message = utils.raw_connection(PORT, "shard0")
+    sock.settimeout(10)
+    try:
+        sql = f"{comment(trace)} SELECT 1".encode()
+        sock.sendall(
+            utils.frontend(b"P", b"\0" + sql + b"\0" + struct.pack("!h", 0))
+            + utils.frontend(b"B", b"\0\0" + struct.pack("!hhh", 0, 0, 0))
+            + utils.frontend(b"E", b"\0" + struct.pack("!i", 0))
+            + utils.frontend(b"H", b"")
+        )
+        assert [message()[0] for _ in range(4)] == [b"1", b"2", b"D", b"C"]
+        span = only(collector.spans_until(trace), trace)
+        assert span["parent_span_id"] == SPAN
+        assert span["attributes"]["pgcat.protocol"] == "extended"
+
+        sock.sendall(utils.frontend(b"S", b""))
+        assert message()[0] == b"Z"
+    finally:
+        sock.close()
+    # The Sync's ReadyForQuery doesn't end it again.
+    marker = new_trace()
+    run(pgcat, f"{comment(marker)} SELECT 1")
+    only(collector.spans_until(marker), trace)
 
 
 def test_statements_in_a_transaction_are_traced(pgcat, collector):
@@ -437,6 +483,36 @@ def test_an_unreachable_collector_never_reaches_statements():
         run(pgcat, f"{comment(new_trace())} SELECT 1")
     finally:
         pgcat.stop()
+
+
+@pytest.mark.parametrize("variable", ["OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"])
+def test_otlp_headers_from_the_environment_are_not_sent(collector, variable):
+    # The usual place for an OTLP credential; pgcat exports over plain http.
+    env = dict(ENV, **{variable: "authorization=secret,x-api-key=secret"})
+    pgcat = utils.PgcatProcess(config(1, collector.endpoint), PORT, env=env).start()
+    try:
+        trace = new_trace()
+        run(pgcat, f"{comment(trace)} SELECT 1")
+        only(collector.spans_until(trace), trace)
+    finally:
+        pgcat.stop()
+    for headers in collector.headers:
+        assert set(headers) <= {"host", "content-type", "content-length", "content-encoding"}, headers
+        assert "secret" not in headers.values(), headers
+
+
+def test_a_bad_endpoint_from_the_environment_isnt_logged(collector):
+    # Not a valid URI, so the SDK refuses it, quoting the value.
+    env = dict(ENV, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://collector:4318/v1/traces?key=xq7 zv9")
+    pgcat = utils.PgcatProcess(config(1, None), PORT, env=env).start()
+    try:
+        # Tracing stays off; statements are unaffected.
+        run(pgcat, f"{comment(new_trace())} SELECT 1")
+        logs = pgcat.logs()
+    finally:
+        pgcat.stop()
+    assert "Statement tracing stays off" in logs, logs
+    assert "xq7" not in logs and "zv9" not in logs, logs
 
 
 def test_shutdown_flushes_queued_spans(collector):

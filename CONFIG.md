@@ -185,9 +185,9 @@ path: general.trace_sample_ratio
 default: 0.0
 ```
 
-The share of traced requests whose statements pgcat records as spans, from 0 to 1. 0 turns statement
-tracing off: no exporter is created and nothing is recorded. Reloadable; setting it back to 0 stops
-new spans.
+The share of traced requests whose statements pgcat records as spans, from 0 to 1. Reloadable. 0 turns
+statement tracing off and records nothing; if pgcat starts at 0, no exporter is created. Once tracing
+has been on, setting it back to 0 stops new spans but keeps the exporter until restart.
 
 A client joins a statement to its trace with a leading [sqlcommenter](https://google.github.io/sqlcommenter/)
 comment carrying a [W3C traceparent](https://www.w3.org/TR/trace-context/#traceparent-header):
@@ -197,7 +197,9 @@ comment carrying a [W3C traceparent](https://www.w3.org/TR/trace-context/#tracep
 ```
 
 pgcat reads only `traceparent` (version `00`, lowercase hex, as the comment's only traceparent), and
-only from a comment at the very start of a simple Query or of a Parse. `tracestate` is not read. A
+only from a comment at the very start of a simple Query or of a Parse; a trailing comment is not read.
+Most sqlcommenter implementations append the comment by default; some can prepend it, e.g. Rails
+`prepend_comment`. A client that appends it gets no spans. `tracestate` is not read. A
 statement gets a span only when its caller sampled the trace (the traceparent's sampled flag) and the
 trace id falls within the ratio, decided as OpenTelemetry's `TraceIdRatioBased` sampler decides, so
 every pgcat at the same ratio keeps the same traces. Statements without such a traceparent are never
@@ -226,9 +228,14 @@ default: <none>
 ```
 
 The OTLP/HTTP traces URL statement spans are sent to, e.g. `http://otel-collector:4318/v1/traces`.
-Must be `http://` with a host and no credentials. When not set, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
-or `OTEL_EXPORTER_OTLP_ENDPOINT` applies, then `http://localhost:4318/v1/traces`. Read when
+Must be `http://` with a host, and no credentials, query or fragment. When not set,
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` applies, then
+`http://localhost:4318/v1/traces`; one with credentials or a query gets no spans. Read when
 `trace_sample_ratio` first goes above 0; changing it later takes effect at restart.
+
+Requests carry only `Host`, `Content-Type` and, when set, `Content-Encoding`:
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` are not sent, since the endpoint is
+plain http.
 
 ### tcp_keepalives_idle
 ```
