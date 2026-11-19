@@ -57,7 +57,7 @@ use opentelemetry_sdk::trace::{
 use opentelemetry_sdk::Resource;
 use tokio::runtime::Handle;
 
-use crate::config::{Address, General, Role};
+use crate::config::{Address, General};
 use crate::errors::Error;
 
 const SPAN_NAME: &str = "pgcat.statement";
@@ -302,10 +302,7 @@ fn endpoint_from_env(
 
 /// `/v1/traces` appended to a base endpoint, with one slash between them.
 fn with_traces_path(base: &str) -> String {
-    match base.strip_suffix('/') {
-        Some(base) => format!("{}{}", base, TRACES_PATH),
-        None => format!("{}{}", base, TRACES_PATH),
-    }
+    format!("{}{}", base.strip_suffix('/').unwrap_or(base), TRACES_PATH)
 }
 
 /// The SDK's resource (OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES), named
@@ -816,7 +813,7 @@ fn export(
     attributes.push(KeyValue::new("db.system.name", "postgresql"));
     attributes.push(KeyValue::new("pgcat.pool.name", address.pool_name.clone()));
     attributes.push(KeyValue::new("pgcat.pool.user", address.username.clone()));
-    attributes.push(KeyValue::new("pgcat.server.role", role_name(address.role)));
+    attributes.push(KeyValue::new("pgcat.server.role", address.role.as_str()));
     attributes.push(KeyValue::new("pgcat.shard", address.shard as i64));
     attributes.push(KeyValue::new("pgcat.protocol", pending.protocol));
     if let Some(code) = outcome.sqlstate {
@@ -841,14 +838,6 @@ fn export(
         span.set_status(Status::error(""));
     }
     span.end_with_timestamp(end);
-}
-
-fn role_name(role: Role) -> &'static str {
-    match role {
-        Role::Primary => "primary",
-        Role::Replica => "replica",
-        Role::Mirror => "mirror",
-    }
 }
 
 /// A NUL-terminated name at the start of `bytes`, if it's short enough to track.
