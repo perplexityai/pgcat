@@ -339,6 +339,16 @@ pub struct General {
     #[serde(default)] // None
     pub autoreload: Option<u64>,
 
+    /// The share of caller-sampled traces whose statements get a span, from
+    /// 0 (off, the default) to 1. See `trace_context`. Reloadable.
+    #[serde(default)] // 0.0
+    pub trace_sample_ratio: f64,
+
+    /// Where statement spans go (OTLP/HTTP), read when tracing first turns on.
+    /// None: the OTEL_EXPORTER_OTLP_* environment, or the OTLP default.
+    #[serde(default)] // None
+    pub trace_otlp_endpoint: Option<String>,
+
     pub tls_certificate: Option<String>,
     pub tls_private_key: Option<String>,
 
@@ -484,6 +494,8 @@ impl Default for General {
             worker_threads: Self::default_worker_threads(),
             plugin_hook_concurrency: Self::default_plugin_hook_concurrency(),
             autoreload: None,
+            trace_sample_ratio: 0.0,
+            trace_otlp_endpoint: None,
             tls_certificate: None,
             tls_private_key: None,
             server_tls: false,
@@ -609,6 +621,9 @@ pub struct Pool {
 
     #[serde(default = "Pool::default_cleanup_server_connections")]
     pub cleanup_server_connections: bool,
+
+    #[serde(default = "Pool::default_sync_application_name")]
+    pub sync_application_name: bool,
 
     #[serde(default)] // False
     pub log_client_parameter_status_changes: bool,
@@ -736,6 +751,10 @@ impl Pool {
     }
 
     pub fn default_cleanup_server_connections() -> bool {
+        true
+    }
+
+    pub fn default_sync_application_name() -> bool {
         true
     }
 
@@ -940,6 +959,7 @@ impl Default for Pool {
             auth_query_user: None,
             auth_query_password: None,
             cleanup_server_connections: true,
+            sync_application_name: Self::default_sync_application_name(),
             log_client_parameter_status_changes: false,
             prepared_statements_cache_size: Self::default_prepared_statements_cache_size(),
             db_activity_based_routing: Self::default_db_activity_based_routing(),
@@ -1372,6 +1392,10 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                         pool.sql_observer_clients.join(","),
                     ),
                     (
+                        format!("pools.{}.sync_application_name", pool_name),
+                        pool.sync_application_name.to_string(),
+                    ),
+                    (
                         format!("pools.{}.default_role", pool_name),
                         pool.default_role.clone(),
                     ),
@@ -1429,6 +1453,10 @@ impl From<&Config> for std::collections::HashMap<String, String> {
             ),
             ("ban_time".to_string(), config.general.ban_time.to_string()),
             (
+                "trace_sample_ratio".to_string(),
+                config.general.trace_sample_ratio.to_string(),
+            ),
+            (
                 "idle_client_in_transaction_timeout".to_string(),
                 config
                     .general
@@ -1477,6 +1505,16 @@ impl Config {
             self.general.server_lifetime
         );
         info!("Server round robin: {}", self.general.server_round_robin);
+        info!(
+            "Statement trace sample ratio: {}",
+            self.general.trace_sample_ratio
+        );
+        if self.general.trace_sample_ratio > 0.0 {
+            match &self.general.trace_otlp_endpoint {
+                Some(endpoint) => info!("Statement trace OTLP endpoint: {}", endpoint),
+                None => info!("Statement trace OTLP endpoint: from the environment"),
+            }
+        }
         match self.general.tls_certificate.clone() {
             Some(tls_certificate) => {
                 info!("TLS certificate: {}", tls_certificate);
@@ -1592,6 +1630,10 @@ impl Config {
             info!(
                 "[pool: {}] Cleanup server connections: {}",
                 pool_name, pool_config.cleanup_server_connections
+            );
+            info!(
+                "[pool: {}] Sync application name: {}",
+                pool_name, pool_config.sync_application_name
             );
             info!(
                 "[pool: {}] DB activity based routing: {}",
@@ -1721,6 +1763,8 @@ impl Config {
 
             return Err(Error::BadConfig);
         }
+
+        crate::trace_context::validate(&self.general)?;
 
         for (name, pool) in self.pools.iter() {
             if pool.auth_query.is_some()
@@ -1861,6 +1905,7 @@ pub async fn reload_config(client_server_map: ClientServerMap) -> Result<bool, E
     };
 
     let new_config = get_config();
+    crate::trace_context::configure(&new_config.general);
 
     match CachedResolver::from_config().await {
         Ok(_) => (),
@@ -2289,6 +2334,7 @@ mod test {
         assert_eq!(Pool::default_default_role(), "any");
         assert!(Pool::default_automatic_sharding_key().is_none());
         assert!(Pool::default_cleanup_server_connections());
+        assert!(Pool::default_sync_application_name());
         assert_eq!(Pool::default_prepared_statements_cache_size(), 0);
         assert!(!Pool::default_db_activity_based_routing());
     }

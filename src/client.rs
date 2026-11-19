@@ -46,6 +46,7 @@ use crate::server::{Server, ServerParameters};
 use crate::sql_observer::{self, BindKey, ClientObserver, Gap, QueryAdmission, Snap, SqlObserver};
 use crate::stats::{ClientStats, ServerStats};
 use crate::tls::Tls;
+use crate::trace_context;
 
 use tokio_rustls::server::TlsStream;
 
@@ -244,6 +245,10 @@ pub struct Client<S, T> {
     /// What the client's extended protocol messages let the SQL observer
     /// count. None unless the pool's observer is enabled.
     observer: Option<Box<ClientObserver>>,
+
+    /// The client's statements that join a caller's trace. None unless
+    /// statement tracing is on and the client sent a sampled one.
+    traces: Option<Box<trace_context::ClientTraces>>,
 
     /// What the Parse being handled counts when its statement is executed.
     parse_meta: Snap,
@@ -1153,6 +1158,7 @@ where
             tenant_may_change: false,
             sql_observed: false,
             observer: None,
+            traces: None,
             parse_meta: Snap::Unparsed,
             portal_effects: HashMap::new(),
             pending_identity: Vec::new(),
@@ -1224,6 +1230,7 @@ where
             tenant_may_change: false,
             sql_observed: false,
             observer: None,
+            traces: None,
             parse_meta: Snap::Unparsed,
             portal_effects: HashMap::new(),
             pending_identity: Vec::new(),
@@ -1356,6 +1363,8 @@ where
                 handle_admin(&mut self.write, message, self.client_server_map.clone()).await?;
                 continue;
             }
+
+            trace_context::client_message(&mut self.traces, &message);
 
             // Plan statements with the pool's current settings. A reload since the
             // client's last transaction may have changed what the plugins cover,
@@ -1641,7 +1650,9 @@ where
                 server.address()
             );
 
-            server.sync_parameters(&self.server_parameters).await?;
+            server
+                .sync_parameters(&self.server_parameters, pool.settings.sync_application_name)
+                .await?;
             // The last user's statements may have changed the tenant parameter
             // without naming it (a function, view or default that sets it), so
             // it's set at every checkout, whatever pgcat set before.
@@ -1678,7 +1689,10 @@ where
                         )
                         .await
                         {
-                            Ok(Ok(message)) => message,
+                            Ok(Ok(message)) => {
+                                trace_context::client_message(&mut self.traces, &message);
+                                message
+                            }
                             Ok(Err(err)) => {
                                 // Client disconnected inside a transaction.
                                 // Clean up the server and re-use it.
@@ -2798,8 +2812,14 @@ where
                     pool.relation_attempt(relations, self.caller());
                 }
             }
-            if let Some(observer) = self.observer.as_deref_mut() {
-                observer.admit_query(QueryAdmission::Parsed(sql_observer::invalidation(&ast)));
+            if self.traces.is_some() || self.observer.is_some() {
+                let invalidate = sql_observer::invalidation(&ast);
+                if invalidate == sql_observer::Invalidate::Both {
+                    trace_context::statements_discarded(&mut self.traces);
+                }
+                if let Some(observer) = self.observer.as_deref_mut() {
+                    observer.admit_query(QueryAdmission::Parsed(invalidate));
+                }
             }
         }
 
@@ -4716,6 +4736,7 @@ where
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.reject_batch();
         }
+        trace_context::batch_dropped(&mut self.traces);
 
         self.buffer.clear();
         self.extended_protocol_data_buffer.clear();
@@ -4846,9 +4867,17 @@ where
                     if let Some(observer) = self.observer.as_deref_mut() {
                         observer.server_replied(error, ready_for_query);
                     }
+                    trace_context::server_replied(
+                        &mut self.traces,
+                        &message,
+                        error,
+                        ready_for_query,
+                        address,
+                    );
                     Ok(message)
                 }
                 Err(err) => {
+                    trace_context::server_failed(&mut self.traces, address, "server_connection");
                     pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
                     error_response_terminal(
                         &mut self.write,
@@ -4866,6 +4895,7 @@ where
                     )
                     .as_str(),
                 );
+                trace_context::server_failed(&mut self.traces, address, "statement_timeout");
                 pool.ban(address, BanReason::StatementTimeout, Some(client_stats));
                 error_response_terminal(&mut self.write, "pool statement timeout").await?;
                 Err(Error::StatementTimeout)
