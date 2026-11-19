@@ -158,6 +158,11 @@ def scrape(metrics_port):
             continue
         series, value = line.rsplit(" ", 1)
         name, labels = series.rstrip("}").split("{", 1)
+        if name in ("pgcat_sql_observer_attempts_total", "pgcat_sql_observer_gap_events_total"):
+            # No pool in the tests configures `sql_observer_clients`, so every
+            # client is `other`, labeled exactly once.
+            clients = [label for label in labels.split(",") if label.startswith("client=")]
+            assert clients == ['client="other"'], line
         samples[(name, frozenset(label.replace('"', "") for label in labels.split(",")))] = int(
             value
         )

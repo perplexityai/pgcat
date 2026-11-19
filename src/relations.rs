@@ -2197,6 +2197,37 @@ mod tests {
             line.contains(&format!("application_name \"{}\", client", "a".repeat(63))),
             "{line}"
         );
+        // Client-chosen text is escaped.
+        let caller = Caller {
+            identity: ABSENT,
+            application_name: "x\"\x1b[31m\nred",
+            address: None,
+        };
+        let line = hub
+            .unidentified_line(select_one, &caller, || t0 + UNIDENTIFIED_LOG_INTERVAL)
+            .unwrap();
+        assert!(
+            line.contains(r#"application_name "x\"\u{1b}[31m\nred", client"#),
+            "{line}"
+        );
+        // The name is cut before it is escaped, so escapes can't grow it past
+        // the 64 bytes: 64 newlines log as exactly 64 escapes.
+        let newlines = "\n".repeat(UNIDENTIFIED_LOG_NAME_BYTES + 1);
+        let caller = Caller {
+            identity: ABSENT,
+            application_name: &newlines,
+            address: None,
+        };
+        let line = hub
+            .unidentified_line(select_one, &caller, || t0 + UNIDENTIFIED_LOG_INTERVAL)
+            .unwrap();
+        assert!(
+            line.contains(&format!(
+                "application_name \"{}\", client",
+                "\\n".repeat(UNIDENTIFIED_LOG_NAME_BYTES)
+            )),
+            "{line}"
+        );
     }
 
     #[test]

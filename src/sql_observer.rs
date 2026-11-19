@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use log::warn;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use crate::identity_label::IdentityState;
@@ -107,6 +108,10 @@ pub fn invalid_clients(clients: &[String]) -> Option<String> {
                 name
             ));
         }
+        // `SHOW CONFIG` lists the names joined by commas.
+        if name.contains(',') {
+            return Some(format!("names can't contain commas, got {:?}", name));
+        }
         if name == OTHER_LABEL {
             return Some(format!(
                 "{:?} is the label of every other name",
@@ -145,14 +150,13 @@ impl Counters {
     }
 }
 
-impl Default for Counters {
-    fn default() -> Counters {
-        Counters::new("", "")
-    }
-}
+/// The counters of every `SqlObserver::default()`, which is disabled and
+/// counts nothing: settings built per client connection, then replaced by the
+/// pool's, would otherwise each allocate a full table.
+static PLACEHOLDER: Lazy<Arc<Counters>> = Lazy::new(|| Arc::new(Counters::new("", "")));
 
 /// A pool's statement counts. Disabled, it counts nothing.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SqlObserver {
     enabled: bool,
     /// The pool's configured client names and their columns.
@@ -160,6 +164,16 @@ pub struct SqlObserver {
     /// Shared with the pool this one replaced on reload, so the counts stay
     /// monotonic and clients still on the old pool aren't lost.
     counters: Arc<Counters>,
+}
+
+impl Default for SqlObserver {
+    fn default() -> SqlObserver {
+        SqlObserver {
+            enabled: false,
+            clients: Arc::from([]),
+            counters: PLACEHOLDER.clone(),
+        }
+    }
 }
 
 impl SqlObserver {
@@ -1844,12 +1858,58 @@ mod tests {
         for invalid in [
             names(&["app-a", "app-a"]),
             names(&["other"]),
+            names(&["app-a,app-b"]),
             names(&[""]),
             names(&[&"a".repeat(MAX_CLIENT_NAME_BYTES + 1)]),
             (0..=MAX_CLIENTS).map(|n| format!("app-{}", n)).collect(),
         ] {
             assert!(invalid_clients(&invalid).is_some(), "{:?}", invalid);
         }
+    }
+
+    #[test]
+    fn client_lineage_is_capped_and_reused() {
+        let caller = |application_name| Caller {
+            identity: IdentityState::Absent,
+            application_name,
+            address: None,
+        };
+        let names = |r: std::ops::Range<usize>| -> Vec<String> {
+            r.map(|n| format!("app-{}", n)).collect()
+        };
+        assert_eq!(invalid_clients(&names(0..MAX_CLIENTS)), None);
+        let all = names(0..MAX_CLIENTS);
+        let a = SqlObserver::new(true, &all, None, &id("db"));
+        for n in &all {
+            a.attempts(1, caller(n));
+        }
+        // Drop app-0, add a 33rd lifetime name: it counts as other.
+        let b = SqlObserver::new(true, &names(1..MAX_CLIENTS + 1), Some(&a), &id("db"));
+        b.attempts(5, caller("app-32"));
+        // Re-add app-0: it keeps its column and counts.
+        let c = SqlObserver::new(true, &all, Some(&b), &id("db"));
+        c.attempts(2, caller("app-0"));
+        let lines = render(&[(&id("db"), &c)]);
+        let absent: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with(ATTEMPTS) && l.contains("identity=\"absent\""))
+            .collect();
+        assert_eq!(absent.len(), MAX_CLIENTS + 1, "{:#?}", absent);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("client=\"app-0\",identity=\"absent\"} 3")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("client=\"other\",identity=\"absent\"} 5")));
+        assert!(!lines.iter().any(|l| l.contains("app-32")));
+        assert_eq!(c.counters.clients.lock().len(), MAX_CLIENTS);
+    }
+
+    #[test]
+    fn defaults_share_one_placeholder() {
+        let (a, b) = (SqlObserver::default(), SqlObserver::default());
+        assert!(Arc::ptr_eq(&a.counters, &b.counters));
+        assert!(!Arc::ptr_eq(&a.counters, &pool().counters));
     }
 
     #[test]

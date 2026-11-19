@@ -701,7 +701,8 @@ client: the startup parameter, or a later `SET application_name` once the server
 matches only exactly (case and all); every other name, the empty one included, counts as `other`,
 so by default every client counts as `other`. `client` takes at most 33 values per pool and user
 whatever clients send, and the counters are a fixed 2,376 bytes per pool and user (33 × 9
-counters, plus the names), shared by its clients, with nothing added per client. A pool exports `other` from the
+counters, plus the names, allocated whether or not the pool observes), shared by its clients,
+with nothing added per client. A pool exports `other` from the
 start and a configured client once it has counted a statement or a gap event (in both metrics),
 so an unused client exports no series; the attempt and gap series take at most 33 × 9 per pool
 and user. The label is never read from `PGCAT_IDENTITY` or its token, and it only labels the
@@ -748,7 +749,7 @@ default: []
 
 The `application_name`s the SQL observer counts under their own `client` label (see
 `sql_observer_enabled`); every other client counts as `other`. At most 32 names, each 1 to 64
-bytes, distinct, without control characters, and not `other`. A name keeps its counters across
+bytes, distinct, without control characters or commas, and not `other`. A name keeps its counters across
 reloads for as long as the pool exists, even after it is removed from the list, so the counts stay
 monotonic; a pool takes at most 32 names over its lifetime, and a name added past that counts as
 `other`, with a warning.
