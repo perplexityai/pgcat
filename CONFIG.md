@@ -224,10 +224,14 @@ Known gaps:
   end at the Sync's reply, with its time and outcome.
 - A batch the server rejects forgets the prepared statements it traced, including ones the server
   created, so their later executions have no span until they're parsed again.
-- pgcat sees SQL `DEALLOCATE` and `DISCARD` only in a simple Query it parses (with
-  `query_parser_enabled` on), and then forgets every traced statement. Run otherwise, or as a prepared
-  statement, they leave a traced name in place: if SQL `PREPARE` then reuses the name, the new
-  statement is traced under the old one's traceparent.
+- pgcat sees SQL `DEALLOCATE` and `DISCARD` only in a simple Query it successfully parses, and then
+  forgets every traced statement. Run otherwise, or as a prepared statement, they leave a traced name
+  in place: if SQL `PREPARE` then reuses the name, the new statement is traced under the old one's
+  traceparent.
+- When a simple Query runs while extended-protocol messages wait for their Sync, its reply ends pgcat's
+  record of what those messages traced. If the server then rejects that batch, or pgcat drops it, a
+  statement name the batch reused keeps the batch's traceparent, and the statement still under that
+  name is traced with it.
 
 Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
 and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.
