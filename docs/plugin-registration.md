@@ -215,9 +215,11 @@ enabled = true
   (in any case), has a Unicode escape (`U&`), or, while `gated_tables` is
   non-empty, has a `DO` block or a `CREATE FUNCTION` or `CREATE PROCEDURE`
   (their bodies are strings) or has one of those words and can't be
-  tokenized, and others are forwarded without its hooks; without it, every
-  unparsed query is forwarded. That check reads the text, so SQL outside
-  those statements that builds a name (`'secr' || 'ets'`) passes it.
+  tokenized, or has inline `COPY ... FROM STDIN` data that ends with a `\.`
+  line or nests more than four COPYs, and others are forwarded without its
+  hooks; without it, every unparsed query is forwarded. That check reads the
+  text, so SQL outside those statements that builds a name
+  (`'secr' || 'ets'`) passes it.
 - With `plugins_require_parse`, while any table is listed in table access, no
   string body reaches the server. Table access refuses a `CREATE FUNCTION` or
   `CREATE PROCEDURE` it parses whose body is a string (`AS $$...$$` or

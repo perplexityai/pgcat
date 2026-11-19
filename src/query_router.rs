@@ -2128,12 +2128,14 @@ impl QueryRouter {
     /// (`U&"..."`), which can spell any name. A VACUUM without a table name
     /// processes every table, so any VACUUM might, as might a `DO` block or a
     /// function or procedure whose body is a string.
-    fn might_touch_gated(&self, query: &str) -> bool {
-        let query = query.to_ascii_lowercase();
+    fn might_touch_gated(&self, original: &str) -> bool {
+        let query = original.to_ascii_lowercase();
         let gated = self.gated_tables();
         query.contains("u&")
             || (!gated.is_empty() && first_word(&query) == "vacuum")
-            || (!gated.is_empty() && runs_string_body(&query))
+            // Dollar-quote tags are case-sensitive, so the tokenizer reads the
+            // text as written.
+            || (!gated.is_empty() && runs_string_body(original))
             || gated
                 .iter()
                 .any(|table| query.contains(&table.to_ascii_lowercase()))
@@ -3971,6 +3973,8 @@ mod test {
             "CREATE FUNCTION f() RETURNS int LANGUAGE sql COST 1 AS $$ SELECT 1 $$",
             // Unterminated: the server reads up to the end.
             "DO $$ BEGIN PERFORM 1",
+            // Dollar-quote tags are case-sensitive: `$A$` doesn't end `$a$`.
+            "SELECT $a$ x $A$ y $a$; DO $$ BEGIN PERFORM 1; END $$; SELECT $A$ z $a$ w $A$",
         ];
         qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
         for query in bodies {

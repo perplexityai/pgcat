@@ -411,7 +411,8 @@ plugins seeing them. A query might touch such a table if its text names one (in 
 Unicode escapes (`U&"..."`), which can spell any name. While any table is checked, so might a
 `VACUUM`, which can process every table, a `DO` block, `CREATE FUNCTION` or `CREATE PROCEDURE`,
 whose body is a string that can name any table, or text with one of those words that pgcat can't
-split into tokens. Other queries the parser can't handle are forwarded, for the server to answer.
+split into tokens or whose inline `COPY ... FROM STDIN` data ends with a `\.` line or nests more
+than four COPYs. Other queries the parser can't handle are forwarded, for the server to answer.
 `ONLY` before a table name counts as something the parser can't handle: it reads `FROM ONLY t` as a
 table named `ONLY`.
 
