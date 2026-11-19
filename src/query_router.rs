@@ -11,7 +11,9 @@ use sqlparser::ast::{
     Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -106,6 +108,88 @@ fn first_word(query: &str) -> &str {
             return &rest[..end];
         }
     }
+}
+
+/// How many times [`runs_string_body`] tokenizes `COPY ... FROM STDIN` data
+/// again before it refuses the query.
+const COPY_DATA_READS: usize = 4;
+
+/// Whether a query has a statement that runs a string as code: `DO`, or
+/// `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE`, whose bodies are strings
+/// the parser doesn't read. One that has one of those words and can't be
+/// tokenized might.
+fn runs_string_body(query: &str) -> bool {
+    // Keywords can't be escaped, so a statement can only start with these if
+    // the text has them. Queries without any of the three substrings skip
+    // tokenizing.
+    let has = |word: &[u8]| {
+        query
+            .as_bytes()
+            .windows(word.len())
+            .any(|window| window.eq_ignore_ascii_case(word))
+    };
+    if !has(b"do") && !has(b"function") && !has(b"procedure") {
+        return false;
+    }
+    let tokenize = |text: &str| Tokenizer::new(&PostgreSqlDialect {}, text).tokenize();
+    let Ok(mut tokens) = tokenize(query) else {
+        return true;
+    };
+    // The tokenizer reads the lines after `COPY ... FROM STDIN;` as the
+    // COPY's data, up to a `\.` line, and puts them in one token before the
+    // `;`. The server reads them as statements, since COPY data comes in
+    // messages of its own. Data that runs to the end of the query is
+    // tokenized again and put back after the rest of the `;` line, where it
+    // is in the text. Data ended by a `\.` line is refused, since the server
+    // can read that line as part of a comment or string, and so is a query
+    // where this happens more than `COPY_DATA_READS` times, which keeps the
+    // cost linear.
+    let mut reads = 0;
+    while let Some(index) = tokens
+        .iter()
+        .position(|token| matches!(token, Token::CopyData { .. }))
+    {
+        reads += 1;
+        if reads > COPY_DATA_READS {
+            return true;
+        }
+        let Token::CopyData {
+            data,
+            terminated: false,
+        } = tokens.remove(index)
+        else {
+            return true;
+        };
+        let Ok(more) = tokenize(&data) else {
+            return true;
+        };
+        tokens.extend(more);
+    }
+    tokens
+        .split(|token| *token == Token::SemiColon)
+        .any(|statement| {
+            let mut keywords = statement
+                .iter()
+                .filter(|token| !matches!(token, Token::Whitespace(_)))
+                .map(|token| match token {
+                    // Quoted words have no keyword.
+                    Token::Word(word) => word.keyword,
+                    _ => Keyword::NoKeyword,
+                });
+            let first: [Keyword; 4] =
+                std::array::from_fn(|_| keywords.next().unwrap_or(Keyword::NoKeyword));
+            matches!(
+                first,
+                [Keyword::DO, ..]
+                    | [Keyword::CREATE, Keyword::FUNCTION | Keyword::PROCEDURE, ..]
+                    | [
+                        Keyword::CREATE,
+                        Keyword::OR,
+                        Keyword::REPLACE,
+                        Keyword::FUNCTION | Keyword::PROCEDURE
+                    ]
+            )
+        })
 }
 
 /// Quickly test for match when a query is received.
@@ -2042,12 +2126,16 @@ impl QueryRouter {
     /// its text has a name a plugin gates (a table's, or a function's that
     /// runs SQL given as text, which can build any name), or Unicode escapes
     /// (`U&"..."`), which can spell any name. A VACUUM without a table name
-    /// processes every table, so any VACUUM might.
-    fn might_touch_gated(&self, query: &str) -> bool {
-        let query = query.to_ascii_lowercase();
+    /// processes every table, so any VACUUM might, as might a `DO` block or a
+    /// function or procedure whose body is a string.
+    fn might_touch_gated(&self, original: &str) -> bool {
+        let query = original.to_ascii_lowercase();
         let gated = self.gated_tables();
         query.contains("u&")
             || (!gated.is_empty() && first_word(&query) == "vacuum")
+            // Dollar-quote tags are case-sensitive, so the tokenizer reads the
+            // text as written.
+            || (!gated.is_empty() && runs_string_body(original))
             || gated
                 .iter()
                 .any(|table| query.contains(&table.to_ascii_lowercase()))
@@ -3855,6 +3943,190 @@ mod test {
         for query in vacuums {
             assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
         }
+    }
+
+    #[test]
+    fn test_unparsed_string_bodies_are_rejected_while_a_table_is_gated() {
+        QueryRouter::setup();
+        let mut qr = QueryRouter::new();
+        let with_gated = |tables: Vec<String>| {
+            let mut settings = testing_plugin_settings(true);
+            if let Some(ref mut plugins) = settings.plugins {
+                plugins.table_access = Some(crate::config::TableAccess {
+                    enabled: true,
+                    tables,
+                });
+            }
+            settings
+        };
+
+        // The parser can't read these, and their bodies can name any table.
+        let bodies = [
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "do language plpgsql 'BEGIN PERFORM 1; END'",
+            "/* c */ DO $x$ BEGIN PERFORM 1; END $x$",
+            "SELECT 1; DO $$ BEGIN PERFORM 1; END $$",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN PERFORM 1; END $$",
+            "create or replace procedure p() language sql as 'SELECT 1'",
+            "CREATE OR REPLACE FUNCTION f() RETURNS SETOF record LANGUAGE sql \
+             AS $$ SELECT 1 $$ ROWS 10",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql COST 1 AS $$ SELECT 1 $$",
+            // Unterminated: the server reads up to the end.
+            "DO $$ BEGIN PERFORM 1",
+            // Dollar-quote tags are case-sensitive: `$A$` doesn't end `$a$`.
+            "SELECT $a$ x $A$ y $a$; DO $$ BEGIN PERFORM 1; END $$; SELECT $A$ z $a$ w $A$",
+        ];
+        qr.update_pool_settings(&with_gated(vec!["secrets".into()]));
+        for query in bodies {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{}",
+                query
+            );
+        }
+        for query in [
+            "SELEKT 'DO $$ $$'",
+            "SELEKT 1; /* DO */ SELEKT 2",
+            "SELEKT \"do\" $$ $$",
+            "SELEKT 1 -- CREATE FUNCTION",
+            // Text that can't be tokenized only might run one if it has
+            // one of the words.
+            "SELEKT 'unterminated",
+        ] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+        for query in ["SELEKT 'Do", "SELEKT 1 $$ function"] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(qr.rejects_unparsed(&message), "{}", query);
+        }
+
+        // The tokenizer reads the lines after `COPY ... FROM STDIN;` as the
+        // COPY's data; the server runs them as statements.
+        let after_copy = [
+            "COPY labels FROM STDIN;\nDO $$ BEGIN RAISE NOTICE 'hi'; END $$",
+            "COPY labels FROM STDIN;\nCREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS $$ SELECT 1 $$",
+            "COPY labels FROM STDIN;\nCREATE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$",
+            "COPY labels FROM STDIN;\r\nDO $$ BEGIN PERFORM 1; END $$",
+            "CREATE TEMP TABLE t (); COPY t FROM STDIN;\nDO $$ BEGIN PERFORM 1; END $$",
+            "COPY labels FROM STDIN;\nCOPY other FROM STDIN;\nDO $$ BEGIN PERFORM 1; END $$",
+            "COPY labels FROM STDIN;\nSELECT 1; COPY other FROM STDIN;\n\
+             DO $$ BEGIN PERFORM 1; END $$",
+            // A statement that starts on the `;` line and goes on in the data.
+            "COPY labels FROM STDIN; CREATE\nFUNCTION f() RETURNS int LANGUAGE sql \
+             AS $$ SELECT 1 $$",
+            "COPY labels FROM STDIN; CREATE OR REPLACE\nPROCEDURE p() LANGUAGE sql \
+             AS $$ SELECT 1 $$",
+            // The server reads the `\.` line as part of the comment.
+            "COPY labels FROM STDIN;\n/*\n\\.\nhello */ DO $$ BEGIN PERFORM 1; END $$",
+        ];
+        // The docs say four nested COPYs are read and five are refused.
+        let deep = "COPY do_log FROM STDIN;\n".repeat(4);
+        let too_deep = "COPY do_log FROM STDIN;\n".repeat(5);
+        for query in after_copy
+            .into_iter()
+            .chain([format!("{too_deep}SELECT 1").as_str()])
+        {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{:?}", query);
+            assert!(qr.rejects_unparsed(&message), "{:?}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{:?}",
+                query
+            );
+        }
+        for query in [
+            "COPY do_log FROM STDIN;\nSELECT 1",
+            "COPY do_log FROM STDIN;\nSELECT 'DO $$ $$'",
+            "COPY do_log FROM STDIN;\nCOPY do_log FROM STDIN;\nSELECT 1",
+            format!("{deep}SELECT 1").as_str(),
+        ] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{:?}", query);
+            assert!(!qr.rejects_unparsed(&message), "{:?}", query);
+        }
+
+        qr.update_pool_settings(&with_gated(vec![]));
+        for query in bodies.into_iter().chain(after_copy) {
+            assert!(!qr.rejects_unparsed(&simple_query(query)), "{:?}", query);
+        }
+
+        // Without plugins_require_parse they're forwarded, even one whose
+        // body names a gated table, like a string body the parser reads:
+        // table access then checks names only.
+        let mut settings = with_gated(vec!["secrets".into()]);
+        settings.plugins_require_parse = false;
+        qr.update_pool_settings(&settings);
+        let names_it = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql COST 1 \
+                        AS $$ SELECT count(*) FROM secrets $$";
+        for query in bodies.into_iter().chain(after_copy).chain([names_it]) {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{}", query);
+            assert!(!qr.rejects_unparsed(&message), "{}", query);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parsed_string_bodies_are_refused_only_with_plugins_require_parse() {
+        let mut qr = forbidding_secrets();
+        let string_body = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+                           AS $$ SELECT count(*) FROM secrets $$";
+        let sql_body = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+                        RETURN (SELECT count(*) FROM secrets)";
+        let refusal =
+            PluginOutput::Deny("permission for a function body given as a string denied".into());
+
+        let ast = qr.parse(&simple_query(string_body)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), refusal);
+
+        // Without plugins_require_parse, with secrets still listed, table
+        // access checks names only: the string body is sent, and the body
+        // given as SQL is checked by the table it names.
+        let mut settings = qr.pool_settings().clone();
+        settings.plugins_require_parse = false;
+        qr.update_pool_settings(&settings);
+        assert!(!qr.plugins_require_parse());
+        let ast = qr.parse(&simple_query(string_body)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), PluginOutput::Allow);
+        let ast = qr.parse(&simple_query(sql_body)).unwrap();
+        assert_eq!(
+            qr.execute_plugins(&ast).await.unwrap(),
+            PluginOutput::Deny("permission for table \"secrets\" denied".into())
+        );
+
+        // A registered process-wide plugin makes pgcat require parsing on
+        // every pool, whatever the pool sets. A string body that names no
+        // listed table is forwarded with no plugin registered, and refused
+        // with one.
+        struct AllowsAll;
+        #[async_trait::async_trait]
+        impl crate::plugins::registry::RegisteredPlugin for AllowsAll {
+            async fn on_query(
+                &self,
+                _context: &PluginContext<'_>,
+                _statements: &[Statement],
+            ) -> Result<PluginResult, Error> {
+                Ok(PluginOutput::Allow.into())
+            }
+        }
+        let unrelated = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'";
+        let ast = qr.parse(&simple_query(unrelated)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), PluginOutput::Allow);
+        let mut registry = crate::plugins::registry::PluginRegistry::default();
+        registry.register("allows_all", AllowsAll).unwrap();
+        let mut qr = QueryRouter::with_plugins(Arc::new(registry));
+        qr.update_pool_settings(&settings);
+        assert!(!qr.pool_settings().plugins_require_parse);
+        assert!(qr.plugins_require_parse());
+        let ast = qr.parse(&simple_query(unrelated)).unwrap();
+        assert_eq!(qr.execute_plugins(&ast).await.unwrap(), refusal);
     }
 
     #[tokio::test]

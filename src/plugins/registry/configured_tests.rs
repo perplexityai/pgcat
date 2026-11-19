@@ -747,8 +747,11 @@ fn unparsed_queries_are_refused_unless_the_plugin_is_table_scoped() {
     };
     let section = "[synthetic]\nenabled = true\ntables = [\"secret\"]";
     let scoped = format!("{}\ntable_scoped = true", section);
-    // SQL that builds the name passes the table-scoped check.
+    // SQL that builds the name passes the table-scoped check of names. A DO
+    // block is refused as such; other SQL that runs text isn't.
     let builds_the_name = "DO $$ BEGIN EXECUTE 'UPDATE secr' || 'et SET a = 1'; END $$";
+    let builds_the_name_elsewhere =
+        "SELEKT query_to_xml('SELECT * FROM secr' || 'et', true, false, '')";
 
     // By default the pool sees no statement the plugin hasn't, whether or
     // not it sets plugins_require_parse.
@@ -770,16 +773,20 @@ fn unparsed_queries_are_refused_unless_the_plugin_is_table_scoped() {
     // A table-scoped plugin refuses those naming its tables, and only with
     // plugins_require_parse.
     let table_scoped = with(&scoped, true);
-    assert!(rejects(&table_scoped, "selec * from secret"));
+    for query in ["selec * from secret", builds_the_name] {
+        assert!(rejects(&table_scoped, query), "{}", query);
+    }
     for query in [
         "selec * from public_table",
         "SELEKT 1",
-        builds_the_name,
+        builds_the_name_elsewhere,
         "RESET ALL",
     ] {
         assert!(!rejects(&table_scoped, query), "{}", query);
     }
-    assert!(!rejects(&with(&scoped, false), "selec * from secret"));
+    for query in ["selec * from secret", builds_the_name] {
+        assert!(!rejects(&with(&scoped, false), query), "{}", query);
+    }
 
     // A plugin that's off refuses none.
     let off = with("[synthetic]\nenabled = false", true);

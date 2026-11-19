@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use sqlparser::ast::{
-    visit_relations, visit_statements, AlterTableOperation, CopySource, ObjectName, ObjectType,
-    Statement, VacuumStatement,
+    visit_relations, visit_statements, AlterTableOperation, CopySource, CreateFunction,
+    CreateFunctionBody, CreateProcedureBody, ObjectName, ObjectType, Statement, VacuumStatement,
 };
 
 use crate::{
@@ -26,7 +26,7 @@ pub struct TableAccess<'a> {
 impl<'a> Plugin for TableAccess<'a> {
     async fn run(
         &mut self,
-        _query_router: &QueryRouter,
+        query_router: &QueryRouter,
         ast: &Vec<Statement>,
     ) -> Result<PluginOutput, Error> {
         if !self.enabled {
@@ -83,6 +83,23 @@ impl<'a> Plugin for TableAccess<'a> {
             ));
         }
 
+        // A function body given as a string isn't parsed, so the tables it
+        // names can't be checked. One given as SQL (`BEGIN ATOMIC`, `RETURN`)
+        // is, above. The refusal comes with plugins_require_parse, which also
+        // refuses the bodies the parser can't read (`DO`, a function with an
+        // option it doesn't know). Without it, table access checks names only.
+        if found.is_none()
+            && !self.tables.is_empty()
+            && query_router.plugins_require_parse()
+            && has_string_body(ast)
+        {
+            debug!("Blocking a function body given as a string");
+
+            return Ok(PluginOutput::Deny(
+                "permission for a function body given as a string denied".into(),
+            ));
+        }
+
         if let Some(found) = found {
             debug!("Blocking access to table \"{}\"", found);
 
@@ -124,6 +141,28 @@ fn unvisited_relations(statement: &Statement) -> Vec<&ObjectName> {
     }
 }
 
+/// Whether a statement, or one nested in it, creates a function or procedure
+/// whose body isn't parsed SQL. A `RETURN` or `BEGIN ATOMIC` body is parsed,
+/// and its tables are checked like any statement's. In Postgres every other
+/// body is a string, `AS 'body'` or `AS $$body$$`, in any language, an object
+/// file's too. Any other form the parser gives, or none, counts as one, so a
+/// form it learns later isn't allowed unread.
+fn has_string_body(ast: &Vec<Statement>) -> bool {
+    visit_statements(ast, |statement| match statement {
+        Statement::CreateFunction(CreateFunction {
+            function_body: Some(CreateFunctionBody::Return(_) | CreateFunctionBody::BeginAtomic(_)),
+            ..
+        })
+        | Statement::CreateProcedure {
+            body: CreateProcedureBody::BeginAtomic(_),
+            ..
+        } => ControlFlow::Continue(()),
+        Statement::CreateFunction(_) | Statement::CreateProcedure { .. } => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
 /// The table a VACUUM processes, or `None` when it processes every table.
 fn vacuum_target(vacuum: &VacuumStatement) -> Option<&ObjectName> {
     let name = vacuum.table_name.as_ref()?;
@@ -158,10 +197,15 @@ impl TableAccess<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::ConditionalStatements;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
     async fn refused(sql: &str) -> bool {
+        refused_by(&QueryRouter::new(), sql).await
+    }
+
+    async fn refused_by(router: &QueryRouter, sql: &str) -> bool {
         let tables = vec!["secrets".to_string()];
         let mut plugin = TableAccess {
             enabled: true,
@@ -169,9 +213,22 @@ mod tests {
         };
         let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         matches!(
-            plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
+            plugin.run(router, &ast).await.unwrap(),
             PluginOutput::Deny(_)
         )
+    }
+
+    /// A router for a pool that sets plugins_require_parse.
+    fn strict() -> QueryRouter {
+        let mut router = QueryRouter::new();
+        router.update_pool_settings(&crate::pool::PoolSettings {
+            query_parser_enabled: true,
+            plugins_require_parse: true,
+            plugins: Some(crate::config::Plugins::default()),
+            ..Default::default()
+        });
+        assert!(router.plugins_require_parse());
+        router
     }
 
     #[tokio::test]
@@ -185,6 +242,101 @@ mod tests {
             assert!(refused(sql).await, "{}", sql);
         }
         assert!(!refused("COPY other TO STDOUT").await);
+    }
+
+    #[tokio::test]
+    async fn test_string_function_bodies_are_refused_with_plugins_require_parse() {
+        let strict = strict();
+        let string_bodies = [
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql AS $$ SELECT count(*) FROM secrets $$",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+            "CREATE OR REPLACE FUNCTION f() RETURNS int AS $body$ SELECT 1 $body$ LANGUAGE sql",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
+            "CREATE FUNCTION f() RETURNS int AS 'MODULE_PATHNAME', 'f' LANGUAGE c",
+            "SELECT 1; CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        ];
+        for sql in string_bodies {
+            assert!(refused_by(&strict, sql).await, "{}", sql);
+            // Without plugins_require_parse, table access checks names only.
+            assert!(!refused(sql).await, "{}", sql);
+        }
+
+        // A body given as SQL is checked by the tables it names, either way.
+        for sql in [
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+             RETURN (SELECT count(*) FROM secrets)",
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql BEGIN ATOMIC \
+             SELECT count(*) FROM secrets; END",
+        ] {
+            assert!(refused_by(&strict, sql).await, "{}", sql);
+            assert!(refused(sql).await, "{}", sql);
+        }
+
+        for sql in [
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql \
+             RETURN (SELECT count(*) FROM other)",
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql BEGIN ATOMIC \
+             SELECT count(*) FROM other; END",
+            "CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; END",
+        ] {
+            assert!(!refused_by(&strict, sql).await, "{}", sql);
+        }
+
+        // Nothing to protect, nothing refused.
+        let tables = vec![];
+        let mut plugin = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        let ast = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        )
+        .unwrap();
+        assert_eq!(
+            plugin.run(&strict, &ast).await.unwrap(),
+            PluginOutput::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn test_only_sql_function_bodies_are_read() {
+        // sqlparser doesn't give these for Postgres today. A body that isn't
+        // RETURN or BEGIN ATOMIC, or no body, is refused as unread.
+        let tables = vec!["secrets".to_string()];
+        let mut plugin = TableAccess {
+            enabled: true,
+            tables: &tables,
+        };
+        let strict = strict();
+        let refusal =
+            PluginOutput::Deny("permission for a function body given as a string denied".into());
+
+        let sql = "CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; END";
+        let mut ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        assert_eq!(
+            plugin.run(&strict, &ast).await.unwrap(),
+            PluginOutput::Allow
+        );
+        let Statement::CreateProcedure { body, .. } = &mut ast[0] else {
+            panic!("{:?}", ast);
+        };
+        *body = CreateProcedureBody::As(ConditionalStatements::Sequence {
+            statements: Vec::new(),
+        });
+        assert_eq!(plugin.run(&strict, &ast).await.unwrap(), refusal);
+
+        let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE sql RETURN 1";
+        let mut ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        assert_eq!(
+            plugin.run(&strict, &ast).await.unwrap(),
+            PluginOutput::Allow
+        );
+        let Statement::CreateFunction(function) = &mut ast[0] else {
+            panic!("{:?}", ast);
+        };
+        function.function_body = None;
+        assert_eq!(plugin.run(&strict, &ast).await.unwrap(), refusal);
     }
 
     #[tokio::test]
