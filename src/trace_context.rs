@@ -49,7 +49,7 @@ use opentelemetry::trace::{
 };
 use opentelemetry::{Context, InstrumentationScope, Key, KeyValue};
 use opentelemetry_http::{HttpClient, HttpError, Request, Response};
-use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{Protocol, RetryPolicy, SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::{
     BatchSpanProcessor, Sampler, SamplingDecision, SamplingResult, SdkTracer, SdkTracerProvider,
     ShouldSample,
@@ -224,6 +224,23 @@ pub async fn shutdown() {
     }
 }
 
+/// One attempt per batch, as before 0.33 turned retries on by default: a
+/// failing collector costs that batch, not the processor's time.
+fn span_exporter(
+    endpoint: String,
+    client: impl HttpClient + 'static,
+) -> Result<SpanExporter, &'static str> {
+    SpanExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .with_timeout(EXPORT_TIMEOUT)
+        .with_http_client(client)
+        .with_retry_policy(RetryPolicy::disabled())
+        .with_endpoint(endpoint)
+        .build()
+        .map_err(|_| "the OTLP exporter can't be built from the endpoint settings")
+}
+
 /// Fails with a fixed reason: the SDK's errors can quote an endpoint from the
 /// environment, which isn't validated and isn't logged.
 fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
@@ -232,20 +249,13 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
         runtime,
         failing: AtomicBool::new(false),
     };
-    let mut builder = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_timeout(EXPORT_TIMEOUT)
-        .with_http_client(client);
     // The SDK reads an endpoint from the environment only when none is given,
     // so resolving it here means 0.32's fallbacks never apply.
-    builder = match endpoint {
-        Some(endpoint) => builder.with_endpoint(endpoint),
-        None => builder.with_endpoint(endpoint_from_env(|name| std::env::var_os(name))?),
+    let resolved = match endpoint {
+        Some(endpoint) => endpoint.to_owned(),
+        None => endpoint_from_env(|name| std::env::var_os(name))?,
     };
-    let exporter = builder
-        .build()
-        .map_err(|_| "the OTLP exporter can't be built from the endpoint settings")?;
+    let exporter = span_exporter(resolved, client)?;
     // The processor's queue is bounded (OTEL_BSP_MAX_QUEUE_SIZE, 2048 by
     // default) and drops spans when full, so a slow collector costs spans,
     // not memory or statement latency.
@@ -1683,6 +1693,54 @@ mod tests {
         let truncated = error_response("22012");
         assert_eq!(sqlstate(&truncated[..truncated.len() - 12]), None);
         assert_eq!(sqlstate(&frame(b'Z', b"I")), None);
+    }
+
+    /// Answers every export with 503 Service Unavailable, which the OTLP
+    /// exporter retries when its retry policy allows.
+    #[derive(Debug)]
+    struct Unavailable(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl HttpClient for Unavailable {
+        async fn send_bytes(&self, _request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Response::builder().status(503).body(Bytes::new())?)
+        }
+    }
+
+    #[tokio::test]
+    async fn exports_a_batch_once() {
+        use opentelemetry_sdk::trace::SpanExporter as _;
+
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exporter = span_exporter(
+            "http://collector:4318/v1/traces".to_string(),
+            Unavailable(sends.clone()),
+        )
+        .unwrap();
+        let span = opentelemetry_sdk::trace::SpanData {
+            span_context: SpanContext::new(
+                TraceId::from_hex(TRACE).unwrap(),
+                SpanId::from_hex(SPAN).unwrap(),
+                TraceFlags::SAMPLED,
+                false,
+                TraceState::default(),
+            ),
+            parent_span_id: SpanId::INVALID,
+            parent_span_is_remote: false,
+            span_kind: SpanKind::Client,
+            name: SPAN_NAME.into(),
+            start_time: SystemTime::UNIX_EPOCH,
+            end_time: SystemTime::UNIX_EPOCH,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            events: Default::default(),
+            links: Default::default(),
+            status: Status::Unset,
+            instrumentation_scope: InstrumentationScope::builder("pgcat").build(),
+        };
+        assert!(exporter.export(vec![span]).await.is_err());
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
     }
 
     fn general(ratio: f64, endpoint: Option<&str>) -> General {
