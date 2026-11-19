@@ -170,7 +170,15 @@ def observed(db, metrics_port=METRICS_PORT):
     pool_labels = {f"pool={db}", f"user={USER}"}
 
     def sample(name, *labels):
-        return samples.get((name, frozenset(pool_labels | set(labels))))
+        # Summed over the `client` label, where the series has one.
+        wanted = pool_labels | set(labels)
+        matching = [
+            value
+            for (series, series_labels), value in samples.items()
+            if series == name
+            and {label for label in series_labels if not label.startswith("client=")} == wanted
+        ]
+        return sum(matching) if matching else None
 
     observing = sample("pgcat_sql_observer_observing")
     counts = {

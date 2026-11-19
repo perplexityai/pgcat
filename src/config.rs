@@ -663,6 +663,11 @@ pub struct Pool {
     #[serde(default)] // False
     pub sql_observer_enabled: bool,
 
+    /// `application_name`s the SQL observer labels as themselves; it labels
+    /// every other client `other`.
+    #[serde(default)] // []
+    pub sql_observer_clients: Vec<String>,
+
     pub plugins: Option<Plugins>,
     pub shards: BTreeMap<String, Shard>,
     pub users: BTreeMap<String, User>,
@@ -797,6 +802,11 @@ impl Pool {
                 );
                 return Err(Error::BadConfig);
             }
+        }
+
+        if let Some(reason) = crate::sql_observer::invalid_clients(&self.sql_observer_clients) {
+            error!("sql_observer_clients is invalid: {}", reason);
+            return Err(Error::BadConfig);
         }
 
         match self.default_role.as_ref() {
@@ -943,6 +953,7 @@ impl Default for Pool {
             plugin_response_batch_rows: Self::default_plugin_response_batch_rows(),
             plugin_response_batch_bytes: Self::default_plugin_response_batch_bytes(),
             sql_observer_enabled: false,
+            sql_observer_clients: Vec::new(),
             plugins: None,
             shards: BTreeMap::from([(String::from("1"), Shard::default())]),
             users: BTreeMap::default(),
@@ -1355,6 +1366,10 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                     (
                         format!("pools.{}.sql_observer_enabled", pool_name),
                         pool.sql_observer_enabled.to_string(),
+                    ),
+                    (
+                        format!("pools.{}.sql_observer_clients", pool_name),
+                        pool.sql_observer_clients.join(","),
                     ),
                     (
                         format!("pools.{}.default_role", pool_name),

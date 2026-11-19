@@ -69,6 +69,15 @@ pub const OVERFLOW_LOG_NAMES: usize = 16;
 /// The log target of the first sighting of each relation by a client without
 /// an identity, for filtering.
 pub const CALLERS_LOG_TARGET: &str = "pgcat::sql_observer::callers";
+/// The log target of the sampled lines for statements counted without a
+/// `present` identity.
+pub const UNIDENTIFIED_LOG_TARGET: &str = "pgcat::sql_observer::unidentified";
+/// At most this many unidentified lines per pool and user per interval.
+pub const UNIDENTIFIED_LOG_LINES: u32 = 10;
+pub const UNIDENTIFIED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// An unidentified line's `application_name` is cut to this many bytes, on a
+/// character boundary, before it is escaped: a client can send a longer one.
+pub const UNIDENTIFIED_LOG_NAME_BYTES: usize = 64;
 
 /// Slot counters are allocated this many slots at a time, as names arrive.
 pub const CHUNK_SLOTS: usize = 64;
@@ -419,6 +428,35 @@ pub struct Notes {
     pub overflow: Option<String>,
 }
 
+/// The unidentified log's budget: `UNIDENTIFIED_LOG_LINES` per interval
+/// starting at `window`, and how many statements went unlogged since the
+/// last line.
+#[derive(Debug, Default)]
+struct UnidentifiedLog {
+    window: Option<Instant>,
+    lines: u32,
+    unlogged: u64,
+}
+
+impl UnidentifiedLog {
+    /// Whether a line is due, with the statements unlogged before it.
+    fn take(&mut self, now: Instant) -> Option<u64> {
+        let due = self.window.map_or(true, |window| {
+            now.saturating_duration_since(window) >= UNIDENTIFIED_LOG_INTERVAL
+        });
+        if due {
+            self.window = Some(now);
+            self.lines = 0;
+        }
+        if self.lines >= UNIDENTIFIED_LOG_LINES {
+            self.unlogged += 1;
+            return None;
+        }
+        self.lines += 1;
+        Some(std::mem::take(&mut self.unlogged))
+    }
+}
+
 /// Who sent an admitted statement, for the callers log.
 #[derive(Clone, Copy, Debug)]
 pub struct Caller<'a> {
@@ -447,6 +485,7 @@ pub struct RelationHub {
     bank: RwLock<Bank>,
     /// Allocated at the first overflow.
     overflow: Mutex<Option<Box<OverflowLog>>>,
+    unidentified: Mutex<UnidentifiedLog>,
 }
 
 impl Default for RelationHub {
@@ -462,6 +501,7 @@ impl RelationHub {
             user: user.to_string(),
             bank: RwLock::new(Bank::default()),
             overflow: Mutex::new(None),
+            unidentified: Mutex::new(UnidentifiedLog::default()),
         }
     }
 
@@ -641,6 +681,66 @@ impl RelationHub {
         for relation in self.admit_noting(snap, caller.identity, || ()) {
             info!(target: CALLERS_LOG_TARGET, "{}", self.callers_line(&relation, &caller));
         }
+        if let Some(line) = self.unidentified_line(snap, &caller, Instant::now) {
+            info!(target: UNIDENTIFIED_LOG_TARGET, "{}", line);
+        }
+    }
+
+    /// The sampled line for a statement counted without a `present` identity,
+    /// if the budget has one: who sent it (its `application_name`, clipped, and the
+    /// client's address for when the name is missing or shared) and the first
+    /// relation it names. Never the SQL or the token. Logging only, so a
+    /// contended budget skips the line rather than waits.
+    fn unidentified_line(
+        &self,
+        snap: RelationSnap,
+        caller: &Caller<'_>,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<String> {
+        if caller.identity == IdentityState::Present {
+            return None;
+        }
+        let unlogged = self.unidentified.try_lock()?.take(now())?;
+        let unlogged = if unlogged > 0 {
+            format!(" ({} more since the last line not logged)", unlogged)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "[pool: {}][user: {}] statement counted with identity {}: application_name \"{}\", client {}, first relation \"{}\"{}",
+            self.pool,
+            self.user,
+            caller.identity.as_str(),
+            log_escape(clip(caller.application_name, UNIDENTIFIED_LOG_NAME_BYTES)),
+            caller
+                .address
+                .map_or_else(|| "unknown".to_string(), |address| address.to_string()),
+            log_escape(&self.first_relation(snap)),
+            unlogged,
+        ))
+    }
+
+    /// The label `snap`'s first relation counts under.
+    fn first_relation(&self, snap: RelationSnap) -> Box<str> {
+        let bank = self.bank.read();
+        if !bank.valid() || snap.epoch != bank.epoch {
+            return FIXED_LABELS[UNKNOWN].into();
+        }
+        if let Some(name) = snap
+            .slots()
+            .first()
+            .and_then(|&slot| bank.names.get(slot as usize))
+        {
+            return name.clone();
+        }
+        let fixed = if snap.flags & FLAG_OTHER != 0 {
+            OTHER
+        } else if snap.flags & FLAG_NO_EXPLICIT != 0 {
+            NO_EXPLICIT
+        } else {
+            UNKNOWN
+        };
+        FIXED_LABELS[fixed].into()
     }
 
     /// The callers log line for `relation`'s first sighting with the caller's
@@ -2026,6 +2126,77 @@ mod tests {
             },
         );
         assert_eq!(count(&hub, "a"), [1, 2, 1, 3]);
+    }
+
+    #[test]
+    fn unidentified_statements_are_logged_within_a_budget() {
+        let (hub, _gate) = live();
+        let snap = snap_for(&hub, "SELECT * FROM orders JOIN users USING (id)");
+        let caller = |identity| Caller {
+            identity,
+            application_name: "batch-worker",
+            address: Some("192.0.2.7:41000".parse().unwrap()),
+        };
+        let t0 = Instant::now();
+        assert_eq!(hub.unidentified_line(snap, &caller(PRESENT), || t0), None);
+        let first = hub.unidentified_line(snap, &caller(ABSENT), || t0);
+        assert_eq!(
+            first.as_deref(),
+            Some(
+                r#"[pool: db][user: app] statement counted with identity absent: application_name "batch-worker", client 192.0.2.7:41000, first relation "orders""#
+            )
+        );
+        for _ in 1..UNIDENTIFIED_LOG_LINES {
+            assert!(hub
+                .unidentified_line(snap, &caller(ABSENT), || t0)
+                .is_some());
+        }
+        // The budget is spent until the interval passes, then the next line
+        // says how many went unlogged.
+        let almost = t0 + UNIDENTIFIED_LOG_INTERVAL - Duration::from_millis(1);
+        for _ in 0..3 {
+            assert_eq!(
+                hub.unidentified_line(snap, &caller(ABSENT), || almost),
+                None
+            );
+        }
+        let next = hub
+            .unidentified_line(
+                RelationSnap::UNKNOWN,
+                &caller(IdentityState::Expired),
+                || t0 + UNIDENTIFIED_LOG_INTERVAL,
+            )
+            .unwrap();
+        assert!(
+            next.ends_with(r#"identity expired: application_name "batch-worker", client 192.0.2.7:41000, first relation "unknown" (3 more since the last line not logged)"#),
+            "{next}"
+        );
+        let select_one = snap_for(&hub, "SELECT 1");
+        let anonymous = Caller::anonymous(ABSENT);
+        let line = hub
+            .unidentified_line(select_one, &anonymous, || t0 + UNIDENTIFIED_LOG_INTERVAL)
+            .unwrap();
+        assert!(
+            line.ends_with(
+                r#"application_name "", client unknown, first relation "no_explicit_relation""#
+            ),
+            "{line}"
+        );
+        // A long name is cut to 64 bytes on a character boundary (the `é`
+        // would end past it), then escaped.
+        let long = format!("{}é\n{}", "a".repeat(63), "b".repeat(4096));
+        let caller = Caller {
+            identity: ABSENT,
+            application_name: &long,
+            address: None,
+        };
+        let line = hub
+            .unidentified_line(select_one, &caller, || t0 + UNIDENTIFIED_LOG_INTERVAL)
+            .unwrap();
+        assert!(
+            line.contains(&format!("application_name \"{}\", client", "a".repeat(63))),
+            "{line}"
+        );
     }
 
     #[test]

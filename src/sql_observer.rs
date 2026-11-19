@@ -22,10 +22,15 @@
 //! Commands pgcat answers itself (`PGCAT_IDENTITY`, its custom commands) and
 //! the SQL pgcat sends on its own aren't counted.
 //!
-//! Labels are pool and user names from the config; never tenants or tokens.
+//! Labels are pool and user names from the config, and the client's
+//! `application_name` folded to the pool's configured list
+//! (`sql_observer_clients`, else `other`); never tenants or tokens.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use log::warn;
+use parking_lot::Mutex;
 
 use crate::identity_label::IdentityState;
 use crate::pool::{get_all_pools, PoolIdentifier};
@@ -69,37 +74,144 @@ impl Gap {
     }
 }
 
-#[derive(Debug, Default)]
+/// At most this many `sql_observer_clients` per pool. With `other`, the
+/// `client` label takes at most `MAX_CLIENTS + 1` values per pool and user.
+pub const MAX_CLIENTS: usize = 32;
+/// A configured client name is at most this many bytes.
+pub const MAX_CLIENT_NAME_BYTES: usize = 64;
+
+/// Column 0 is `other`; column `n` is the `n`th client name of the lineage.
+const COLUMNS: usize = MAX_CLIENTS + 1;
+const OTHER_CLIENT: usize = 0;
+const OTHER_LABEL: &str = "other";
+
+/// Why `sql_observer_clients` is invalid, if it is.
+pub fn invalid_clients(clients: &[String]) -> Option<String> {
+    if clients.len() > MAX_CLIENTS {
+        return Some(format!(
+            "at most {} names, got {}",
+            MAX_CLIENTS,
+            clients.len()
+        ));
+    }
+    for (i, name) in clients.iter().enumerate() {
+        if name.is_empty() || name.len() > MAX_CLIENT_NAME_BYTES {
+            return Some(format!(
+                "names must be 1 to {} bytes, got {:?}",
+                MAX_CLIENT_NAME_BYTES, name
+            ));
+        }
+        if name.chars().any(char::is_control) {
+            return Some(format!(
+                "names can't contain control characters, got {:?}",
+                name
+            ));
+        }
+        if name == OTHER_LABEL {
+            return Some(format!(
+                "{:?} is the label of every other name",
+                OTHER_LABEL
+            ));
+        }
+        if clients[..i].contains(name) {
+            return Some(format!("{:?} is listed twice", name));
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
 struct Counters {
-    /// Statements, by the client's `IdentityState`.
-    identities: [AtomicU64; IdentityState::COUNT],
-    /// By `Gap`, in `Gap::ALL` order.
-    gaps: [AtomicU64; Gap::ALL.len()],
+    /// Statements, by client column and the client's `IdentityState`.
+    identities: [[AtomicU64; IdentityState::COUNT]; COLUMNS],
+    /// By client column and `Gap`, in `Gap::ALL` order.
+    gaps: [[AtomicU64; Gap::ALL.len()]; COLUMNS],
+    /// The client names of the lineage, column `n` at `n - 1`: append-only,
+    /// so a name keeps its column (and counts) across reloads, even after it
+    /// is dropped from the config.
+    clients: Mutex<Vec<Box<str>>>,
     /// The relation slots and their counters, see `relations`.
     relations: RelationHub,
+}
+
+impl Counters {
+    fn new(pool: &str, user: &str) -> Counters {
+        Counters {
+            identities: std::array::from_fn(|_| Default::default()),
+            gaps: std::array::from_fn(|_| Default::default()),
+            clients: Mutex::new(Vec::new()),
+            relations: RelationHub::new(pool, user),
+        }
+    }
+}
+
+impl Default for Counters {
+    fn default() -> Counters {
+        Counters::new("", "")
+    }
 }
 
 /// A pool's statement counts. Disabled, it counts nothing.
 #[derive(Clone, Debug, Default)]
 pub struct SqlObserver {
     enabled: bool,
+    /// The pool's configured client names and their columns.
+    clients: Arc<[(Box<str>, u8)]>,
     /// Shared with the pool this one replaced on reload, so the counts stay
     /// monotonic and clients still on the old pool aren't lost.
     counters: Arc<Counters>,
 }
 
 impl SqlObserver {
-    /// `id` names the pool in the observer's logs.
-    pub fn new(enabled: bool, previous: Option<&SqlObserver>, id: &PoolIdentifier) -> SqlObserver {
+    /// `clients` are the `application_name`s counted under their own `client`
+    /// label (validated by `invalid_clients`); `id` names the pool in the
+    /// observer's logs.
+    pub fn new(
+        enabled: bool,
+        clients: &[String],
+        previous: Option<&SqlObserver>,
+        id: &PoolIdentifier,
+    ) -> SqlObserver {
         let counters = match previous {
             Some(previous) => previous.counters.clone(),
-            None => Arc::new(Counters {
-                identities: Default::default(),
-                gaps: Default::default(),
-                relations: RelationHub::new(&id.db, &id.user),
-            }),
+            None => Arc::new(Counters::new(&id.db, &id.user)),
         };
-        SqlObserver { enabled, counters }
+        let clients = {
+            let mut lineage = counters.clients.lock();
+            clients
+                .iter()
+                .filter_map(|name| {
+                    let column = match lineage.iter().position(|known| **known == **name) {
+                        Some(at) => at + 1,
+                        None if lineage.len() < MAX_CLIENTS => {
+                            lineage.push(name.as_str().into());
+                            lineage.len()
+                        }
+                        None => {
+                            warn!(
+                                "[pool: {}][user: {}] SQL observer client names are full ({} since the pool was added); {:?} counts as other",
+                                id.db, id.user, MAX_CLIENTS, name
+                            );
+                            return None;
+                        }
+                    };
+                    Some((name.as_str().into(), column as u8))
+                })
+                .collect()
+        };
+        SqlObserver {
+            enabled,
+            clients,
+            counters,
+        }
+    }
+
+    /// The `client` column of an `application_name`.
+    fn client_column(&self, application_name: &str) -> usize {
+        self.clients
+            .iter()
+            .find(|(name, _)| **name == *application_name)
+            .map_or(OTHER_CLIENT, |(_, column)| *column as usize)
     }
 
     pub fn enabled(&self) -> bool {
@@ -108,18 +220,21 @@ impl SqlObserver {
 
     /// `statements` admitted: parsed from one simple Query, or the statement of
     /// the first Execute of a portal.
-    pub fn attempts(&self, statements: usize, identity: IdentityState) {
+    pub fn attempts(&self, statements: usize, caller: Caller<'_>) {
         if !self.enabled {
             return;
         }
-        self.counters.identities[identity.column()].fetch_add(statements as u64, Ordering::Relaxed);
+        self.counters.identities[self.client_column(caller.application_name)]
+            [caller.identity.column()]
+        .fetch_add(statements as u64, Ordering::Relaxed);
     }
 
-    pub fn gap(&self, gap: Gap) {
+    pub fn gap(&self, gap: Gap, caller: Caller<'_>) {
         if !self.enabled {
             return;
         }
-        self.counters.gaps[gap as usize].fetch_add(1, Ordering::Relaxed);
+        self.counters.gaps[self.client_column(caller.application_name)][gap as usize]
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// The relation slots shared along this pool's reload lineage.
@@ -680,17 +795,17 @@ impl ClientObserver {
             } else {
                 Gap::UnknownPortal
             };
-            return pool.gap(gap);
+            return pool.gap(gap, caller);
         };
         let entry = self.portals[index].expect("indexed portal");
         match entry.value.snap {
             Snap::Excluded => (),
             Snap::Unparsed => {
-                pool.gap(Gap::UnparsedStatement);
+                pool.gap(Gap::UnparsedStatement, caller);
                 self.clear(true, true);
             }
             Snap::Invalidated => {
-                pool.gap(Gap::MetadataInvalidated);
+                pool.gap(Gap::MetadataInvalidated, caller);
                 self.clear(true, true);
             }
             Snap::Known {
@@ -704,7 +819,7 @@ impl ClientObserver {
                 if let Some(live) = self.portals[index].as_mut() {
                     live.value.executed = true;
                 }
-                pool.attempts(count as usize, caller.identity);
+                pool.attempts(count as usize, caller);
                 if count > 0 {
                     pool.relation_attempt(relations, caller);
                 }
@@ -1023,14 +1138,18 @@ fn render(observers: &[(&PoolIdentifier, &SqlObserver)]) -> Vec<String> {
         "counter",
     );
     for (id, observer) in observers.iter().filter(|(_, observer)| observer.enabled) {
-        for (identity, counter) in IdentityState::ALL.iter().zip(&observer.counters.identities) {
-            lines.push(format!(
-                "{}{{{},identity=\"{}\"}} {}",
-                ATTEMPTS,
-                pool_labels(id),
-                identity.as_str(),
-                counter.load(Ordering::Relaxed)
-            ));
+        for (client, column) in exported_clients(&observer.counters) {
+            let counters = &observer.counters.identities[column];
+            for (identity, counter) in IdentityState::ALL.iter().zip(counters) {
+                lines.push(format!(
+                    "{}{{{},client=\"{}\",identity=\"{}\"}} {}",
+                    ATTEMPTS,
+                    pool_labels(id),
+                    client,
+                    identity.as_str(),
+                    counter.load(Ordering::Relaxed)
+                ));
+            }
         }
     }
 
@@ -1041,18 +1160,41 @@ fn render(observers: &[(&PoolIdentifier, &SqlObserver)]) -> Vec<String> {
         "counter",
     );
     for (id, observer) in observers.iter().filter(|(_, observer)| observer.enabled) {
-        for (gap, counter) in Gap::ALL.iter().zip(&observer.counters.gaps) {
-            lines.push(format!(
-                "{}{{{},reason=\"{}\"}} {}",
-                GAPS,
-                pool_labels(id),
-                gap.as_str(),
-                counter.load(Ordering::Relaxed)
-            ));
+        for (client, column) in exported_clients(&observer.counters) {
+            let counters = &observer.counters.gaps[column];
+            for (gap, counter) in Gap::ALL.iter().zip(counters) {
+                lines.push(format!(
+                    "{}{{{},client=\"{}\",reason=\"{}\"}} {}",
+                    GAPS,
+                    pool_labels(id),
+                    client,
+                    gap.as_str(),
+                    counter.load(Ordering::Relaxed)
+                ));
+            }
         }
     }
 
     lines
+}
+
+/// The clients a pool exports, in both families, as their escaped labels and
+/// columns: `other` always, so an observing pool exports its series before
+/// any traffic, and a configured client once it has a nonzero count in either
+/// family, so idle pools don't export every client's zeros. A client never
+/// disappears once exported, as its counts only grow.
+fn exported_clients(counters: &Counters) -> Vec<(String, usize)> {
+    let names = counters.clients.lock();
+    std::iter::once((OTHER_LABEL.to_string(), OTHER_CLIENT))
+        .chain(names.iter().enumerate().filter_map(|(at, name)| {
+            let column = at + 1;
+            counters.identities[column]
+                .iter()
+                .chain(&counters.gaps[column])
+                .any(|count| count.load(Ordering::Relaxed) > 0)
+                .then(|| (label(name), column))
+        }))
+        .collect()
 }
 
 fn pool_labels(id: &PoolIdentifier) -> String {
@@ -1086,17 +1228,22 @@ mod tests {
     };
 
     fn pool() -> SqlObserver {
-        SqlObserver::new(true, None, &id("db"))
+        SqlObserver::new(true, &[], None, &id("db"))
     }
 
     fn gap_total(pool: &SqlObserver, gap: Gap) -> u64 {
-        pool.counters.gaps[gap as usize].load(Ordering::Relaxed)
+        pool.counters
+            .gaps
+            .iter()
+            .map(|row| row[gap as usize].load(Ordering::Relaxed))
+            .sum()
     }
 
     fn statements(pool: &SqlObserver) -> u64 {
         pool.counters
             .identities
             .iter()
+            .flatten()
             .map(|count| count.load(Ordering::Relaxed))
             .sum()
     }
@@ -1335,7 +1482,7 @@ mod tests {
     fn disabled_observers_have_no_storage() {
         let client: Option<Box<ClientObserver>> = None;
         assert_eq!(std::mem::size_of_val(&client), std::mem::size_of::<usize>());
-        assert!(!SqlObserver::new(false, None, &id("db")).enabled());
+        assert!(!SqlObserver::new(false, &[], None, &id("db")).enabled());
     }
 
     #[test]
@@ -1448,7 +1595,7 @@ mod tests {
             observer.stage_bind(b"P", b"S");
             assert_eq!(observer.portal_value(b"P"), Some((EMPTY, false)));
 
-            pool.attempts(1, IdentityState::Absent);
+            pool.attempts(1, Caller::anonymous(IdentityState::Absent));
             observer.admit_query(QueryAdmission::Parsed(Invalidate::Nothing));
             observer.send_query();
             assert_eq!(statements(&pool), 1, "only the Query counts");
@@ -1561,8 +1708,8 @@ mod tests {
     #[test]
     fn disabled_counts_nothing_and_says_so() {
         let observer = SqlObserver::default();
-        observer.attempts(3, IdentityState::Present);
-        observer.gap(Gap::UnparsedQuery);
+        observer.attempts(3, Caller::anonymous(IdentityState::Present));
+        observer.gap(Gap::UnparsedQuery, absent());
 
         let lines = render(&[(&id("db"), &observer)]);
 
@@ -1570,34 +1717,59 @@ mod tests {
         assert!(!lines.iter().any(|line| line.starts_with(ATTEMPTS)));
         assert!(!lines.iter().any(|line| line.starts_with(GAPS)));
         assert_eq!(
-            observer.counters.identities[IdentityState::Present.column()].load(Ordering::Relaxed),
+            observer.counters.identities[OTHER_CLIENT][IdentityState::Present.column()]
+                .load(Ordering::Relaxed),
             0
         );
-        assert_eq!(observer.counters.gaps[0].load(Ordering::Relaxed), 0);
+        assert_eq!(
+            observer.counters.gaps[OTHER_CLIENT][0].load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
     fn counts_statements_by_identity_and_gaps_by_reason() {
-        let observer = SqlObserver::new(true, None, &id("db"));
-        observer.attempts(3, IdentityState::Present);
-        observer.attempts(2, IdentityState::Absent);
-        observer.attempts(1, IdentityState::Absent);
-        observer.gap(Gap::UnknownPortal);
-        observer.gap(Gap::RefusedUnparsed);
-        observer.gap(Gap::RefusedUnparsed);
+        let observer = SqlObserver::new(true, &[], None, &id("db"));
+        observer.attempts(3, Caller::anonymous(IdentityState::Present));
+        observer.attempts(2, Caller::anonymous(IdentityState::Absent));
+        observer.attempts(1, Caller::anonymous(IdentityState::Absent));
+        observer.gap(Gap::UnknownPortal, absent());
+        observer.gap(Gap::RefusedUnparsed, absent());
+        observer.gap(Gap::RefusedUnparsed, absent());
 
         let lines = render(&[(&id("db"), &observer)]);
         let labels = "pool=\"db\",user=\"app\"";
 
         for expected in [
             format!("{}{{{}}} 1", OBSERVING, labels),
-            format!("{}{{{},identity=\"present\"}} 3", ATTEMPTS, labels),
-            format!("{}{{{},identity=\"absent\"}} 3", ATTEMPTS, labels),
-            format!("{}{{{},identity=\"expired\"}} 0", ATTEMPTS, labels),
-            format!("{}{{{},identity=\"refused\"}} 0", ATTEMPTS, labels),
-            format!("{}{{{},reason=\"unknown_portal\"}} 1", GAPS, labels),
-            format!("{}{{{},reason=\"unparsed_query\"}} 0", GAPS, labels),
-            format!("{}{{{},reason=\"refused_unparsed\"}} 2", GAPS, labels),
+            format!(
+                "{}{{{},client=\"other\",identity=\"present\"}} 3",
+                ATTEMPTS, labels
+            ),
+            format!(
+                "{}{{{},client=\"other\",identity=\"absent\"}} 3",
+                ATTEMPTS, labels
+            ),
+            format!(
+                "{}{{{},client=\"other\",identity=\"expired\"}} 0",
+                ATTEMPTS, labels
+            ),
+            format!(
+                "{}{{{},client=\"other\",identity=\"refused\"}} 0",
+                ATTEMPTS, labels
+            ),
+            format!(
+                "{}{{{},client=\"other\",reason=\"unknown_portal\"}} 1",
+                GAPS, labels
+            ),
+            format!(
+                "{}{{{},client=\"other\",reason=\"unparsed_query\"}} 0",
+                GAPS, labels
+            ),
+            format!(
+                "{}{{{},client=\"other\",reason=\"refused_unparsed\"}} 2",
+                GAPS, labels
+            ),
         ] {
             assert!(
                 lines.contains(&expected),
@@ -1609,19 +1781,92 @@ mod tests {
     }
 
     #[test]
-    fn reload_keeps_the_counts() {
-        let before = SqlObserver::new(true, None, &id("db"));
-        before.attempts(2, IdentityState::Absent);
+    fn counts_by_the_configured_clients() {
+        let names =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        let caller = |application_name| Caller {
+            identity: IdentityState::Absent,
+            application_name,
+            address: None,
+        };
+        let labels = "pool=\"db\",user=\"app\"";
+        let attempts = |client: &str, count: u64| {
+            format!(
+                "{}{{{},client=\"{}\",identity=\"absent\"}} {}",
+                ATTEMPTS, labels, client, count
+            )
+        };
 
-        let disabled = SqlObserver::new(false, Some(&before), &id("db"));
-        disabled.attempts(5, IdentityState::Absent);
-        let enabled = SqlObserver::new(true, Some(&disabled), &id("db"));
-        enabled.attempts(1, IdentityState::Absent);
+        // Unconfigured, every name is other.
+        let unconfigured = pool();
+        unconfigured.attempts(3, caller("app-a"));
+        let lines = render(&[(&id("db"), &unconfigured)]);
+        assert!(lines.contains(&attempts("other", 3)), "{:#?}", lines);
+
+        let observer = SqlObserver::new(true, &names(&["app-a", "app-b"]), None, &id("db"));
+        observer.attempts(2, caller("app-a"));
+        observer.attempts(1, caller("app-a-canary"));
+        observer.attempts(1, caller("App-A"));
+        observer.gap(Gap::UnknownPortal, caller("app-b"));
+        // Reloaded without app-b: app-a keeps its column, app-b its series
+        // (an old client still counts to it), and app-c takes a new column.
+        let reloaded = SqlObserver::new(
+            true,
+            &names(&["app-c", "app-a"]),
+            Some(&observer),
+            &id("db"),
+        );
+        reloaded.attempts(1, caller("app-a"));
+        reloaded.attempts(4, caller("app-c"));
+        reloaded.attempts(1, caller("app-b"));
+        observer.attempts(1, caller("app-b"));
+
+        let lines = render(&[(&id("db"), &reloaded)]);
+        for expected in [
+            attempts("app-a", 3),
+            attempts("other", 3),
+            attempts("app-b", 1),
+            attempts("app-c", 4),
+            format!(
+                "{}{{{},client=\"app-b\",reason=\"unknown_portal\"}} 1",
+                GAPS, labels
+            ),
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "{} not in {:#?}",
+                expected,
+                lines
+            );
+        }
+
+        assert_eq!(invalid_clients(&names(&["app-a", "app-b"])), None);
+        for invalid in [
+            names(&["app-a", "app-a"]),
+            names(&["other"]),
+            names(&[""]),
+            names(&[&"a".repeat(MAX_CLIENT_NAME_BYTES + 1)]),
+            (0..=MAX_CLIENTS).map(|n| format!("app-{}", n)).collect(),
+        ] {
+            assert!(invalid_clients(&invalid).is_some(), "{:?}", invalid);
+        }
+    }
+
+    #[test]
+    fn reload_keeps_the_counts() {
+        let before = SqlObserver::new(true, &[], None, &id("db"));
+        before.attempts(2, Caller::anonymous(IdentityState::Absent));
+
+        let disabled = SqlObserver::new(false, &[], Some(&before), &id("db"));
+        disabled.attempts(5, Caller::anonymous(IdentityState::Absent));
+        let enabled = SqlObserver::new(true, &[], Some(&disabled), &id("db"));
+        enabled.attempts(1, Caller::anonymous(IdentityState::Absent));
         // A client still holding the settings it started with.
-        before.attempts(1, IdentityState::Absent);
+        before.attempts(1, Caller::anonymous(IdentityState::Absent));
 
         assert_eq!(
-            enabled.counters.identities[IdentityState::Absent.column()].load(Ordering::Relaxed),
+            enabled.counters.identities[OTHER_CLIENT][IdentityState::Absent.column()]
+                .load(Ordering::Relaxed),
             4
         );
     }
@@ -1721,7 +1966,8 @@ mod tests {
             ([1, 0, 1, 0], [1, 0, 1, 0])
         );
         assert_eq!(
-            pool.counters.identities[IdentityState::Expired.column()].load(Ordering::Relaxed),
+            pool.counters.identities[OTHER_CLIENT][IdentityState::Expired.column()]
+                .load(Ordering::Relaxed),
             1
         );
     }
@@ -1783,7 +2029,7 @@ mod tests {
         );
         observer.admit_execute(Some(b"p"), absent(), &pool);
         assert!(pool.hub().samples().iter().all(|(_, v)| *v == [0; 4]));
-        let off = SqlObserver::new(false, None, &id("db"));
+        let off = SqlObserver::new(false, &[], None, &id("db"));
         off.relation_attempt(RelationSnap::UNKNOWN, present());
         assert!(off.hub().samples().iter().all(|(_, v)| *v == [0; 4]));
     }

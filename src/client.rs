@@ -2706,7 +2706,10 @@ where
     /// recorded (see `sql_observed`).
     fn observe_gap(&mut self, query_router: &QueryRouter, gap: Gap) {
         if !self.sql_observed {
-            query_router.pool_settings().sql_observer.gap(gap);
+            query_router
+                .pool_settings()
+                .sql_observer
+                .gap(gap, self.caller());
             if let Some(observer) = self.observer.as_deref_mut() {
                 observer.admit_query(QueryAdmission::Unparsed);
             }
@@ -2780,11 +2783,10 @@ where
 
         // As the client sent them: before plugins rewrite or refuse them.
         if !self.sql_observed {
-            let identity = self.caller().identity;
             query_router
                 .pool_settings()
                 .sql_observer
-                .attempts(ast.len(), identity);
+                .attempts(ast.len(), self.caller());
             let pool = &query_router.pool_settings().sql_observer;
             if pool.enabled() {
                 // Each statement's relations, from the original AST.
