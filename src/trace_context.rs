@@ -225,7 +225,11 @@ pub async fn shutdown() {
 }
 
 /// One attempt per batch, as before 0.33 turned retries on by default: a
-/// failing collector costs that batch, not the processor's time.
+/// failing collector costs that batch, not the processor's time. Always
+/// uncompressed: this build enables none of the crate's compression features,
+/// so it ignores OTEL_EXPORTER_OTLP_COMPRESSION and
+/// OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, without a warning: internal-logs is
+/// off.
 fn span_exporter(
     endpoint: String,
     client: impl HttpClient + 'static,
@@ -249,8 +253,8 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
         runtime,
         failing: AtomicBool::new(false),
     };
-    // The SDK reads an endpoint from the environment only when none is given,
-    // so resolving it here means 0.32's fallbacks never apply.
+    // Resolved here, by the SDK's rules, so a bad variable gets a specific
+    // error that doesn't quote it, and an SDK release can't change the choice.
     let resolved = match endpoint {
         Some(endpoint) => endpoint.to_owned(),
         None => endpoint_from_env(|name| std::env::var_os(name))?,
@@ -284,11 +288,10 @@ const TRACES_PATH: &str = "/v1/traces";
 /// The OTLP/HTTP traces URL the environment gives, resolved as
 /// opentelemetry-otlp 0.33 does (the OTLP exporter spec's order): the traces
 /// variable as is, else the generic one with `/v1/traces` appended, else
-/// localhost. An empty variable counts as unset. 0.32 instead skips a value
-/// that isn't Unicode or a valid URI and falls back to the next, and turns an
-/// empty generic one into the relative `/v1/traces`; resolving here keeps a
-/// typo from exporting somewhere else. Errors don't quote the value: it isn't
-/// validated beyond parsing and may carry a key.
+/// localhost. An empty variable counts as unset; one that isn't Unicode or a
+/// valid URI is refused, not skipped, so a typo can't export somewhere else.
+/// Errors don't quote the value: it isn't validated beyond parsing and may
+/// carry a key.
 fn endpoint_from_env(
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<String, &'static str> {
