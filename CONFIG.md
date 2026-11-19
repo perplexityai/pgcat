@@ -387,6 +387,30 @@ default: 0
 Size of the prepared statements cache. 0 means disabled.
 TODO: update documentation
 
+### sync_application_name
+```
+path: pools.<pool_name>.sync_application_name
+default: true
+```
+
+Whether pgcat sends the client's `application_name` to the server. By default, when a client
+takes a server connection whose `application_name` differs from the client's, pgcat runs
+`SET application_name` on it first, so the server sees each client's name.
+
+When false, server connections keep the name pgcat connects with, `pgcat`, which is what the
+server reports in `pg_stat_activity` and to `SHOW application_name`. Clients with different
+names then share server connections without that extra round trip at checkout. If a client
+changes the name on the server (`SET application_name`, `set_config()`), pgcat sets `pgcat` back
+the next time the connection is checked out, so in transaction mode the change lasts until the
+end of the client's transaction. The name the client connected with is still what pgcat uses
+for `SHOW CLIENTS` and logs; `SHOW SERVERS` shows the client's current name, which follows the
+client's own `SET application_name`. The other tracked parameters (`TimeZone`,
+`client_encoding`, ...) are synced either way.
+
+A reload that changes the setting recreates the pool, as for other pool settings. Each client
+switches to the new pool when it next takes a server connection; a session-mode client keeps
+the server connection it holds until it disconnects.
+
 ### query_parser_enabled
 ```
 path: pools.<pool_name>.query_parser_enabled

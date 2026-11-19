@@ -62,6 +62,7 @@ idle_client_in_transaction_timeout = {IDLE_IN_TRANSACTION_MS}
     + pool("sem_two", pool_size=2)
     + pool("sem_timeout", statement_timeout=STATEMENT_TIMEOUT_MS)
     + pool("sem_lifetime", extra=f"server_lifetime = {SERVER_LIFETIME_MS}")
+    + pool("sem_appname_off", extra="sync_application_name = false")
 )
 
 
@@ -286,6 +287,76 @@ def test_client_parameters_survive_interleaving(pgcat):
         assert chicago.execute("SHOW TimeZone").fetchone() == ("America/Chicago",)
         assert tokyo.execute("SHOW application_name").fetchone() == ("tokyo_app",)
         assert chicago.execute("SHOW application_name").fetchone() != ("tokyo_app",)
+
+
+def application_name_sets(su):
+    """The SET application_name statements sharding_user's server connections
+    ran in shard0 since the last pg_stat_statements_reset()."""
+    return su.execute(
+        "SELECT coalesce(sum(calls), 0) FROM pg_stat_statements"
+        " WHERE query ILIKE 'SET application_name TO %'"
+        " AND dbid = (SELECT oid FROM pg_database WHERE datname = 'shard0')"
+        " AND userid = 'sharding_user'::regrole"
+    ).fetchone()[0]
+
+
+def server_application_name(conn):
+    return conn.execute("SELECT current_setting('application_name')").fetchone()[0]
+
+
+# By default the server connection takes each client's application_name, a
+# SET whenever the next client's name differs.
+def test_application_name_synced_by_default(pgcat):
+    su = psycopg.connect(PG, autocommit=True)
+    su.execute("SELECT pg_stat_statements_reset()")
+    app_a = connect(pgcat, "sem_one", application_name="app-a")
+    app_b = connect(pgcat, "sem_one", application_name="app-b")
+    try:
+        for _ in range(2):
+            assert server_application_name(app_a) == "app-a"
+            assert server_application_name(app_b) == "app-b"
+        assert application_name_sets(su) == 4
+    finally:
+        app_a.close()
+        app_b.close()
+        su.close()
+
+
+# With sync_application_name off, clients with different names share the
+# server connection without that SET: it keeps pgcat's name, and pgcat still
+# reports each client's own.
+def test_application_name_not_synced_when_off(pgcat):
+    su = psycopg.connect(PG, autocommit=True)
+    su.execute("SELECT pg_stat_statements_reset()")
+    app_a = connect(pgcat, "sem_appname_off", application_name="app-a")
+    app_b = connect(pgcat, "sem_appname_off", application_name="app-b")
+    try:
+        for _ in range(2):
+            assert server_application_name(app_a) == "pgcat"
+            assert server_application_name(app_b) == "pgcat"
+        assert application_name_sets(su) == 0
+
+        # set_config has no SET command tag, so the cleanup at checkin leaves
+        # the name; the next checkout puts pgcat's back.
+        app_a.execute("SELECT set_config('application_name', 'drifted', false)")
+        assert server_application_name(app_b) == "pgcat"
+        assert application_name_sets(su) == 1
+
+        app_a.execute("SET application_name TO 'x'")
+        assert server_application_name(app_b) == "pgcat"
+        assert application_name_sets(su) == 2  # the client's own SET; pgcat sent no reset
+
+        with admin(pgcat) as console:
+            cur = console.execute("SHOW CLIENTS")
+            columns = [c.name for c in cur.description]
+            database = columns.index("database")
+            name = columns.index("application_name")
+            names = sorted(r[name] for r in cur.fetchall() if r[database] == "sem_appname_off")
+        assert names == ["app-a", "app-b"]
+    finally:
+        app_a.close()
+        app_b.close()
+        su.close()
 
 
 # Regression: the admin console misreports to a stock psql client, or an

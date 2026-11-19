@@ -167,6 +167,10 @@ enum TenantParameter {
     Unknown,
 }
 
+/// The `application_name` pgcat connects to the server with. With
+/// `sync_application_name` off, server connections keep it.
+pub const PGCAT_APPLICATION_NAME: &str = "pgcat";
+
 static TRACKED_PARAMETERS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut set = HashSet::new();
     set.insert("client_encoding".to_string());
@@ -202,7 +206,11 @@ impl ServerParameters {
             "on".to_string(),
             false,
         );
-        server_parameters.set_param("application_name".to_string(), "pgcat".to_string(), false);
+        server_parameters.set_param(
+            "application_name".to_string(),
+            PGCAT_APPLICATION_NAME.to_string(),
+            false,
+        );
 
         server_parameters
     }
@@ -229,13 +237,24 @@ impl ServerParameters {
         }
     }
 
-    // Gets the diff of the parameters
-    fn compare_params(&self, incoming_parameters: &ServerParameters) -> HashMap<String, String> {
+    // Gets the diff of the parameters. Without `sync_application_name`, the
+    // client's application_name is never wanted: the server keeps pgcat's, and
+    // gets it back if it drifted (a client's `SET application_name`).
+    fn compare_params(
+        &self,
+        incoming_parameters: &ServerParameters,
+        sync_application_name: bool,
+    ) -> HashMap<String, String> {
         let mut diff = HashMap::new();
 
         // iterate through tracked parameters
         for key in TRACKED_PARAMETERS.iter() {
-            if let Some(incoming_value) = incoming_parameters.parameters.get(key) {
+            let incoming_value = if key == "application_name" && !sync_application_name {
+                Some(PGCAT_APPLICATION_NAME)
+            } else {
+                incoming_parameters.parameters.get(key).map(String::as_str)
+            };
+            if let Some(incoming_value) = incoming_value {
                 if let Some(value) = self.parameters.get(key) {
                     if value != incoming_value {
                         diff.insert(key.to_string(), incoming_value.to_string());
@@ -1380,8 +1399,14 @@ impl Server {
         self.server_parameters.clone()
     }
 
-    pub async fn sync_parameters(&mut self, parameters: &ServerParameters) -> Result<(), Error> {
-        let parameter_diff = self.server_parameters.compare_params(parameters);
+    pub async fn sync_parameters(
+        &mut self,
+        parameters: &ServerParameters,
+        sync_application_name: bool,
+    ) -> Result<(), Error> {
+        let parameter_diff = self
+            .server_parameters
+            .compare_params(parameters, sync_application_name);
 
         if parameter_diff.is_empty() {
             return Ok(());
@@ -1956,7 +1981,7 @@ mod tests {
         let params1 = ServerParameters::new();
         let params2 = ServerParameters::new();
 
-        let diff = params1.compare_params(&params2);
+        let diff = params1.compare_params(&params2, true);
         assert!(diff.is_empty());
     }
 
@@ -1971,7 +1996,7 @@ mod tests {
         );
         params2.set_param("client_encoding".to_string(), "LATIN1".to_string(), false);
 
-        let diff = params1.compare_params(&params2);
+        let diff = params1.compare_params(&params2, true);
 
         assert_eq!(diff.len(), 2);
         assert_eq!(
@@ -1979,6 +2004,36 @@ mod tests {
             Some(&"America/Los_Angeles".to_string())
         );
         assert_eq!(diff.get("client_encoding"), Some(&"LATIN1".to_string()));
+    }
+
+    #[test]
+    fn test_compare_params_without_application_name_sync() {
+        let mut client = ServerParameters::new();
+        client.set_param("application_name".to_string(), "app-a".to_string(), false);
+        client.set_param(
+            "TimeZone".to_string(),
+            "America/Los_Angeles".to_string(),
+            false,
+        );
+
+        let mut server = ServerParameters::new();
+        let diff = server.compare_params(&client, false);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(
+            diff.get("TimeZone"),
+            Some(&"America/Los_Angeles".to_string())
+        );
+
+        // A drifted server name goes back to pgcat's, not to the client's.
+        server.set_param("application_name".to_string(), "app-b".to_string(), false);
+        let diff = server.compare_params(&client, false);
+        assert_eq!(
+            diff.get("application_name"),
+            Some(&PGCAT_APPLICATION_NAME.to_string())
+        );
+
+        let diff = server.compare_params(&client, true);
+        assert_eq!(diff.get("application_name"), Some(&"app-a".to_string()));
     }
 
     #[test]

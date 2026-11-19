@@ -1641,7 +1641,9 @@ where
                 server.address()
             );
 
-            server.sync_parameters(&self.server_parameters).await?;
+            server
+                .sync_parameters(&self.server_parameters, pool.settings.sync_application_name)
+                .await?;
             // The last user's statements may have changed the tenant parameter
             // without naming it (a function, view or default that sets it), so
             // it's set at every checkout, whatever pgcat set before.

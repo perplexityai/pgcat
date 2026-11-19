@@ -610,6 +610,9 @@ pub struct Pool {
     #[serde(default = "Pool::default_cleanup_server_connections")]
     pub cleanup_server_connections: bool,
 
+    #[serde(default = "Pool::default_sync_application_name")]
+    pub sync_application_name: bool,
+
     #[serde(default)] // False
     pub log_client_parameter_status_changes: bool,
 
@@ -731,6 +734,10 @@ impl Pool {
     }
 
     pub fn default_cleanup_server_connections() -> bool {
+        true
+    }
+
+    pub fn default_sync_application_name() -> bool {
         true
     }
 
@@ -930,6 +937,7 @@ impl Default for Pool {
             auth_query_user: None,
             auth_query_password: None,
             cleanup_server_connections: true,
+            sync_application_name: Self::default_sync_application_name(),
             log_client_parameter_status_changes: false,
             prepared_statements_cache_size: Self::default_prepared_statements_cache_size(),
             db_activity_based_routing: Self::default_db_activity_based_routing(),
@@ -1357,6 +1365,10 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                         pool.sql_observer_enabled.to_string(),
                     ),
                     (
+                        format!("pools.{}.sync_application_name", pool_name),
+                        pool.sync_application_name.to_string(),
+                    ),
+                    (
                         format!("pools.{}.default_role", pool_name),
                         pool.default_role.clone(),
                     ),
@@ -1577,6 +1589,10 @@ impl Config {
             info!(
                 "[pool: {}] Cleanup server connections: {}",
                 pool_name, pool_config.cleanup_server_connections
+            );
+            info!(
+                "[pool: {}] Sync application name: {}",
+                pool_name, pool_config.sync_application_name
             );
             info!(
                 "[pool: {}] DB activity based routing: {}",
@@ -2274,6 +2290,7 @@ mod test {
         assert_eq!(Pool::default_default_role(), "any");
         assert!(Pool::default_automatic_sharding_key().is_none());
         assert!(Pool::default_cleanup_server_connections());
+        assert!(Pool::default_sync_application_name());
         assert_eq!(Pool::default_prepared_statements_cache_size(), 0);
         assert!(!Pool::default_db_activity_based_routing());
     }

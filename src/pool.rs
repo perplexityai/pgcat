@@ -235,6 +235,9 @@ pub struct PoolSettings {
     pub auth_query_user: Option<String>,
     pub auth_query_password: Option<String>,
 
+    /// Send the client's `application_name` to the server at checkout.
+    pub sync_application_name: bool,
+
     /// Reject unparseable queries when plugins are configured.
     pub plugins_require_parse: bool,
 
@@ -290,6 +293,7 @@ impl Default for PoolSettings {
             auth_query: None,
             auth_query_user: None,
             auth_query_password: None,
+            sync_application_name: crate::config::Pool::default_sync_application_name(),
             plugins_require_parse: false,
             plugin_hook_timeout: std::time::Duration::from_millis(
                 crate::config::Pool::default_plugin_hook_timeout(),
@@ -622,6 +626,7 @@ impl ConnectionPool {
                         auth_query: pool_config.auth_query.clone(),
                         auth_query_user: pool_config.auth_query_user.clone(),
                         auth_query_password: pool_config.auth_query_password.clone(),
+                        sync_application_name: pool_config.sync_application_name,
                         plugins_require_parse: pool_config.plugins_require_parse,
                         plugin_hook_timeout: std::time::Duration::from_millis(
                             pool_config.plugin_hook_timeout,
