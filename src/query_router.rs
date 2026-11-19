@@ -692,7 +692,9 @@ impl QueryRouter {
             SetExpr::SetOperation { left, right, .. } => {
                 Self::is_mutation_set_expr(left) || Self::is_mutation_set_expr(right)
             }
-            SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => false,
+            // `SELECT ... INTO t` creates t.
+            SetExpr::Select(select) => select.into.is_some(),
+            SetExpr::Values(_) | SetExpr::Table(_) => false,
         }
     }
 
@@ -2306,6 +2308,11 @@ mod test {
              WHEN MATCHED THEN DELETE; SELECT 1",
             "WITH x AS (DELETE FROM data RETURNING *) SELECT * FROM x; SELECT 1",
             "SELECT * FROM data FOR UPDATE; SELECT 1",
+            // SELECT INTO creates a table.
+            "SELECT 1 INTO t",
+            "SELECT * INTO TEMP t FROM data",
+            "WITH x AS (SELECT 1) SELECT * INTO t FROM x",
+            "SELECT 1 INTO t UNION ALL SELECT 2",
         ] {
             assert_eq!(role_of(sql), Some(Role::Primary), "{}", sql);
         }
