@@ -42,6 +42,7 @@ pub mod stats;
 #[cfg(test)]
 mod test_allocator;
 pub mod tls;
+pub mod trace_context;
 
 /// Format chrono::Duration to be more human-friendly.
 ///

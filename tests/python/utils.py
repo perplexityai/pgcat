@@ -185,11 +185,12 @@ class PgcatProcess:
         return f"postgres://{user}:{password}@{PGCAT_HOST}:{self.port}/{db}?application_name=testing_pgcat"
 
 
-def raw_connection(port: int, db: str, wrap=lambda sock: sock):
+def raw_connection(port: int, db: str, wrap=lambda sock: sock, timeout=None):
     """A protocol-level connection to pgcat as sharding_user, authenticated,
     ready for queries. Returns the socket and a function reading one message.
-    `wrap` can replace the socket, for example to change how it sends."""
-    sock = wrap(socket.create_connection((PGCAT_HOST, port)))
+    `wrap` can replace the socket, for example to change how it sends.
+    `timeout` bounds each socket operation, from the startup on."""
+    sock = wrap(socket.create_connection((PGCAT_HOST, port), timeout=timeout))
     params = f"user\0sharding_user\0database\0{db}\0\0".encode()
     sock.sendall(struct.pack("!ii", 8 + len(params), 196608) + params)
 

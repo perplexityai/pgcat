@@ -179,6 +179,81 @@ default: 256
 Most plugin hooks that may run at once in the whole process. A hook that finds none free waits
 within its pool's `plugin_hook_timeout`. Read when pgcat starts.
 
+### trace_sample_ratio
+```
+path: general.trace_sample_ratio
+default: 0.0
+```
+
+The share of traced requests whose statements pgcat records as spans, from 0 to 1. Reloadable. 0 turns
+statement tracing off and records nothing; if pgcat starts at 0, no exporter is created. Once tracing
+has been on, setting it back to 0 stops new spans but keeps the exporter until restart.
+
+A client joins a statement to its trace with a leading [sqlcommenter](https://google.github.io/sqlcommenter/)
+comment carrying a [W3C traceparent](https://www.w3.org/TR/trace-context/#traceparent-header):
+
+```sql
+/*application='api',traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'*/ SELECT ...
+```
+
+pgcat reads only `traceparent` (version `00`, lowercase hex, as the comment's only traceparent), and
+only from a comment at the very start of a simple Query or of a Parse; a trailing comment is not read.
+Most sqlcommenter implementations append the comment by default; some can prepend it, e.g. Rails
+`prepend_comment`. A client that appends it gets no spans. `tracestate` is not read. A
+statement gets a span only when its caller sampled the trace (the traceparent's sampled flag) and the
+trace id falls within the ratio, decided as OpenTelemetry's `TraceIdRatioBased` sampler decides, so
+every pgcat at the same ratio keeps the same traces. pgcat starts no traces of its own: every span is
+a child of a traceparent the client sent, and a statement without one isn't traced, except in a case
+listed under Known gaps below.
+
+Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
+caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for its
+batch, so the Executes of a pipelined batch all end at its Sync and share its outcome: if any of them
+fails, all carry the first error. Its attributes are `db.system.name` (`postgresql`),
+`pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`, `pgcat.shard` and `pgcat.protocol`
+(`simple` or `extended`); a failed statement has an error status, `error.type` and, when the server
+sent one, `db.response.status_code` (the SQLSTATE). Statement tracing never puts the statement, its
+comment or parameters in spans, and its own logs don't include them; other pgcat logging is
+unchanged. Batches pgcat answers itself normally have no span (see Known gaps), nor do replies a
+client disconnects before.
+
+Known gaps:
+
+- When a batch pgcat answers itself ends with a Flush, and the client's next message is a lone Sync
+  that pgcat sends to the server to end a transaction it opened at an earlier Flush, that batch's spans
+  end at the Sync's reply, with its time and outcome.
+- A batch the server rejects forgets the prepared statements it traced, including ones the server
+  created, so their later executions have no span until they're parsed again.
+- pgcat sees SQL `DEALLOCATE` and `DISCARD` only in a simple Query it successfully parses, and then
+  forgets every traced statement. Run otherwise, or as a prepared statement, they leave a traced name
+  in place: if SQL `PREPARE` then reuses the name, the new statement is traced under the old one's
+  traceparent.
+- When a simple Query runs while extended-protocol messages wait for their Sync, its reply ends pgcat's
+  record of what those messages traced. If the server then rejects that batch, or pgcat drops it, a
+  statement name the batch reused keeps the batch's traceparent, and the statement still under that
+  name is traced with it.
+
+Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
+and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.
+Export failures are logged when they start and when they stop. The standard `OTEL_BSP_*` variables
+tune the queue, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` the resource (`service.name`
+defaults to `pgcat`). Queued spans are flushed at shutdown, for up to 5 seconds.
+
+### trace_otlp_endpoint
+```
+path: general.trace_otlp_endpoint
+default: <none>
+```
+
+The OTLP/HTTP traces URL statement spans are sent to, e.g. `http://otel-collector:4318/v1/traces`.
+Must be `http://` with a host, a valid port if one is written, and no credentials, query or fragment.
+When not set, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` applies, then
+`http://localhost:4318/v1/traces`; one with credentials, a query or an invalid port gets no spans.
+Read when `trace_sample_ratio` first goes above 0; changing it later takes effect at restart.
+
+pgcat sends only `Host` (from the endpoint) and `Content-Type: application/x-protobuf`; it doesn't
+forward headers from `OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS`.
+
 ### tcp_keepalives_idle
 ```
 path: general.tcp_keepalives_idle
