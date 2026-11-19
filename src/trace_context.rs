@@ -276,11 +276,14 @@ fn check_endpoint_from_env(var: impl Fn(&str) -> Option<String>) -> Result<(), &
     .into_iter()
     .filter_map(var)
     .find(|value| !value.is_empty());
-    match value {
-        Some(value) if value.parse::<hyper::Uri>().is_err() => {
-            Err("the OTLP endpoint from the environment isn't a valid URI")
-        }
-        _ => Ok(()),
+    // "collector:4318" parses as an authority-only URI, which the SDK then
+    // rejects once it appends the signal path: require a scheme and a host.
+    let Some(value) = value else {
+        return Ok(());
+    };
+    match value.parse::<hyper::Uri>() {
+        Ok(uri) if uri.scheme().is_some() && uri.authority().is_some() => Ok(()),
+        _ => Err("the OTLP endpoint from the environment isn't a valid URI"),
     }
 }
 
@@ -1034,6 +1037,8 @@ mod tests {
         assert!(env(None, Some(bad)).is_err());
         assert!(env(Some(""), Some(bad)).is_err());
         assert_eq!(env(Some(good), Some(bad)), Ok(()));
+        assert!(env(None, Some("collector:4318")).is_err());
+        assert!(env(Some("collector:4318"), None).is_err());
         let reason = env(Some(bad), None).unwrap_err();
         assert!(!reason.contains("xq7") && !reason.contains("zv9"));
     }
