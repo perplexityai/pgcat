@@ -237,8 +237,9 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
         .with_protocol(Protocol::HttpBinary)
         .with_timeout(EXPORT_TIMEOUT)
         .with_http_client(client);
-    if let Some(endpoint) = endpoint {
-        builder = builder.with_endpoint(endpoint);
+    match endpoint {
+        Some(endpoint) => builder = builder.with_endpoint(endpoint),
+        None => check_endpoint_from_env(|name| std::env::var(name).ok())?,
     }
     let exporter = builder
         .build()
@@ -261,6 +262,26 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
         tracer,
         endpoint: endpoint.map(String::from),
     })
+}
+
+/// opentelemetry-otlp 0.32 skips an endpoint variable that isn't a valid URI
+/// and falls back to the next one, then to localhost. Refuse it instead, so a
+/// typo leaves tracing off rather than exporting somewhere else. The value
+/// isn't quoted: it isn't validated beyond parsing and may carry a key.
+fn check_endpoint_from_env(var: impl Fn(&str) -> Option<String>) -> Result<(), &'static str> {
+    let value = [
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ]
+    .into_iter()
+    .filter_map(var)
+    .find(|value| !value.is_empty());
+    match value {
+        Some(value) if value.parse::<hyper::Uri>().is_err() => {
+            Err("the OTLP endpoint from the environment isn't a valid URI")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The SDK's resource (OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES), named
@@ -992,6 +1013,30 @@ mod tests {
 
     const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
     const SPAN: &str = "b7ad6b7169203331";
+
+    #[test]
+    fn an_endpoint_from_the_environment_must_be_a_uri() {
+        let env = |traces: Option<&str>, generic: Option<&str>| {
+            let (traces, generic) = (traces.map(String::from), generic.map(String::from));
+            check_endpoint_from_env(move |name| match name {
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => traces.clone(),
+                "OTEL_EXPORTER_OTLP_ENDPOINT" => generic.clone(),
+                _ => None,
+            })
+        };
+        let bad = "http://collector:4318/v1/traces?key=xq7 zv9";
+        let good = "http://collector:4318";
+        assert_eq!(env(None, None), Ok(()));
+        assert_eq!(env(Some(good), None), Ok(()));
+        assert_eq!(env(None, Some(good)), Ok(()));
+        assert!(env(Some(bad), None).is_err());
+        assert!(env(Some(bad), Some(good)).is_err());
+        assert!(env(None, Some(bad)).is_err());
+        assert!(env(Some(""), Some(bad)).is_err());
+        assert_eq!(env(Some(good), Some(bad)), Ok(()));
+        let reason = env(Some(bad), None).unwrap_err();
+        assert!(!reason.contains("xq7") && !reason.contains("zv9"));
+    }
 
     fn statement(comment: &str) -> Vec<u8> {
         format!("{} SELECT 1", comment).into_bytes()
