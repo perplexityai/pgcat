@@ -11,6 +11,7 @@ use sqlparser::ast::{
     Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 use std::sync::Arc;
@@ -109,13 +110,18 @@ fn first_word(query: &str) -> &str {
     }
 }
 
+/// How many times [`runs_string_body`] tokenizes `COPY ... FROM STDIN` data
+/// again before it refuses the query.
+const COPY_DATA_READS: usize = 4;
+
 /// Whether a query has a statement that runs a string as code: `DO`, or
 /// `CREATE [OR REPLACE] FUNCTION` or `PROCEDURE`, whose bodies are strings
 /// the parser doesn't read. One that has one of those words and can't be
 /// tokenized might.
 fn runs_string_body(query: &str) -> bool {
     // Keywords can't be escaped, so a statement can only start with these if
-    // the text has them. That skips tokenizing most long queries.
+    // the text has them. Queries without any of the three substrings skip
+    // tokenizing.
     let has = |word: &[u8]| {
         query
             .as_bytes()
@@ -125,29 +131,63 @@ fn runs_string_body(query: &str) -> bool {
     if !has(b"do") && !has(b"function") && !has(b"procedure") {
         return false;
     }
-    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, query).tokenize() else {
+    let tokenize = |text: &str| Tokenizer::new(&PostgreSqlDialect {}, text).tokenize();
+    let Ok(mut tokens) = tokenize(query) else {
         return true;
     };
+    // The tokenizer reads the lines after `COPY ... FROM STDIN;` as the
+    // COPY's data, up to a `\.` line, and puts them in one token before the
+    // `;`. The server reads them as statements, since COPY data comes in
+    // messages of its own. Data that runs to the end of the query is
+    // tokenized again and put back after the rest of the `;` line, where it
+    // is in the text. Data ended by a `\.` line is refused, since the server
+    // can read that line as part of a comment or string, and so is a query
+    // where this happens more than `COPY_DATA_READS` times, which keeps the
+    // cost linear.
+    let mut reads = 0;
+    while let Some(index) = tokens
+        .iter()
+        .position(|token| matches!(token, Token::CopyData { .. }))
+    {
+        reads += 1;
+        if reads > COPY_DATA_READS {
+            return true;
+        }
+        let Token::CopyData {
+            data,
+            terminated: false,
+        } = tokens.remove(index)
+        else {
+            return true;
+        };
+        let Ok(more) = tokenize(&data) else {
+            return true;
+        };
+        tokens.extend(more);
+    }
     tokens
         .split(|token| *token == Token::SemiColon)
         .any(|statement| {
-            let words: Vec<String> = statement
+            let mut keywords = statement
                 .iter()
                 .filter(|token| !matches!(token, Token::Whitespace(_)))
-                .take(4)
                 .map(|token| match token {
-                    Token::Word(word) if word.quote_style.is_none() => {
-                        word.value.to_ascii_lowercase()
-                    }
-                    _ => String::new(),
-                })
-                .collect();
-            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    // Quoted words have no keyword.
+                    Token::Word(word) => word.keyword,
+                    _ => Keyword::NoKeyword,
+                });
+            let first: [Keyword; 4] =
+                std::array::from_fn(|_| keywords.next().unwrap_or(Keyword::NoKeyword));
             matches!(
-                words.as_slice(),
-                ["do", ..]
-                    | ["create", "function" | "procedure", ..]
-                    | ["create", "or", "replace", "function" | "procedure", ..]
+                first,
+                [Keyword::DO, ..]
+                    | [Keyword::CREATE, Keyword::FUNCTION | Keyword::PROCEDURE, ..]
+                    | [
+                        Keyword::CREATE,
+                        Keyword::OR,
+                        Keyword::REPLACE,
+                        Keyword::FUNCTION | Keyword::PROCEDURE
+                    ]
             )
         })
 }
@@ -3962,9 +4002,55 @@ mod test {
             assert!(qr.rejects_unparsed(&message), "{}", query);
         }
 
+        // The tokenizer reads the lines after `COPY ... FROM STDIN;` as the
+        // COPY's data; the server runs them as statements.
+        let after_copy = [
+            "COPY labels FROM STDIN;\nDO $$ BEGIN RAISE NOTICE 'hi'; END $$",
+            "COPY labels FROM STDIN;\nCREATE FUNCTION f() RETURNS int LANGUAGE sql \
+             AS $$ SELECT 1 $$",
+            "COPY labels FROM STDIN;\nCREATE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$",
+            "COPY labels FROM STDIN;\r\nDO $$ BEGIN PERFORM 1; END $$",
+            "CREATE TEMP TABLE t (); COPY t FROM STDIN;\nDO $$ BEGIN PERFORM 1; END $$",
+            "COPY labels FROM STDIN;\nCOPY other FROM STDIN;\nDO $$ BEGIN PERFORM 1; END $$",
+            "COPY labels FROM STDIN;\nSELECT 1; COPY other FROM STDIN;\n\
+             DO $$ BEGIN PERFORM 1; END $$",
+            // A statement that starts on the `;` line and goes on in the data.
+            "COPY labels FROM STDIN; CREATE\nFUNCTION f() RETURNS int LANGUAGE sql \
+             AS $$ SELECT 1 $$",
+            "COPY labels FROM STDIN; CREATE OR REPLACE\nPROCEDURE p() LANGUAGE sql \
+             AS $$ SELECT 1 $$",
+            // The server reads the `\.` line as part of the comment.
+            "COPY labels FROM STDIN;\n/*\n\\.\nhello */ DO $$ BEGIN PERFORM 1; END $$",
+        ];
+        let deep = "COPY do_log FROM STDIN;\n".repeat(COPY_DATA_READS);
+        let too_deep = "COPY do_log FROM STDIN;\n".repeat(COPY_DATA_READS + 1);
+        for query in after_copy
+            .into_iter()
+            .chain([format!("{too_deep}SELECT 1").as_str()])
+        {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{:?}", query);
+            assert!(qr.rejects_unparsed(&message), "{:?}", query);
+            assert!(
+                qr.rejects_unparsed(&parse_message("", query, &[])),
+                "{:?}",
+                query
+            );
+        }
+        for query in [
+            "COPY do_log FROM STDIN;\nSELECT 1",
+            "COPY do_log FROM STDIN;\nSELECT 'DO $$ $$'",
+            "COPY do_log FROM STDIN;\nCOPY do_log FROM STDIN;\nSELECT 1",
+            format!("{deep}SELECT 1").as_str(),
+        ] {
+            let message = simple_query(query);
+            assert!(qr.parse(&message).is_err(), "{:?}", query);
+            assert!(!qr.rejects_unparsed(&message), "{:?}", query);
+        }
+
         qr.update_pool_settings(&with_gated(vec![]));
-        for query in bodies {
-            assert!(!qr.rejects_unparsed(&simple_query(query)), "{}", query);
+        for query in bodies.into_iter().chain(after_copy) {
+            assert!(!qr.rejects_unparsed(&simple_query(query)), "{:?}", query);
         }
 
         // Without plugins_require_parse they're forwarded, even one whose
@@ -3975,7 +4061,7 @@ mod test {
         qr.update_pool_settings(&settings);
         let names_it = "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql COST 1 \
                         AS $$ SELECT count(*) FROM secrets $$";
-        for query in bodies.into_iter().chain([names_it]) {
+        for query in bodies.into_iter().chain(after_copy).chain([names_it]) {
             let message = simple_query(query);
             assert!(qr.parse(&message).is_err(), "{}", query);
             assert!(!qr.rejects_unparsed(&message), "{}", query);

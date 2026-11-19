@@ -212,11 +212,12 @@ enabled = true
   some tables can return true from `allows_unparsed_outside_gated_tables` to
   keep the table-scoped rule instead: with `plugins_require_parse`, an
   unparsed query is refused only if its text names one of its `gated_tables`
-  (in any case), has a Unicode escape (`U&`), or has a `DO` block or a
-  `CREATE FUNCTION` or `CREATE PROCEDURE` (their bodies are strings), and
-  others are forwarded without its hooks; without it, every unparsed query is
-  forwarded. That check reads the text, so SQL outside those statements that
-  builds a name (`'secr' || 'ets'`) passes it.
+  (in any case), has a Unicode escape (`U&`), or, while `gated_tables` is
+  non-empty, has a `DO` block or a `CREATE FUNCTION` or `CREATE PROCEDURE`
+  (their bodies are strings) or has one of those words and can't be
+  tokenized, and others are forwarded without its hooks; without it, every
+  unparsed query is forwarded. That check reads the text, so SQL outside
+  those statements that builds a name (`'secr' || 'ets'`) passes it.
 - With `plugins_require_parse`, while any table is listed in table access, no
   string body reaches the server. Table access refuses a `CREATE FUNCTION` or
   `CREATE PROCEDURE` it parses whose body is a string (`AS $$...$$` or
