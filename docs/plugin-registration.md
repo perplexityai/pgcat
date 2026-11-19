@@ -122,8 +122,10 @@ library callers and isolated tests. It does not install a process-wide registry.
   follow objects that exist on the server: a view, a parent or partitioned
   table, a function, a rule or a trigger that reaches a listed table is
   allowed by its own name, and names inside strings (a foreign table's
-  `OPTIONS`, `dblink`, `table_to_xml`/`query_to_xml`, a function body given
-  as a string) aren't read. Block those on the server, with privileges.
+  `OPTIONS`, `dblink`, `table_to_xml`/`query_to_xml`) aren't read. Nor is a
+  function body given as a string, which is refused instead with
+  `plugins_require_parse` or a process-wide plugin (below), and forwarded
+  without. Block those on the server, with privileges.
 - A configured plugin that checks rewrites refuses another plugin's final
   rewrite that reaches what it covers (below). SQL that a plan's
   `on_execute_query` hook sends isn't parsed again or checked: plugins are

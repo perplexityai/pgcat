@@ -8,9 +8,11 @@
 //! server. A view, a parent table or partition tree, a function, a rule or a
 //! trigger that reaches a forbidden table is used by its own name, so a
 //! statement naming only it is allowed. Neither does it read names inside
-//! strings: a foreign table's `OPTIONS (table_name '...')`, `dblink`,
-//! `table_to_xml`/`query_to_xml` or a string function body. Block those on
-//! the server, with privileges, if they matter.
+//! strings: a foreign table's `OPTIONS (table_name '...')`, `dblink` or
+//! `table_to_xml`/`query_to_xml`, nor a function body given as a string, which
+//! is refused instead while pgcat requires parsing (`plugins_require_parse`, or
+//! a process-wide plugin) and forwarded otherwise. Block those on the server,
+//! with privileges, if they matter.
 
 use async_trait::async_trait;
 use sqlparser::ast::{
