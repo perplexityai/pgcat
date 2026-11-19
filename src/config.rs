@@ -39,13 +39,19 @@ pub enum Role {
     Mirror,
 }
 
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Primary => "primary",
+            Role::Replica => "replica",
+            Role::Mirror => "mirror",
+        }
+    }
+}
+
 impl std::fmt::Display for Role {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Role::Primary => write!(f, "primary"),
-            Role::Replica => write!(f, "replica"),
-            Role::Mirror => write!(f, "mirror"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -1509,12 +1515,6 @@ impl Config {
             "Statement trace sample ratio: {}",
             self.general.trace_sample_ratio
         );
-        if self.general.trace_sample_ratio > 0.0 {
-            match &self.general.trace_otlp_endpoint {
-                Some(endpoint) => info!("Statement trace OTLP endpoint: {}", endpoint),
-                None => info!("Statement trace OTLP endpoint: from the environment"),
-            }
-        }
         match self.general.tls_certificate.clone() {
             Some(tls_certificate) => {
                 info!("TLS certificate: {}", tls_certificate);
