@@ -12,8 +12,8 @@
 //! At ratio 0, the default, no exporter is built and each client message costs
 //! one atomic load. Spans go to an OTLP/HTTP endpoint through a bounded batch
 //! queue that drops spans when it's full; exporting never delays a statement,
-//! and a failed export only loses spans. Requests carry only content headers:
-//! the SDK's `OTEL_EXPORTER_OTLP_*HEADERS` aren't sent over plain http.
+//! and a failed export only loses spans. Requests carry only pgcat's own
+//! `Host` and `Content-Type`: `OTEL_EXPORTER_OTLP_*HEADERS` aren't forwarded.
 //!
 //! Nothing here logs or exports the comment, the statement, or anything else
 //! the client sent besides the trace and span ids: span attributes are pool,
@@ -24,7 +24,9 @@
 //! pipelined batch all end at its Sync. A batch pgcat answers itself (an
 //! identity command, a checkout failure) gets no ReadyForQuery from a server:
 //! its spans are discarded when the client's next batch starts, as are those
-//! of a client that disconnects before its reply.
+//! of a client that disconnects before its reply. A lone Sync doesn't start a
+//! batch (the server ignores it during COPY), so if pgcat sends one to the
+//! server, its reply ends them instead: a known gap.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,7 +37,8 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, HOST};
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_TYPE, HOST};
+use hyper::http::uri::Authority;
 use hyper_util::rt::TokioIo;
 use log::{error, info, warn};
 use opentelemetry::trace::{
@@ -136,7 +139,23 @@ fn check_endpoint(endpoint: &str) -> Result<(), &'static str> {
     if authority.host().is_empty() {
         return Err("it has no host");
     }
+    port(authority).ok_or("its port isn't valid")?;
     Ok(())
+}
+
+/// The endpoint's port: 80 when none is written, `None` when the written one
+/// isn't valid. The URI parser accepts a port it can't read, such as one past
+/// 65535 or one that isn't a number, and then reports none.
+fn port(authority: &Authority) -> Option<u16> {
+    let written = authority
+        .as_str()
+        .rsplit(']')
+        .next()
+        .is_some_and(|rest| rest.contains(':'));
+    match authority.port_u16() {
+        None if !written => Some(80),
+        port => port,
+    }
 }
 
 /// Applies the tracing settings, at start and at each reload: builds the
@@ -452,6 +471,13 @@ pub struct ClientTraces {
     statements: HashMap<Box<[u8]>, Parent>,
     /// Portals bound to those statements.
     portals: HashMap<Box<[u8]>, Parent>,
+    /// The statements and portals traced since the server's last
+    /// ReadyForQuery. A batch the server rejects may not have created them (a
+    /// Parse of a name in use fails, and the old statement stays), so they're
+    /// forgotten then; past the caps, all of them are.
+    batch_statements: Vec<Box<[u8]>>,
+    batch_portals: Vec<Box<[u8]>>,
+    batch_overflowed: bool,
     /// The spans of the batch in flight, ended by the server's ReadyForQuery.
     pending: Vec<Pending>,
     /// The client ended the pending spans' batch (Query, Sync or Flush). A
@@ -569,7 +595,9 @@ impl ClientTraces {
                 };
                 match traceparent(text).filter(|parent| keeps(ratio, parent)) {
                     Some(parent) => {
-                        insert_bounded(&mut self.statements, name, parent, MAX_STATEMENTS)
+                        insert_bounded(&mut self.statements, name, parent, MAX_STATEMENTS);
+                        self.batch_overflowed |=
+                            !remember(&mut self.batch_statements, name, MAX_STATEMENTS);
                     }
                     None => {
                         self.statements.remove(name);
@@ -582,7 +610,11 @@ impl ClientTraces {
                 };
                 // A statement name too long to track can't be a traced one.
                 match statement.and_then(|statement| self.statements.get(statement).copied()) {
-                    Some(parent) => insert_bounded(&mut self.portals, portal, parent, MAX_PORTALS),
+                    Some(parent) => {
+                        insert_bounded(&mut self.portals, portal, parent, MAX_PORTALS);
+                        self.batch_overflowed |=
+                            !remember(&mut self.batch_portals, portal, MAX_PORTALS);
+                    }
                     None => {
                         self.portals.remove(portal);
                     }
@@ -635,6 +667,24 @@ impl ClientTraces {
         error: bool,
         ready_for_query: bool,
     ) -> Option<Outcome> {
+        if error {
+            if self.batch_overflowed {
+                self.statements.clear();
+                self.portals.clear();
+            } else {
+                for name in &self.batch_statements {
+                    self.statements.remove(name);
+                }
+                for name in &self.batch_portals {
+                    self.portals.remove(name);
+                }
+            }
+        }
+        if error || ready_for_query {
+            self.batch_statements.clear();
+            self.batch_portals.clear();
+            self.batch_overflowed = false;
+        }
         if self.pending.is_empty() {
             return None;
         }
@@ -745,6 +795,18 @@ fn bind_fields(message: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
     Some((portal, name(&body[portal.len() + 1..])))
 }
 
+/// Adds a name to a batch's names; false when they're full.
+fn remember(names: &mut Vec<Box<[u8]>>, name: &[u8], cap: usize) -> bool {
+    if names.iter().any(|known| **known == *name) {
+        return true;
+    }
+    if names.len() >= cap {
+        return false;
+    }
+    names.push(name.into());
+    true
+}
+
 fn insert_bounded(map: &mut HashMap<Box<[u8]>, Parent>, key: &[u8], parent: Parent, cap: usize) {
     if let Some(existing) = map.get_mut(key) {
         *existing = parent;
@@ -848,7 +910,8 @@ async fn send_once(request: Request<Bytes>) -> Result<Response<Bytes>, HttpError
         .host()
         .trim_start_matches('[')
         .trim_end_matches(']');
-    let stream = tokio::net::TcpStream::connect((host, authority.port_u16().unwrap_or(80))).await?;
+    let port = port(&authority).ok_or("the OTLP endpoint's port isn't valid")?;
+    let stream = tokio::net::TcpStream::connect((host, port)).await?;
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
     // The connection task ends with the request: one connection per export,
@@ -859,15 +922,15 @@ async fn send_once(request: Request<Bytes>) -> Result<Response<Bytes>, HttpError
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .parse()?;
-    // Only the headers OTLP/HTTP needs. The SDK adds OTEL_EXPORTER_OTLP_HEADERS
-    // and OTEL_EXPORTER_OTLP_TRACES_HEADERS from the environment, which usually
-    // carry credentials; over plain http they'd go out in clear.
-    let mut headers = HeaderMap::with_capacity(3);
-    for header in [CONTENT_TYPE, CONTENT_ENCODING] {
-        if let Some(value) = parts.headers.remove(&header) {
-            headers.insert(header, value);
-        }
-    }
+    // pgcat's own headers, none of the SDK's: it adds OTEL_EXPORTER_OTLP_HEADERS
+    // and OTEL_EXPORTER_OTLP_TRACES_HEADERS from the environment, over the
+    // ones it sets, and those usually carry credentials. This build has no
+    // compression, so the body is plain protobuf.
+    let mut headers = HeaderMap::with_capacity(2);
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-protobuf"),
+    );
     headers.insert(HOST, HeaderValue::from_str(authority.as_str())?);
     parts.headers = headers;
     let response = sender
@@ -1287,6 +1350,26 @@ mod tests {
             &[parse(&long, "SELECT 1"), bind("", &long), execute("")],
         );
         assert_eq!(traced(&traces), []);
+
+        // The server keeps a statement whose name a rejected Parse reused,
+        // so it isn't traced as the rejected one.
+        run(&mut traces, &[parse("s5", "SELECT 1"), frame(b'S', b"")]);
+        assert_eq!(ready(&mut traces), None);
+        run(
+            &mut traces,
+            &[parse("s5", &sampled_sql(5)), frame(b'S', b"")],
+        );
+        assert_eq!(
+            traces.server_replied(&error_response("42P05"), true, false),
+            None
+        );
+        assert_eq!(ready(&mut traces), None);
+        run(
+            &mut traces,
+            &[bind("", "s5"), execute(""), frame(b'S', b"")],
+        );
+        assert_eq!(traced(&traces), []);
+        assert_eq!(ready(&mut traces), None);
     }
 
     #[test]
@@ -1432,6 +1515,8 @@ mod tests {
             "http://collector:4318/v1/traces?api_key=secret",
             "http://collector:4318?api_key=secret",
             "http://collector:4318/v1/traces#secret",
+            "http://collector:431800/v1/traces",
+            "http://collector:abc/v1/traces",
             "not a url",
         ] {
             assert!(

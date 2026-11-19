@@ -207,13 +207,17 @@ traced: pgcat starts no traces of its own.
 
 Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
 caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for its
-batch, so the Executes of a pipelined batch all end at its Sync. Its attributes are
-`db.system.name` (`postgresql`), `pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`,
-`pgcat.shard` and `pgcat.protocol` (`simple` or `extended`); a failed statement has an error status,
-`error.type` and, when the server sent one, `db.response.status_code` (the SQLSTATE). Spans never
-contain the statement, its comment, or anything else the client sent but the trace context; pgcat
-doesn't log them either. Batches pgcat answers itself, and replies a client disconnects before, have
-no span.
+batch, so the Executes of a pipelined batch all end at its Sync and share its outcome: if any of them
+fails, all carry the first error. Its attributes are `db.system.name` (`postgresql`),
+`pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`, `pgcat.shard` and `pgcat.protocol`
+(`simple` or `extended`); a failed statement has an error status, `error.type` and, when the server
+sent one, `db.response.status_code` (the SQLSTATE). Statement tracing never puts the statement, its
+comment or parameters in spans, and its own logs don't include them; other pgcat logging is
+unchanged. Batches pgcat answers itself, and replies a client disconnects before, have no span.
+
+Known gap: when a batch pgcat answers itself ends with a Flush, and the client's next message is a
+lone Sync that pgcat sends to the server to end a transaction it opened at an earlier Flush, that
+batch's spans end at the Sync's reply, with its time and outcome.
 
 Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
 and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.
@@ -228,14 +232,13 @@ default: <none>
 ```
 
 The OTLP/HTTP traces URL statement spans are sent to, e.g. `http://otel-collector:4318/v1/traces`.
-Must be `http://` with a host, and no credentials, query or fragment. When not set,
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` applies, then
-`http://localhost:4318/v1/traces`; one with credentials or a query gets no spans. Read when
-`trace_sample_ratio` first goes above 0; changing it later takes effect at restart.
+Must be `http://` with a host, a valid port if one is written, and no credentials, query or fragment.
+When not set, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` applies, then
+`http://localhost:4318/v1/traces`; one with credentials, a query or an invalid port gets no spans.
+Read when `trace_sample_ratio` first goes above 0; changing it later takes effect at restart.
 
-Requests carry only `Host`, `Content-Type` and, when set, `Content-Encoding`:
-`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` are not sent, since the endpoint is
-plain http.
+pgcat sends only `Host` (from the endpoint) and `Content-Type: application/x-protobuf`; it doesn't
+forward headers from `OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS`.
 
 ### tcp_keepalives_idle
 ```

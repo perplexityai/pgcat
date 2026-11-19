@@ -101,10 +101,10 @@ class Collector:
         assert content_type == "application/x-protobuf", content_type
         return list(export_spans(body))
 
-    def spans_until(self, trace, timeout=10):
-        """Every span received until one in `trace` arrives."""
+    def spans_until(self, trace, timeout=10, count=1):
+        """Every span received until `count` in `trace` have arrived."""
         deadline = time.monotonic() + timeout
-        while not any(span["trace_id"] == trace for span in self.spans):
+        while sum(span["trace_id"] == trace for span in self.spans) < count:
             self.spans.extend(self.request(timeout=max(0, deadline - time.monotonic())))
         return self.spans
 
@@ -300,7 +300,7 @@ def test_extended_protocol_statements_keep_their_parent(pgcat, collector):
         for _ in range(2):
             conn.execute(comment(prepared).replace("%", "%%") + " SELECT %s::int", (1,), prepare=True)
 
-    spans = collector.spans_until(prepared)
+    spans = collector.spans_until(prepared, count=2)
     assert only(spans, unnamed)["attributes"]["pgcat.protocol"] == "extended"
     executions = [span for span in spans if span["trace_id"] == prepared]
     assert len(executions) == 2, executions
@@ -385,8 +385,7 @@ def test_a_flush_ends_the_span(pgcat, collector):
     # A driver's Flush gets the batch's replies without a Sync: pgcat syncs
     # the server for it, and that ReadyForQuery ends the span.
     trace = new_trace()
-    sock, message = utils.raw_connection(PORT, "shard0")
-    sock.settimeout(10)
+    sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
     try:
         sql = f"{comment(trace)} SELECT 1".encode()
         sock.sendall(
@@ -488,7 +487,9 @@ def test_an_unreachable_collector_never_reaches_statements():
 @pytest.mark.parametrize("variable", ["OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"])
 def test_otlp_headers_from_the_environment_are_not_sent(collector, variable):
     # The usual place for an OTLP credential; pgcat exports over plain http.
-    env = dict(ENV, **{variable: "authorization=secret,x-api-key=secret"})
+    # The SDK lets them replace its own content headers too.
+    headers = "authorization=secret,x-api-key=secret,content-type=sentinel,content-encoding=sentinel"
+    env = dict(ENV, **{variable: headers})
     pgcat = utils.PgcatProcess(config(1, collector.endpoint), PORT, env=env).start()
     try:
         trace = new_trace()
@@ -497,8 +498,8 @@ def test_otlp_headers_from_the_environment_are_not_sent(collector, variable):
     finally:
         pgcat.stop()
     for headers in collector.headers:
-        assert set(headers) <= {"host", "content-type", "content-length", "content-encoding"}, headers
-        assert "secret" not in headers.values(), headers
+        assert set(headers) == {"host", "content-type", "content-length"}, headers
+        assert headers["content-type"] == "application/x-protobuf", headers
 
 
 def test_a_bad_endpoint_from_the_environment_isnt_logged(collector):
