@@ -202,8 +202,9 @@ Most sqlcommenter implementations append the comment by default; some can prepen
 `prepend_comment`. A client that appends it gets no spans. `tracestate` is not read. A
 statement gets a span only when its caller sampled the trace (the traceparent's sampled flag) and the
 trace id falls within the ratio, decided as OpenTelemetry's `TraceIdRatioBased` sampler decides, so
-every pgcat at the same ratio keeps the same traces. Statements without such a traceparent are never
-traced: pgcat starts no traces of its own.
+every pgcat at the same ratio keeps the same traces. pgcat starts no traces of its own: every span is
+a child of a traceparent the client sent, and a statement without one isn't traced, except in a case
+listed under Known gaps below.
 
 Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
 caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for its
@@ -213,11 +214,20 @@ fails, all carry the first error. Its attributes are `db.system.name` (`postgres
 (`simple` or `extended`); a failed statement has an error status, `error.type` and, when the server
 sent one, `db.response.status_code` (the SQLSTATE). Statement tracing never puts the statement, its
 comment or parameters in spans, and its own logs don't include them; other pgcat logging is
-unchanged. Batches pgcat answers itself, and replies a client disconnects before, have no span.
+unchanged. Batches pgcat answers itself normally have no span (see Known gaps), nor do replies a
+client disconnects before.
 
-Known gap: when a batch pgcat answers itself ends with a Flush, and the client's next message is a
-lone Sync that pgcat sends to the server to end a transaction it opened at an earlier Flush, that
-batch's spans end at the Sync's reply, with its time and outcome.
+Known gaps:
+
+- When a batch pgcat answers itself ends with a Flush, and the client's next message is a lone Sync
+  that pgcat sends to the server to end a transaction it opened at an earlier Flush, that batch's spans
+  end at the Sync's reply, with its time and outcome.
+- A batch the server rejects forgets the prepared statements it traced, including ones the server
+  created, so their later executions have no span until they're parsed again.
+- pgcat sees SQL `DEALLOCATE` and `DISCARD` only in a simple Query it parses (with
+  `query_parser_enabled` on), and then forgets every traced statement. Run otherwise, or as a prepared
+  statement, they leave a traced name in place: if SQL `PREPARE` then reuses the name, the new
+  statement is traced under the old one's traceparent.
 
 Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
 and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.

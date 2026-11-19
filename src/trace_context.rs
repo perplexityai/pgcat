@@ -7,7 +7,8 @@
 //! trace, keeping `trace_sample_ratio` of those traces. The decision is
 //! `TraceIdRatioBased`'s, made on the trace id, so every pgcat keeps or drops
 //! a given trace alike. A statement without a traceparent, or whose caller
-//! didn't sample it, is never traced: pgcat starts no traces of its own.
+//! didn't sample it, isn't traced, except in the known gaps `CONFIG.md`
+//! lists: pgcat starts no traces of its own.
 //!
 //! At ratio 0, the default, no exporter is built and each client message costs
 //! one atomic load. Spans go to an OTLP/HTTP endpoint through a bounded batch
@@ -21,12 +22,13 @@
 //!
 //! A span starts when pgcat reads the Query or Execute and ends when the
 //! server's ReadyForQuery for its batch arrives, so the Executes of one
-//! pipelined batch all end at its Sync. A batch pgcat answers itself (an
-//! identity command, a checkout failure) gets no ReadyForQuery from a server:
-//! its spans are discarded when the client's next batch starts, as are those
-//! of a client that disconnects before its reply. A lone Sync doesn't start a
-//! batch (the server ignores it during COPY), so if pgcat sends one to the
-//! server, its reply ends them instead: a known gap.
+//! pipelined batch all end at its Sync. A batch pgcat drops without sending it
+//! (a plugin refused it, or no server could be checked out) is forgotten with
+//! its statements. One pgcat answers itself (an identity command) gets no
+//! ReadyForQuery from a server: its spans are discarded when the client's next
+//! batch starts, as are those of a client that disconnects before its reply.
+//! A lone Sync doesn't start a batch (the server ignores it during COPY), so
+//! if pgcat sends one to the server, its reply ends them instead: a known gap.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -473,8 +475,8 @@ pub struct ClientTraces {
     portals: HashMap<Box<[u8]>, Parent>,
     /// The statements and portals traced since the server's last
     /// ReadyForQuery. A batch the server rejects may not have created them (a
-    /// Parse of a name in use fails, and the old statement stays), so they're
-    /// forgotten then; past the caps, all of them are.
+    /// Parse of a name in use fails, and the old statement stays), nor one
+    /// pgcat drops, so they're forgotten then; past the caps, all of them are.
     batch_statements: Vec<Box<[u8]>>,
     batch_portals: Vec<Box<[u8]>>,
     batch_overflowed: bool,
@@ -557,6 +559,22 @@ pub fn server_failed(
         if let Some(outcome) = traces.server_failed(error_type) {
             traces.export(outcome, address);
         }
+    }
+}
+
+/// pgcat dropped the client's buffered batch without sending it: what it
+/// parsed and bound doesn't exist, and no reply will end its spans.
+pub fn batch_dropped(traces: &mut Option<Box<ClientTraces>>) {
+    if let Some(traces) = traces.as_deref_mut() {
+        traces.batch_dropped();
+    }
+}
+
+/// A simple Query runs SQL `DEALLOCATE` or `DISCARD`, which share protocol
+/// statements' names: a later SQL `PREPARE` can reuse one.
+pub fn statements_discarded(traces: &mut Option<Box<ClientTraces>>) {
+    if let Some(traces) = traces.as_deref_mut() {
+        traces.statements_discarded();
     }
 }
 
@@ -667,23 +685,8 @@ impl ClientTraces {
         error: bool,
         ready_for_query: bool,
     ) -> Option<Outcome> {
-        if error {
-            if self.batch_overflowed {
-                self.statements.clear();
-                self.portals.clear();
-            } else {
-                for name in &self.batch_statements {
-                    self.statements.remove(name);
-                }
-                for name in &self.batch_portals {
-                    self.portals.remove(name);
-                }
-            }
-        }
         if error || ready_for_query {
-            self.batch_statements.clear();
-            self.batch_portals.clear();
-            self.batch_overflowed = false;
+            self.end_batch(error);
         }
         if self.pending.is_empty() {
             return None;
@@ -708,6 +711,35 @@ impl ClientTraces {
             };
         }
         Some(outcome)
+    }
+
+    fn batch_dropped(&mut self) {
+        self.end_batch(true);
+        self.discard();
+    }
+
+    fn statements_discarded(&mut self) {
+        self.statements.clear();
+        self.portals.clear();
+    }
+
+    /// Stops tracking what the batch traced, first forgetting it when the
+    /// batch may not have created it; past the caps, everything is.
+    fn end_batch(&mut self, forget: bool) {
+        if forget && self.batch_overflowed {
+            self.statements.clear();
+            self.portals.clear();
+        } else if forget {
+            for name in &self.batch_statements {
+                self.statements.remove(name);
+            }
+            for name in &self.batch_portals {
+                self.portals.remove(name);
+            }
+        }
+        self.batch_statements.clear();
+        self.batch_portals.clear();
+        self.batch_overflowed = false;
     }
 
     fn discard(&mut self) {
@@ -1370,6 +1402,41 @@ mod tests {
         );
         assert_eq!(traced(&traces), []);
         assert_eq!(ready(&mut traces), None);
+
+        // Nor as one in a batch pgcat dropped without sending it.
+        run(&mut traces, &[parse("s6", "SELECT 1"), frame(b'S', b"")]);
+        assert_eq!(ready(&mut traces), None);
+        run(
+            &mut traces,
+            &[parse("s6", &sampled_sql(6)), frame(b'S', b"")],
+        );
+        traces.batch_dropped();
+        run(
+            &mut traces,
+            &[bind("", "s6"), execute(""), frame(b'S', b"")],
+        );
+        assert_eq!(traced(&traces), []);
+        assert_eq!(ready(&mut traces), None);
+    }
+
+    #[test]
+    fn sql_deallocate_forgets_traced_statements() {
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s1", &sampled_sql(1)),
+                bind("p1", "s1"),
+                frame(b'S', b""),
+            ],
+        );
+        assert_eq!(ready(&mut traces), None);
+        traces.statements_discarded();
+        run(
+            &mut traces,
+            &[bind("", "s1"), execute(""), execute("p1"), frame(b'S', b"")],
+        );
+        assert_eq!(traced(&traces), []);
     }
 
     #[test]

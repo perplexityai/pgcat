@@ -2808,8 +2808,12 @@ where
                     pool.relation_attempt(relations, self.caller());
                 }
             }
+            let invalidate = sql_observer::invalidation(&ast);
+            if invalidate == sql_observer::Invalidate::Both {
+                trace_context::statements_discarded(&mut self.traces);
+            }
             if let Some(observer) = self.observer.as_deref_mut() {
-                observer.admit_query(QueryAdmission::Parsed(sql_observer::invalidation(&ast)));
+                observer.admit_query(QueryAdmission::Parsed(invalidate));
             }
         }
 
@@ -4726,6 +4730,7 @@ where
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.reject_batch();
         }
+        trace_context::batch_dropped(&mut self.traces);
 
         self.buffer.clear();
         self.extended_protocol_data_buffer.clear();

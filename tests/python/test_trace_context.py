@@ -113,6 +113,14 @@ class Collector:
         self.server.server_close()
 
 
+@pytest.fixture(autouse=True)
+def no_inherited_otel(monkeypatch):
+    # pgcat inherits the runner's environment, where an OTEL_SERVICE_NAME
+    # would change the spans checked here. A test's own go through `env`.
+    for name in [name for name in os.environ if name.startswith("OTEL_")]:
+        monkeypatch.delenv(name)
+
+
 @pytest.fixture
 def collector():
     collector = Collector()
