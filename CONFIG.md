@@ -403,8 +403,9 @@ names then share server connections without that extra round trip at checkout. I
 changes the name on the server (`SET application_name`, `set_config()`), pgcat sets `pgcat` back
 the next time the connection is checked out, so in transaction mode the change lasts until the
 end of the client's transaction. The name the client connected with is still what pgcat uses
-for its client stats, `SHOW CLIENTS`, `SHOW SERVERS` and logs. The other tracked parameters
-(`TimeZone`, `client_encoding`, ...) are synced either way.
+for `SHOW CLIENTS` and logs; `SHOW SERVERS` shows the client's current name, which follows the
+client's own `SET application_name`. The other tracked parameters (`TimeZone`,
+`client_encoding`, ...) are synced either way.
 
 A reload that changes the setting recreates the pool, as for other pool settings. Each client
 switches to the new pool when it next takes a server connection; a session-mode client keeps

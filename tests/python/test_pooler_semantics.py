@@ -342,6 +342,10 @@ def test_application_name_not_synced_when_off(pgcat):
         assert server_application_name(app_b) == "pgcat"
         assert application_name_sets(su) == 1
 
+        app_a.execute("SET application_name TO 'x'")
+        assert server_application_name(app_b) == "pgcat"
+        assert application_name_sets(su) == 2  # the client's own SET; pgcat sent no reset
+
         with admin(pgcat) as console:
             cur = console.execute("SHOW CLIENTS")
             columns = [c.name for c in cur.description]
