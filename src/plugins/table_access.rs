@@ -453,19 +453,14 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
+    const SECRETS: &[&str] = &["secrets"];
+
+    /// Whether table access refuses `sql` with only `secrets` listed.
     async fn refused(sql: &str) -> bool {
-        refused_by(&QueryRouter::new(), sql).await
+        refused_by(&QueryRouter::new(), SECRETS, sql).await
     }
 
-    async fn refused_by(router: &QueryRouter, sql: &str) -> bool {
-        refused_by_with(router, &["secrets"], sql).await
-    }
-
-    async fn refused_with(tables: &[&str], sql: &str) -> bool {
-        refused_by_with(&QueryRouter::new(), tables, sql).await
-    }
-
-    async fn refused_by_with(router: &QueryRouter, tables: &[&str], sql: &str) -> bool {
+    async fn refused_by(router: &QueryRouter, tables: &[&str], sql: &str) -> bool {
         let tables = tables.iter().map(|table| table.to_string()).collect();
         let mut plugin = TableAccess {
             enabled: true,
@@ -516,7 +511,7 @@ mod tests {
             "SELECT 1; CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
         ];
         for sql in string_bodies {
-            assert!(refused_by(&strict, sql).await, "{}", sql);
+            assert!(refused_by(&strict, SECRETS, sql).await, "{}", sql);
             // Without plugins_require_parse, table access checks names only.
             assert!(!refused(sql).await, "{}", sql);
         }
@@ -528,7 +523,7 @@ mod tests {
             "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql BEGIN ATOMIC \
              SELECT count(*) FROM secrets; END",
         ] {
-            assert!(refused_by(&strict, sql).await, "{}", sql);
+            assert!(refused_by(&strict, SECRETS, sql).await, "{}", sql);
             assert!(refused(sql).await, "{}", sql);
         }
 
@@ -539,24 +534,12 @@ mod tests {
              SELECT count(*) FROM other; END",
             "CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; END",
         ] {
-            assert!(!refused_by(&strict, sql).await, "{}", sql);
+            assert!(!refused_by(&strict, SECRETS, sql).await, "{}", sql);
         }
 
         // Nothing to protect, nothing refused.
-        let tables = vec![];
-        let mut plugin = TableAccess {
-            enabled: true,
-            tables: &tables,
-        };
-        let ast = Parser::parse_sql(
-            &PostgreSqlDialect {},
-            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
-        )
-        .unwrap();
-        assert_eq!(
-            plugin.run(&strict, &ast).await.unwrap(),
-            PluginOutput::Allow
-        );
+        let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'";
+        assert!(!refused_by(&strict, &[], sql).await);
     }
 
     #[tokio::test]
@@ -641,16 +624,7 @@ mod tests {
         // A table named like an option is one when it's quoted.
         assert!(!refused(r#"VACUUM "verbose""#).await);
 
-        let tables = vec![];
-        let mut plugin = TableAccess {
-            enabled: true,
-            tables: &tables,
-        };
-        let ast = Parser::parse_sql(&PostgreSqlDialect {}, "VACUUM FULL").unwrap();
-        assert!(matches!(
-            plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
-            PluginOutput::Allow
-        ));
+        assert!(!refused_by(&QueryRouter::new(), &[], "VACUUM FULL").await);
     }
 
     #[tokio::test]
@@ -752,7 +726,11 @@ mod tests {
             "CREATE FOREIGN TABLE c (LIKE json) SERVER s",
             "CREATE FOREIGN TABLE c (a int, LIKE timestamptz) SERVER s",
         ] {
-            assert!(refused_with(&tables, sql).await, "{}", sql);
+            assert!(
+                refused_by(&QueryRouter::new(), &tables, sql).await,
+                "{}",
+                sql
+            );
         }
         // A quoted "like" is a column, and a column of a type isn't a table.
         for sql in [
@@ -760,7 +738,11 @@ mod tests {
             "CREATE TABLE c (a json, b string, c timestamptz)",
             "CREATE TABLE c (a int, LIKE text)",
         ] {
-            assert!(!refused_with(&tables, sql).await, "{}", sql);
+            assert!(
+                !refused_by(&QueryRouter::new(), &tables, sql).await,
+                "{}",
+                sql
+            );
         }
 
         // Each type name the parser knows prints as the word it read, so a
@@ -777,7 +759,11 @@ mod tests {
                 }
             }
             let table = word.to_ascii_lowercase();
-            assert!(refused_with(&[table.as_str()], &sql).await, "{}", sql);
+            assert!(
+                refused_by(&QueryRouter::new(), &[table.as_str()], &sql).await,
+                "{}",
+                sql
+            );
         }
         assert!(types > 50, "{}", types);
     }
@@ -807,24 +793,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_every_table_grants_are_refused_only_with_a_forbidden_table() {
-        let tables = vec![];
-        let mut plugin = TableAccess {
-            enabled: true,
-            tables: &tables,
-        };
         for sql in [
             "GRANT SELECT ON ALL TABLES IN SCHEMA public TO r",
             "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC",
         ] {
-            let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-            assert!(
-                matches!(
-                    plugin.run(&QueryRouter::new(), &ast).await.unwrap(),
-                    PluginOutput::Allow
-                ),
-                "{}",
-                sql
-            );
+            assert!(!refused_by(&QueryRouter::new(), &[], sql).await, "{}", sql);
         }
     }
 
