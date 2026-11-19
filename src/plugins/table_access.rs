@@ -16,11 +16,10 @@
 
 use async_trait::async_trait;
 use sqlparser::ast::{
-    visit_relations, visit_statements, AlterIndexOperation, AlterTableOperation,
-    AlterViewOperation, ColumnDef, ColumnOption, CommentObject, CopySource, CreateFunction,
-    CreateFunctionBody, CreateProcedureBody, CreateTableLikeKind, DataType, Expr, GrantObjects,
-    Ident, ObjectName, ObjectType, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint,
-    VacuumStatement, Visit, Visitor,
+    AlterIndexOperation, AlterTableOperation, AlterViewOperation, ColumnDef, ColumnOption,
+    CommentObject, CopySource, CreateFunction, CreateFunctionBody, CreateProcedureBody,
+    CreateTableLikeKind, DataType, Expr, GrantObjects, Ident, ObjectName, ObjectType, Query,
+    RenameTableNameKind, SetExpr, Statement, TableConstraint, VacuumStatement, Visit, Visitor,
 };
 use std::borrow::Cow;
 
@@ -46,55 +45,35 @@ impl<'a> Plugin for TableAccess<'a> {
         query_router: &QueryRouter,
         ast: &Vec<Statement>,
     ) -> Result<PluginOutput, Error> {
-        if !self.enabled {
+        // With no table listed, there's nothing to refuse.
+        if !self.enabled || self.tables.is_empty() {
             return Ok(PluginOutput::Allow);
         }
 
-        let mut found = None;
-        let _ = visit_relations(ast, |relation| {
-            found = self.forbidden(relation);
-            match found {
-                Some(_) => ControlFlow::<()>::Break(()),
-                None => ControlFlow::<()>::Continue(()),
-            }
-        });
+        let mut check = Check {
+            access: self,
+            every_table: None,
+            string_body: false,
+        };
+        if let ControlFlow::Break(table) = ast.visit(&mut check) {
+            debug!("Blocking access to table \"{}\"", table);
 
-        // `visit_relations` doesn't visit the names in `unvisited_names`, in
-        // any statement, nested ones too.
-        let found = found.or_else(|| {
-            let mut found = None;
-            let _ = visit_statements(ast, |statement| {
-                found = unvisited_names(statement)
-                    .iter()
-                    .find_map(|name| self.forbidden_name(name));
-                match found {
-                    Some(_) => ControlFlow::<()>::Break(()),
-                    None => ControlFlow::<()>::Continue(()),
-                }
-            });
-            found
-        });
-
-        // Nor the tables `SELECT ... INTO` creates or `TABLE t` reads, in any
-        // query.
-        let found = found.or_else(|| {
-            let mut names = QueryNames(Vec::new());
-            let _ = ast.visit(&mut names);
-            names.0.iter().find_map(|name| self.forbidden_name(name))
-        });
+            return Ok(PluginOutput::Deny(format!(
+                "permission for table \"{}\" denied",
+                table
+            )));
+        }
 
         // A VACUUM without a table processes every table, and a GRANT or
-        // REVOKE on all tables in a schema every table there: forbidden ones
+        // REVOKE on all tables in a schema every table there: listed ones
         // too.
-        if found.is_none() && !self.tables.is_empty() {
-            if let Some(every) = every_table(ast) {
-                debug!("Blocking {}", every);
+        if let Some(every) = check.every_table {
+            debug!("Blocking {}", every);
 
-                return Ok(PluginOutput::Deny(format!(
-                    "permission for {} denied",
-                    every
-                )));
-            }
+            return Ok(PluginOutput::Deny(format!(
+                "permission for {} denied",
+                every
+            )));
         }
 
         // A function body given as a string isn't parsed, so the tables it
@@ -102,11 +81,7 @@ impl<'a> Plugin for TableAccess<'a> {
         // is, above. The refusal comes with plugins_require_parse, which also
         // refuses the bodies the parser can't read (`DO`, a function with an
         // option it doesn't know). Without it, table access checks names only.
-        if found.is_none()
-            && !self.tables.is_empty()
-            && query_router.plugins_require_parse()
-            && has_string_body(ast)
-        {
+        if check.string_body && query_router.plugins_require_parse() {
             debug!("Blocking a function body given as a string");
 
             return Ok(PluginOutput::Deny(
@@ -114,21 +89,56 @@ impl<'a> Plugin for TableAccess<'a> {
             ));
         }
 
-        if let Some(found) = found {
-            debug!("Blocking access to table \"{}\"", found);
-
-            Ok(PluginOutput::Deny(format!(
-                "permission for table \"{}\" denied",
-                found
-            )))
-        } else {
-            Ok(PluginOutput::Allow)
-        }
+        Ok(PluginOutput::Allow)
     }
 }
 
+/// One walk over every statement, nested ones included. It breaks with the
+/// first listed table a statement names, and notes the refusals that don't
+/// name one.
+struct Check<'s, 't> {
+    access: &'s TableAccess<'t>,
+    /// The first statement that processes every table.
+    every_table: Option<&'static str>,
+    /// Whether a statement creates a function body given as a string.
+    string_body: bool,
+}
+
+impl Visitor for Check<'_, '_> {
+    type Break = String;
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<String> {
+        refuse(self.access.forbidden(relation))
+    }
+
+    /// The names `pre_visit_relation` doesn't see: see `unvisited_names`.
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<String> {
+        self.every_table = self.every_table.or(every_table(statement));
+        self.string_body |= has_string_body(statement);
+        refuse(
+            unvisited_names(statement)
+                .iter()
+                .find_map(|name| self.access.forbidden_name(name)),
+        )
+    }
+
+    /// Nor the tables `SELECT ... INTO` creates or `TABLE t` reads.
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<String> {
+        refuse(
+            query_names(&query.body)
+                .into_iter()
+                .find_map(|name| self.access.forbidden_name(name)),
+        )
+    }
+}
+
+/// Breaks with a listed table's name, if there is one.
+fn refuse(table: Option<String>) -> ControlFlow<String> {
+    table.map_or(ControlFlow::Continue(()), ControlFlow::Break)
+}
+
 /// The last part of each name a statement has for a table that
-/// `visit_relations` doesn't visit. The match lists the statements that have
+/// `pre_visit_relation` doesn't see. The match lists the statements that have
 /// one, by field:
 ///
 /// - `COPY t` and `VACUUM t`;
@@ -325,78 +335,60 @@ fn last_part(name: &ObjectName) -> Option<&Ident> {
     name.0.last()?.as_ident()
 }
 
-/// The tables `SELECT ... INTO` creates and `TABLE t` reads, in every query:
-/// neither is an `ObjectName`, so `visit_relations` doesn't visit them.
-struct QueryNames(Vec<Ident>);
-
-impl QueryNames {
-    fn body(&mut self, body: &SetExpr) {
-        match body {
-            SetExpr::Select(select) => {
-                let targets = select.into.iter().flat_map(|into| &into.targets);
-                self.0.extend(targets.filter_map(|target| match target {
-                    Expr::Identifier(ident) => Some(ident.clone()),
-                    Expr::CompoundIdentifier(parts) => parts.last().cloned(),
-                    _ => None,
-                }));
-            }
-            SetExpr::Table(table) => self.0.extend(table.table_name.clone()),
-            SetExpr::SetOperation { left, right, .. } => {
-                self.body(left);
-                self.body(right);
-            }
-            // A nested query is visited on its own.
-            _ => (),
+/// The tables `SELECT ... INTO` creates and `TABLE t` reads in a query's
+/// body: neither is an `ObjectName`, so `pre_visit_relation` doesn't see
+/// them. A nested query is visited on its own.
+fn query_names(body: &SetExpr) -> Vec<&Ident> {
+    match body {
+        SetExpr::Select(select) => select
+            .into
+            .iter()
+            .flat_map(|into| &into.targets)
+            .filter_map(|target| match target {
+                Expr::Identifier(ident) => Some(ident),
+                Expr::CompoundIdentifier(parts) => parts.last(),
+                _ => None,
+            })
+            .collect(),
+        SetExpr::Table(table) => table.table_name.iter().collect(),
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut names = query_names(left);
+            names.extend(query_names(right));
+            names
         }
+        _ => Vec::new(),
     }
 }
 
-impl Visitor for QueryNames {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        self.body(&query.body);
-        ControlFlow::Continue(())
-    }
-}
-
-/// The statement that processes every table, in any statement: a VACUUM
+/// What a statement processes every table with, if it does: a VACUUM
 /// without a table, or a GRANT or REVOKE on all tables in a schema.
-fn every_table(ast: &Vec<Statement>) -> Option<&'static str> {
-    let mut every = None;
-    let _ = visit_statements(ast, |statement| {
-        every = match statement {
-            Statement::Vacuum(vacuum) if vacuum_target(vacuum).is_none() => {
-                Some("VACUUM of every table")
-            }
-            Statement::Grant(grant)
-                if matches!(grant.objects, Some(GrantObjects::AllTablesInSchema { .. })) =>
-            {
-                Some("GRANT on every table in a schema")
-            }
-            Statement::Revoke(revoke)
-                if matches!(revoke.objects, Some(GrantObjects::AllTablesInSchema { .. })) =>
-            {
-                Some("REVOKE on every table in a schema")
-            }
-            _ => None,
-        };
-        match every {
-            Some(_) => ControlFlow::<()>::Break(()),
-            None => ControlFlow::<()>::Continue(()),
+fn every_table(statement: &Statement) -> Option<&'static str> {
+    match statement {
+        Statement::Vacuum(vacuum) if vacuum_target(vacuum).is_none() => {
+            Some("VACUUM of every table")
         }
-    });
-    every
+        Statement::Grant(grant)
+            if matches!(grant.objects, Some(GrantObjects::AllTablesInSchema { .. })) =>
+        {
+            Some("GRANT on every table in a schema")
+        }
+        Statement::Revoke(revoke)
+            if matches!(revoke.objects, Some(GrantObjects::AllTablesInSchema { .. })) =>
+        {
+            Some("REVOKE on every table in a schema")
+        }
+        _ => None,
+    }
 }
 
-/// Whether a statement, or one nested in it, creates a function or procedure
-/// whose body isn't parsed SQL. A `RETURN` or `BEGIN ATOMIC` body is parsed,
-/// and its tables are checked like any statement's. In Postgres every other
-/// body is a string, `AS 'body'` or `AS $$body$$`, in any language, an object
-/// file's too. Any other form the parser gives, or none, counts as one, so a
-/// form it learns later isn't allowed unread.
-fn has_string_body(ast: &Vec<Statement>) -> bool {
-    visit_statements(ast, |statement| match statement {
+/// Whether a statement creates a function or procedure whose body isn't
+/// parsed SQL. A `RETURN` or `BEGIN ATOMIC` body is parsed, and its tables
+/// are checked like any statement's. In Postgres every other body is a
+/// string, `AS 'body'` or `AS $$body$$`, in any language, an object file's
+/// too. Any other form the parser gives, or none, counts as one, so a form it
+/// learns later isn't allowed unread.
+fn has_string_body(statement: &Statement) -> bool {
+    match statement {
         Statement::CreateFunction(CreateFunction {
             function_body: Some(CreateFunctionBody::Return(_) | CreateFunctionBody::BeginAtomic(_)),
             ..
@@ -404,11 +396,10 @@ fn has_string_body(ast: &Vec<Statement>) -> bool {
         | Statement::CreateProcedure {
             body: CreateProcedureBody::BeginAtomic(_),
             ..
-        } => ControlFlow::Continue(()),
-        Statement::CreateFunction(_) | Statement::CreateProcedure { .. } => ControlFlow::Break(()),
-        _ => ControlFlow::Continue(()),
-    })
-    .is_break()
+        } => false,
+        Statement::CreateFunction(_) | Statement::CreateProcedure { .. } => true,
+        _ => false,
+    }
 }
 
 /// The table a VACUUM processes, or `None` when it processes every table.
