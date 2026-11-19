@@ -524,6 +524,65 @@ def test_a_bad_endpoint_from_the_environment_isnt_logged(collector):
     assert "xq7" not in logs and "zv9" not in logs, logs
 
 
+def unused_endpoint():
+    with socket.socket() as unused:
+        unused.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{unused.getsockname()[1]}"
+
+
+def collector_base(collector):
+    return collector.endpoint.removesuffix("/v1/traces")
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [
+        # The generic endpoint gets the signal path, with or without a slash.
+        lambda collector: {"OTEL_EXPORTER_OTLP_ENDPOINT": collector_base(collector)},
+        lambda collector: {"OTEL_EXPORTER_OTLP_ENDPOINT": collector_base(collector) + "/"},
+        # The traces endpoint is used as is and wins over the generic one;
+        # an empty one counts as unset.
+        lambda collector: {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": collector.endpoint,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": unused_endpoint(),
+        },
+        lambda collector: {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": collector_base(collector),
+        },
+    ],
+)
+def test_the_environment_endpoint_resolves_in_protocol_order(collector, variables):
+    env = dict(ENV, **variables(collector))
+    pgcat = utils.PgcatProcess(config(1, None), PORT, env=env).start()
+    try:
+        trace = new_trace()
+        run(pgcat, f"{comment(trace)} SELECT 1")
+        # The collector checks the request path is /v1/traces.
+        only(collector.spans_until(trace), trace)
+    finally:
+        pgcat.stop()
+
+
+@pytest.mark.skipif(not os.supports_bytes_environ, reason="needs a bytes environment")
+def test_a_non_unicode_traces_endpoint_isnt_skipped(collector):
+    # The generic endpoint would work, but the traces one is set: tracing stays off.
+    env = dict(ENV, OTEL_EXPORTER_OTLP_ENDPOINT=collector_base(collector))
+    pgcat = utils.PgcatProcess(config(1, None), PORT, env=env)
+    os.environb[b"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = b"http://127.0.0.1/\xff"
+    try:
+        pgcat.start()
+        try:
+            run(pgcat, f"{comment(new_trace())} SELECT 1")
+            logs = pgcat.logs()
+        finally:
+            pgcat.stop()
+    finally:
+        del os.environb[b"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
+    assert "Statement tracing stays off" in logs, logs
+    assert collector.requests.empty()
+
+
 def test_shutdown_flushes_queued_spans(collector):
     # A long export interval: only the shutdown flush sends this span.
     env = {"OTEL_BSP_SCHEDULE_DELAY": "60000"}

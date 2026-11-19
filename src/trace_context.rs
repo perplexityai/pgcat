@@ -237,9 +237,12 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
         .with_protocol(Protocol::HttpBinary)
         .with_timeout(EXPORT_TIMEOUT)
         .with_http_client(client);
-    if let Some(endpoint) = endpoint {
-        builder = builder.with_endpoint(endpoint);
-    }
+    // The SDK reads an endpoint from the environment only when none is given,
+    // so resolving it here means 0.32's fallbacks never apply.
+    builder = match endpoint {
+        Some(endpoint) => builder.with_endpoint(endpoint),
+        None => builder.with_endpoint(endpoint_from_env(|name| std::env::var_os(name))?),
+    };
     let exporter = builder
         .build()
         .map_err(|_| "the OTLP exporter can't be built from the endpoint settings")?;
@@ -261,6 +264,48 @@ fn build(endpoint: Option<&str>) -> Result<Exporter, &'static str> {
         tracer,
         endpoint: endpoint.map(String::from),
     })
+}
+
+const TRACES_ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+const ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const DEFAULT_ENDPOINT: &str = "http://localhost:4318";
+const TRACES_PATH: &str = "/v1/traces";
+
+/// The OTLP/HTTP traces URL the environment gives, resolved as
+/// opentelemetry-otlp 0.33 does (the OTLP exporter spec's order): the traces
+/// variable as is, else the generic one with `/v1/traces` appended, else
+/// localhost. An empty variable counts as unset. 0.32 instead skips a value
+/// that isn't Unicode or a valid URI and falls back to the next, and turns an
+/// empty generic one into the relative `/v1/traces`; resolving here keeps a
+/// typo from exporting somewhere else. Errors don't quote the value: it isn't
+/// validated beyond parsing and may carry a key.
+fn endpoint_from_env(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<String, &'static str> {
+    let read = |name: &str| match var(name).map(std::ffi::OsString::into_string) {
+        None => Ok(None),
+        Some(Ok(value)) if value.is_empty() => Ok(None),
+        Some(Ok(value)) => Ok(Some(value)),
+        Some(Err(_)) => Err("the OTLP endpoint from the environment isn't valid Unicode"),
+    };
+    let endpoint = match read(TRACES_ENDPOINT_VAR)? {
+        Some(traces) => traces,
+        None => with_traces_path(&read(ENDPOINT_VAR)?.unwrap_or_else(|| DEFAULT_ENDPOINT.into())),
+    };
+    // "collector:4318" parses as an authority-only URI: require a scheme and a
+    // host.
+    match endpoint.parse::<hyper::Uri>() {
+        Ok(uri) if uri.scheme().is_some() && uri.authority().is_some() => Ok(endpoint),
+        _ => Err("the OTLP endpoint from the environment isn't a valid URI"),
+    }
+}
+
+/// `/v1/traces` appended to a base endpoint, with one slash between them.
+fn with_traces_path(base: &str) -> String {
+    match base.strip_suffix('/') {
+        Some(base) => format!("{}{}", base, TRACES_PATH),
+        None => format!("{}{}", base, TRACES_PATH),
+    }
 }
 
 /// The SDK's resource (OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES), named
@@ -992,6 +1037,100 @@ mod tests {
 
     const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
     const SPAN: &str = "b7ad6b7169203331";
+
+    fn resolve(traces: Option<&str>, generic: Option<&str>) -> Result<String, &'static str> {
+        resolve_os(traces.map(Into::into), generic.map(Into::into))
+    }
+
+    fn resolve_os(
+        traces: Option<std::ffi::OsString>,
+        generic: Option<std::ffi::OsString>,
+    ) -> Result<String, &'static str> {
+        endpoint_from_env(move |name| match name {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => traces.clone(),
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => generic.clone(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_environment_endpoint_resolves_as_in_otlp_0_33() {
+        let ok = |url: &str| Ok(url.to_string());
+        // Neither set, or set empty: the default.
+        assert_eq!(resolve(None, None), ok("http://localhost:4318/v1/traces"));
+        assert_eq!(
+            resolve(Some(""), Some("")),
+            ok("http://localhost:4318/v1/traces")
+        );
+        assert_eq!(
+            resolve(None, Some("")),
+            ok("http://localhost:4318/v1/traces")
+        );
+        // The traces variable is used as is, its path included.
+        assert_eq!(
+            resolve(
+                Some("http://collector:4318/custom"),
+                Some("http://other:4318")
+            ),
+            ok("http://collector:4318/custom")
+        );
+        assert_eq!(
+            resolve(Some("http://collector:4318"), None),
+            ok("http://collector:4318")
+        );
+        // The generic one gets the signal path, one slash between.
+        assert_eq!(
+            resolve(None, Some("http://collector:4318")),
+            ok("http://collector:4318/v1/traces")
+        );
+        assert_eq!(
+            resolve(Some(""), Some("http://collector:4318/")),
+            ok("http://collector:4318/v1/traces")
+        );
+        assert_eq!(
+            resolve(None, Some("http://collector:4318/otlp")),
+            ok("http://collector:4318/otlp/v1/traces")
+        );
+    }
+
+    #[test]
+    fn a_bad_environment_endpoint_is_refused_not_skipped() {
+        let bad = "http://collector:4318/v1/traces?key=xq7 zv9";
+        let good = "http://collector:4318";
+        for (traces, generic) in [
+            (Some(bad), None),
+            (Some(bad), Some(good)),
+            (None, Some(bad)),
+            (Some(""), Some(bad)),
+            (Some("collector:4318"), None),
+            (None, Some("collector:4318")),
+            (Some("/v1/traces"), None),
+        ] {
+            let reason = resolve(traces, generic).unwrap_err();
+            assert!(
+                !reason.contains("xq7") && !reason.contains("zv9"),
+                "{}",
+                reason
+            );
+        }
+        // A valid traces variable wins, so a bad generic one isn't read.
+        assert_eq!(resolve(Some(good), Some(bad)), Ok(good.to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_environment_endpoint_is_refused_not_skipped() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = || Some(std::ffi::OsString::from_vec(vec![b'h', 0xff]));
+        let good = Some("http://collector:4318".into());
+        assert!(resolve_os(invalid(), good.clone()).is_err());
+        assert!(resolve_os(None, invalid()).is_err());
+        assert!(resolve_os(Some("".into()), invalid()).is_err());
+        assert_eq!(
+            resolve_os(good.clone(), invalid()),
+            Ok("http://collector:4318".to_string())
+        );
+    }
 
     fn statement(comment: &str) -> Vec<u8> {
         format!("{} SELECT 1", comment).into_bytes()
