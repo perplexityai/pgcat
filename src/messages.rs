@@ -13,6 +13,7 @@ use crate::errors::Error;
 
 use crate::constants::MESSAGE_TERMINATOR;
 use crate::plugins::StatementPlan;
+use crate::server::PGCAT_APPLICATION_NAME;
 use crate::sql_observer::SharedSnap;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -143,7 +144,8 @@ where
 
     // Application name
     bytes.put(&b"application_name\0"[..]);
-    bytes.put_slice(&b"pgcat\0"[..]);
+    bytes.put_slice(PGCAT_APPLICATION_NAME.as_bytes());
+    bytes.put_u8(0);
 
     // Database
     bytes.put(&b"database\0"[..]);
