@@ -640,6 +640,7 @@ impl ConnectionPool {
                         plugin_response_batch_bytes: pool_config.plugin_response_batch_bytes,
                         sql_observer: SqlObserver::new(
                             pool_config.sql_observer_enabled,
+                            &pool_config.sql_observer_clients,
                             old_pool_ref
                                 .as_ref()
                                 .map(|pool| &pool.settings.sql_observer),

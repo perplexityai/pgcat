@@ -25,7 +25,7 @@ static GATE: std::sync::Mutex<Gate> = std::sync::Mutex::new(Gate::new());
 
 /// An enabled pool whose hub is published.
 fn published(db: &str) -> SqlObserver {
-    let pool = SqlObserver::new(true, None, &id(db));
+    let pool = SqlObserver::new(true, &[], None, &id(db));
     GATE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .install(pool.hub());
@@ -48,12 +48,17 @@ fn statements(pool: &SqlObserver) -> u64 {
     pool.counters
         .identities
         .iter()
+        .flatten()
         .map(|count| count.load(Ordering::Relaxed))
         .sum()
 }
 
 fn gap_total(pool: &SqlObserver, gap: Gap) -> u64 {
-    pool.counters.gaps[gap as usize].load(Ordering::Relaxed)
+    pool.counters
+        .gaps
+        .iter()
+        .map(|row| row[gap as usize].load(Ordering::Relaxed))
+        .sum()
 }
 
 fn gaps(pool: &SqlObserver) -> u64 {

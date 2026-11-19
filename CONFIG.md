@@ -747,9 +747,11 @@ statements. This only changes the counts, never what pgcat or the server runs.
   or one whose statements pgcat answers itself) can keep counting after the pool stops observing,
   or not count yet after it starts. The counts are cumulative, so what such a client counted while
   the pool didn't export it shows once the pool observes again.
-- `pgcat_sql_observer_attempts_total{pool,user,identity}`: statements counted, by the client's
-  `PGCAT_IDENTITY` state when the statement was admitted (see below).
-- `pgcat_sql_observer_gap_events_total{pool,user,reason}`: messages not counted, by reason:
+- `pgcat_sql_observer_attempts_total{pool,user,client,identity}`: statements counted, by the
+  client's `application_name` (`client`, see below) and its `PGCAT_IDENTITY` state when the
+  statement was admitted (see below).
+- `pgcat_sql_observer_gap_events_total{pool,user,client,reason}`: messages not counted, by the
+  client's `application_name` (`client`) and by reason:
   `unparsed_query` (a simple query the parser didn't parse, or with the parser disabled),
   `refused_unparsed` (a simple query refused before it was parsed), `unparsed_statement` (an Execute
   of a prepared statement the parser didn't parse, or of one dropped from the record before the
@@ -803,6 +805,19 @@ The relation series take up to 1,003 × 4 series per pool and user. Datadog fold
 values to lower-case names of at most 200 characters, other characters becoming `_`, so a quoted
 or mixed-case label may be merged with another there.
 
+The attempt and gap counters label the client's `application_name` (as pgcat tracks it for the
+client: the startup parameter, or a later `SET application_name` once the server reports it) as
+`client`: its own name if it is one of the pool's `sql_observer_clients`, else `other`. A name
+matches only exactly (case and all); every other name, the empty one included, counts as `other`,
+so by default every client counts as `other`. `client` takes at most 33 values per pool and user
+whatever clients send, and the counters are a fixed 2,376 bytes per pool and user (33 × 9
+counters, plus the names, allocated whether or not the pool observes), shared by its clients,
+with nothing added per client. A pool exports `other` from the
+start and a configured client once it has counted a statement or a gap event (in both metrics),
+so an unused client exports no series; the attempt and gap series take at most 33 × 9 per pool
+and user. The label is never read from `PGCAT_IDENTITY` or its token, and it only labels the
+counts.
+
 Both counted metrics label the client's `PGCAT_IDENTITY` state as `identity`:
 
 - `present`: a verified, unexpired identity is set.
@@ -821,9 +836,33 @@ target with the pool, user, relation, identity state, `application_name` and cli
 (table names, `application_name`) is escaped: `\`, `"`, control characters (such as a newline,
 `\n`, or an escape, `\u{1b}`) and Unicode line and bidi controls.
 
+Statements counted with an identity other than `present` are also sampled on the
+`pgcat::sql_observer::unidentified` log target: one info line per such statement, with the pool,
+user, identity state, the `application_name` (cut to 64 bytes on a character boundary, then
+escaped as above, so a long name can't grow the line), the client's address (to
+find a client whose name is missing or generic) and the first relation the statement
+names that has a label (else its fixed label: `other`, `unknown` or `no_explicit_relation`), at
+most 10 lines per minute per pool and user. Statements past the budget aren't logged; the next
+line says how many went unlogged since the line before it (a statement counted while another
+thread holds the budget may go uncounted there too). The line never carries the SQL text or the
+`PGCAT_IDENTITY` token.
+
 The global attempt and gap counters survive a config reload for as long as the pool exists, and
 so do the relation series. A query admitted just before a reload enables the parser is recorded
 once, as the gap it was admitted as; its statements are not counted as well.
+
+### sql_observer_clients
+```
+path: pools.<pool_name>.sql_observer_clients
+default: []
+```
+
+The `application_name`s the SQL observer counts under their own `client` label (see
+`sql_observer_enabled`); every other client counts as `other`. At most 32 names, each 1 to 64
+bytes, distinct, without control characters or commas, and not `other`. A name keeps its counters across
+reloads for as long as the pool exists, even after it is removed from the list, so the counts stay
+monotonic; a pool takes at most 32 names over its lifetime, and a name added past that counts as
+`other`, with a warning.
 
 ### primary_reads_enabled
 ```

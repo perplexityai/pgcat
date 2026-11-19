@@ -158,6 +158,11 @@ def scrape(metrics_port):
             continue
         series, value = line.rsplit(" ", 1)
         name, labels = series.rstrip("}").split("{", 1)
+        if name in ("pgcat_sql_observer_attempts_total", "pgcat_sql_observer_gap_events_total"):
+            # No pool in the tests configures `sql_observer_clients`, so every
+            # client is `other`, labeled exactly once.
+            clients = [label for label in labels.split(",") if label.startswith("client=")]
+            assert clients == ['client="other"'], line
         samples[(name, frozenset(label.replace('"', "") for label in labels.split(",")))] = int(
             value
         )
@@ -170,7 +175,15 @@ def observed(db, metrics_port=METRICS_PORT):
     pool_labels = {f"pool={db}", f"user={USER}"}
 
     def sample(name, *labels):
-        return samples.get((name, frozenset(pool_labels | set(labels))))
+        # Summed over the `client` label, where the series has one.
+        wanted = pool_labels | set(labels)
+        matching = [
+            value
+            for (series, series_labels), value in samples.items()
+            if series == name
+            and {label for label in series_labels if not label.startswith("client=")} == wanted
+        ]
+        return sum(matching) if matching else None
 
     observing = sample("pgcat_sql_observer_observing")
     counts = {
