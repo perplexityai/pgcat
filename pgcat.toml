@@ -56,6 +56,12 @@ autoreload = 15000
 # Number of worker threads the Runtime will use (4 by default).
 worker_threads = 5
 
+# The share of caller-sampled traces whose statements get spans, from 0 to 1. 0 turns statement tracing off. See CONFIG.md.
+trace_sample_ratio = 0.0
+
+# Where statement spans are sent (OTLP/HTTP). When not set: the OTEL_EXPORTER_OTLP_* environment, or http://localhost:4318/v1/traces.
+# trace_otlp_endpoint = "http://localhost:4318/v1/traces"
+
 # Number of seconds of connection idleness to wait before sending a keepalive packet to the server.
 tcp_keepalives_idle = 5
 # Number of unacknowledged keepalive packets allowed before giving up and closing the connection.

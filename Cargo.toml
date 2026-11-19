@@ -76,6 +76,15 @@ tracing-subscriber = { version = "0.3.20", features = [
 ] }
 lru = "0.16"
 mini-moka = "0.10.3"
+# Statement spans (src/trace_context.rs). OTLP over HTTP/protobuf, sent with
+# the hyper client above: no reqwest or tonic.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "http-proto",
+    "trace",
+] }
+opentelemetry-http = { version = "0.33", default-features = false }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5.0"

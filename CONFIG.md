@@ -179,6 +179,57 @@ default: 256
 Most plugin hooks that may run at once in the whole process. A hook that finds none free waits
 within its pool's `plugin_hook_timeout`. Read when pgcat starts.
 
+### trace_sample_ratio
+```
+path: general.trace_sample_ratio
+default: 0.0
+```
+
+The share of traced requests whose statements pgcat records as spans, from 0 to 1. 0 turns statement
+tracing off: no exporter is created and nothing is recorded. Reloadable; setting it back to 0 stops
+new spans.
+
+A client joins a statement to its trace with a leading [sqlcommenter](https://google.github.io/sqlcommenter/)
+comment carrying a [W3C traceparent](https://www.w3.org/TR/trace-context/#traceparent-header):
+
+```sql
+/*application='api',traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'*/ SELECT ...
+```
+
+pgcat reads only `traceparent` (version `00`, lowercase hex, as the comment's only traceparent), and
+only from a comment at the very start of a simple Query or of a Parse. `tracestate` is not read. A
+statement gets a span only when its caller sampled the trace (the traceparent's sampled flag) and the
+trace id falls within the ratio, decided as OpenTelemetry's `TraceIdRatioBased` sampler decides, so
+every pgcat at the same ratio keeps the same traces. Statements without such a traceparent are never
+traced: pgcat starts no traces of its own.
+
+Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
+caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for its
+batch, so the Executes of a pipelined batch all end at its Sync. Its attributes are
+`db.system.name` (`postgresql`), `pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`,
+`pgcat.shard` and `pgcat.protocol` (`simple` or `extended`); a failed statement has an error status,
+`error.type` and, when the server sent one, `db.response.status_code` (the SQLSTATE). Spans never
+contain the statement, its comment, or anything else the client sent but the trace context; pgcat
+doesn't log them either. Batches pgcat answers itself, and replies a client disconnects before, have
+no span.
+
+Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
+and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.
+Export failures are logged when they start and when they stop. The standard `OTEL_BSP_*` variables
+tune the queue, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` the resource (`service.name`
+defaults to `pgcat`). Queued spans are flushed at shutdown, for up to 5 seconds.
+
+### trace_otlp_endpoint
+```
+path: general.trace_otlp_endpoint
+default: <none>
+```
+
+The OTLP/HTTP traces URL statement spans are sent to, e.g. `http://otel-collector:4318/v1/traces`.
+Must be `http://` with a host and no credentials. When not set, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+or `OTEL_EXPORTER_OTLP_ENDPOINT` applies, then `http://localhost:4318/v1/traces`. Read when
+`trace_sample_ratio` first goes above 0; changing it later takes effect at restart.
+
 ### tcp_keepalives_idle
 ```
 path: general.tcp_keepalives_idle

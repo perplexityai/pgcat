@@ -106,6 +106,7 @@ pub(crate) fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     runtime.block_on(async move {
+        pgcat::trace_context::configure(&config.general);
 
         if let Some(true) = config.general.enable_prometheus_exporter {
             let http_addr_str = format!(
@@ -351,6 +352,7 @@ pub(crate) fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
 
     started_plugins.shutdown().await;
+    pgcat::trace_context::shutdown().await;
 
     info!("Shutting down...");
     });
