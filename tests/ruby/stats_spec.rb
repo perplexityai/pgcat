@@ -162,7 +162,7 @@ describe "Stats" do
         threads = []
         connections = Array.new(5) { PG::connect("#{pgcat_conn_str}?application_name=one_query") }
         connections.each do |c|
-          threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::SystemError }
+          threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::TooManyConnections }
         end
 
         sleep(2)
@@ -385,7 +385,7 @@ describe "Stats" do
           Thread.new do
             conn = PG.connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
             conn.async_exec("SELECT pg_sleep(0.1)")
-          rescue PG::SystemError
+          rescue PG::TooManyConnections
           ensure
             conn.close
           end

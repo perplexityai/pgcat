@@ -4,7 +4,12 @@ over the window, not all at once, so they don't all reconnect elsewhere at once.
 import os
 import selectors
 import signal
+import socket
+import struct
 import time
+
+import psycopg
+import pytest
 
 import utils
 
@@ -13,6 +18,14 @@ PG_PORT = int(os.environ.get("PGCAT_TEST_PG_PORT", "5432"))
 SPREAD = 5.0
 TIMEOUT = 10.0
 CLIENTS = 50
+# What a client may retry on a new connection: pgcat sent nothing it got on
+# this one to a server.
+SHUTDOWN = {
+    "S": "FATAL",
+    "V": "FATAL",
+    "C": "PS001",
+    "M": "terminating connection due to administrator command",
+}
 
 CONFIG = f"""
 [general]
@@ -138,3 +151,373 @@ def test_a_reload_raising_both_settings_moves_the_hard_exit():
         assert max(closed_after) > 2, closed_after
     finally:
         pgcat.stop()
+
+
+def test_a_drained_client_gets_the_shutdown_code_and_is_closed():
+    now = CONFIG.replace(
+        f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 0"
+    )
+    assert "shutdown_drain_spread = 0\n" in now, now
+    pgcat = utils.PgcatProcess(now, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
+        pgcat.process.send_signal(signal.SIGINT)
+
+        code, body = message()
+        assert code == b"E", (code, body)
+        assert utils.error_fields(body) == SHUTDOWN
+        assert utils.closed(sock)
+    finally:
+        pgcat.stop()
+
+
+def startup(port, db):
+    """Send a StartupMessage as sharding_user; return the socket and pgcat's
+    first reply."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT)
+    params = f"user\0sharding_user\0database\0{db}\0\0".encode()
+    sock.sendall(struct.pack("!ii", 8 + len(params), 196608) + params)
+    code, length = struct.unpack("!ci", utils.recv_exactly(sock, 5))
+    return sock, code, utils.recv_exactly(sock, length - 4)
+
+
+def test_a_client_connecting_during_shutdown_gets_the_shutdown_code():
+    pgcat = utils.PgcatProcess(CONFIG, PORT).start()
+    # pgcat exits once no non-admin client is left, and drains a client only
+    # between transactions, so this one keeps it running.
+    holder = psycopg.connect(
+        f"postgres://sharding_user:sharding_user@127.0.0.1:{PORT}/shard0"
+    )
+    try:
+        holder.execute("SELECT 1")
+        pgcat.process.send_signal(signal.SIGINT)
+
+        # A connection that starts before pgcat handles SIGINT is admitted.
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            sock, code, body = startup(PORT, "shard0")
+            if code != b"R":
+                break
+            sock.close()
+            assert time.monotonic() < deadline, "pgcat admitted clients after SIGINT"
+
+        assert code == b"E", (code, body)
+        assert utils.error_fields(body) == SHUTDOWN
+        assert utils.closed(sock)
+        sock.close()
+    finally:
+        holder.close()
+        pgcat.stop()
+
+
+DIRECT = f"postgres://sharding_user:sharding_user@127.0.0.1:{PG_PORT}/shard0"
+# Zero spread: a client is drained as soon as it is idle.
+NOW = CONFIG.replace(
+    f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 0"
+)
+assert "shutdown_drain_spread = 0\n" in NOW, NOW
+SESSION_POOL = f"""
+[pools.shard0_session]
+pool_mode = "session"
+
+[pools.shard0_session.users.0]
+username = "sharding_user"
+password = "sharding_user"
+pool_size = 1
+
+[pools.shard0_session.shards.0]
+servers = [["127.0.0.1", {PG_PORT}, "primary"]]
+database = "shard0"
+"""
+
+
+def fresh_tables(*tables):
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        for table in tables:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(f"CREATE TABLE {table} (n int)")
+
+
+def drop_tables(*tables):
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        for table in tables:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+def rows(table):
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        return [n for (n,) in conn.execute(f"SELECT n FROM {table} ORDER BY n")]
+
+
+def replies_until(message, last):
+    """Read messages through `last` or an ErrorResponse. Each read is bounded
+    by the socket's timeout."""
+    replies = []
+    while not replies or replies[-1][0] not in (last, b"E"):
+        replies.append(message())
+    return replies
+
+
+def replies_until_closed(message):
+    replies = []
+    while True:
+        try:
+            replies.append(message())
+        except ConnectionError:
+            return replies
+
+
+def copy_data(*values):
+    return b"".join(utils.frontend(b"d", f"{v}\n".encode()) for v in values) + (
+        utils.frontend(b"c", b"")
+    )
+
+
+def test_a_drain_after_a_copy_waits_for_the_rest_of_its_query():
+    # After CopyDone, the rest of a simple Query's reply can take more than
+    # one read from the server. Checking the server in after the first one
+    # leaves the client without its ReadyForQuery, so a drain then closes it
+    # with the shutdown code after its COPY ran.
+    table = "drain_copy_rows"
+    fresh_tables(table)
+    pgcat = utils.PgcatProcess(NOW, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
+        query = f"COPY {table} FROM STDIN; SELECT repeat('x', 10000)\0".encode()
+        sock.sendall(utils.frontend(b"Q", query))
+        assert message()[0] == b"G"
+        sock.sendall(copy_data(1))
+
+        # The COPY ran.
+        replies = [message()]
+        assert replies == [(b"C", b"COPY 1\0")], replies
+        pgcat.process.send_signal(signal.SIGINT)
+        replies += replies_until_closed(message)
+
+        codes = [code for code, _ in replies]
+        assert codes == [b"C", b"T", b"D", b"C", b"Z", b"E"], codes
+        assert replies[2][1].endswith(b"x" * 10000), replies[2]
+        assert replies[4] == (b"Z", b"I"), replies[4]
+        assert utils.error_fields(replies[5][1]) == SHUTDOWN
+        assert rows(table) == [1]
+    finally:
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(table)
+
+
+@pytest.mark.parametrize("db", ["shard0", "shard0_session"])
+def test_a_query_with_rows_between_two_copies_completes(db):
+    # The server sends nothing after CopyInResponse until the client's
+    # data. A DataRow earlier in the reply must not leave pgcat reading the
+    # server for more while the server waits for the client.
+    first, second = "copy_first_rows", "copy_second_rows"
+    fresh_tables(first, second)
+    pgcat = utils.PgcatProcess(CONFIG + SESSION_POOL, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, db, timeout=TIMEOUT)
+        query = (
+            f"COPY {first} FROM STDIN; SELECT repeat('x', 10000); "
+            f"COPY {second} FROM STDIN\0"
+        ).encode()
+        sock.sendall(utils.frontend(b"Q", query))
+        assert [code for code, _ in replies_until(message, b"G")] == [b"G"]
+
+        sock.sendall(copy_data(1))
+        replies = replies_until(message, b"G")
+        assert [code for code, _ in replies] == [b"C", b"T", b"D", b"C", b"G"], replies
+        assert replies[0] == (b"C", b"COPY 1\0"), replies[0]
+        assert replies[2][1].endswith(b"x" * 10000), replies[2]
+
+        sock.sendall(copy_data(2, 3))
+        assert replies_until(message, b"Z") == [(b"C", b"COPY 2\0"), (b"Z", b"I")]
+        assert (rows(first), rows(second)) == ([1], [2, 3])
+    finally:
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(first, second)
+
+
+def test_a_drain_between_two_copies_of_a_query_waits_for_the_second():
+    # In transaction mode, the server stays with the client from one COPY
+    # of a Query to the next: checked in between, the second COPY has no
+    # server, and a drain closes the client with the shutdown code after the
+    # first COPY ran.
+    first, second = "drain_first_rows", "drain_second_rows"
+    fresh_tables(first, second)
+    pgcat = utils.PgcatProcess(NOW, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
+        query = f"COPY {first} FROM STDIN; COPY {second} FROM STDIN\0".encode()
+        sock.sendall(utils.frontend(b"Q", query))
+        assert message()[0] == b"G"
+
+        sock.sendall(copy_data(1))
+        replies = replies_until(message, b"G")
+        assert [code for code, _ in replies] == [b"C", b"G"], replies
+        assert replies[0] == (b"C", b"COPY 1\0"), replies[0]
+
+        # The first COPY ran.
+        pgcat.process.send_signal(signal.SIGINT)
+        sock.sendall(copy_data(2, 3))
+        replies = replies_until_closed(message)
+        assert [code for code, _ in replies] == [b"C", b"Z", b"E"], replies
+        assert replies[:2] == [(b"C", b"COPY 2\0"), (b"Z", b"I")], replies
+        assert utils.error_fields(replies[2][1]) == SHUTDOWN
+        assert (rows(first), rows(second)) == ([1], [2, 3])
+    finally:
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(first, second)
+
+
+def hooked_pool(name, hook_timeout):
+    """A pool whose testing plugin copies drain_hooked_rows' a to b."""
+    return f"""
+[pools.{name}]
+pool_mode = "transaction"
+query_parser_enabled = true
+plugins_require_parse = true
+plugin_hook_timeout = {hook_timeout}
+
+[pools.{name}.plugins.testing]
+enabled = true
+
+[pools.{name}.plugins.testing.copy_param]
+table = "drain_hooked_rows"
+from = "a"
+to = "b"
+
+[pools.{name}.users.0]
+username = "sharding_user"
+password = "sharding_user"
+pool_size = 1
+statement_timeout = 0
+
+[pools.{name}.shards.0]
+servers = [["127.0.0.1", {PG_PORT}, "primary"]]
+database = "shard0"
+"""
+
+
+# The testing plugin's slow-query Bind outlives this pool's hook timeout,
+HOOKED_POOL = hooked_pool("drain_hooks", 300)
+# and runs within this one's.
+PATIENT_POOL = hooked_pool("drain_hooks_patient", 10000)
+CONNECTION_LOST = dict(SHUTDOWN, C="08006")
+
+
+def extended(query, *params):
+    """Parse, Bind, and Execute `query` unnamed, with text `params`."""
+    values = b"".join(struct.pack("!i", len(p)) + p for p in params)
+    return (
+        utils.frontend(b"P", b"\0" + query.encode() + b"\0" + struct.pack("!h", 0))
+        + utils.frontend(
+            b"B",
+            b"\0\0"
+            + struct.pack("!hh", 0, len(params))
+            + values
+            + struct.pack("!h", 0),
+        )
+        + utils.frontend(b"E", b"\0" + struct.pack("!i", 0))
+    )
+
+
+def backend_pid(message, sock):
+    """The pid of the server answering `sock` in this transaction."""
+    sock.sendall(utils.frontend(b"Q", b"SELECT pg_backend_pid()\0"))
+    replies = replies_until(message, b"Z")
+    assert [code for code, _ in replies] == [b"T", b"D", b"C", b"Z"], replies
+    columns, length = struct.unpack("!hi", replies[1][1][:6])
+    assert columns == 1, replies
+    return int(replies[1][1][6 : 6 + length])
+
+
+def terminate_once_running(pid, query):
+    """Ends server connection `pid` once it runs `query`."""
+    deadline = time.monotonic() + TIMEOUT
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        while time.monotonic() < deadline:
+            terminated = conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                " WHERE pid = %s AND query = %s AND state = 'active'",
+                [pid, query],
+            ).fetchall()
+            if terminated:
+                assert terminated == [(True,)], terminated
+                return
+    raise AssertionError(f"server {pid} didn't run {query!r} within {TIMEOUT}s")
+
+
+@pytest.mark.skipif(
+    os.environ.get("PGCAT_TEST_PLUGINS") != "1",
+    reason="needs pgcat built with --features test-plugins and PGCAT_TEST_PLUGINS=1",
+)
+@pytest.mark.parametrize("case", ["after-an-insert", "hook-only", "hook-query-lost"])
+def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it(
+    case,
+):
+    # In transaction mode, pgcat runs an INSERT sent with Flush and keeps the
+    # server for the client's Sync. A Bind hook cut off at the next Flush
+    # loses that server, and with it the client's last ReadyForQuery: the
+    # INSERT is committed, so the drain must not tell the client to retry.
+    # Without the INSERT, what the hook's own query ran may still have had
+    # effects, so the same holds, and also when that query loses the server
+    # instead of being cut off.
+    insert_first = case == "after-an-insert"
+    lost = case == "hook-query-lost"
+    hooked, unhooked = "drain_hooked_rows", "drain_unhooked_rows"
+    fresh_tables(unhooked)
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {hooked}")
+        conn.execute(f"CREATE TABLE {hooked} (a text, b text)")
+    pgcat = utils.PgcatProcess(NOW + HOOKED_POOL + PATIENT_POOL, PORT).start()
+    try:
+        # Its INSERT is answered with a ReadyForQuery before the drain.
+        answered, answered_message = utils.raw_connection(
+            PORT, "drain_hooks", timeout=TIMEOUT
+        )
+        insert = f"INSERT INTO {unhooked} VALUES (%s)"
+        answered.sendall(extended(insert % 2) + utils.frontend(b"H", b""))
+        replies = replies_until(answered_message, b"C")
+        assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
+        answered.sendall(utils.frontend(b"S", b""))
+        assert replies_until(answered_message, b"Z") == [(b"Z", b"I")]
+
+        pool = "drain_hooks_patient" if lost else "drain_hooks"
+        sock, message = utils.raw_connection(PORT, pool, timeout=TIMEOUT)
+        if lost:
+            # The pool's one server answers the slow Bind too.
+            pid = backend_pid(message, sock)
+        if insert_first:
+            sock.sendall(extended(insert % 1) + utils.frontend(b"H", b""))
+            replies = replies_until(message, b"C")
+            assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
+
+        # The hook queries the server and outlives plugin_hook_timeout, or
+        # its server connection ends while it waits for the query.
+        slow = f"INSERT INTO {hooked} (a) VALUES ($1)"
+        sock.sendall(extended(slow, b"slow-query") + utils.frontend(b"H", b""))
+        if lost:
+            terminate_once_running(pid, "SELECT pg_sleep(1)")
+        replies = replies_until(message, b"Z")
+        assert replies[-1][0] == b"E", replies
+        code = utils.error_fields(replies[-1][1])["C"]
+        assert code == ("XX000" if lost else "PH001"), replies
+
+        pgcat.process.send_signal(signal.SIGINT)
+        replies = replies_until_closed(message)
+        assert [code for code, _ in replies] == [b"E"], replies
+        assert utils.error_fields(replies[0][1]) == CONNECTION_LOST
+        replies = replies_until_closed(answered_message)
+        assert [code for code, _ in replies] == [b"E"], replies
+        assert utils.error_fields(replies[0][1]) == SHUTDOWN
+        assert rows(unhooked) == ([1, 2] if insert_first else [2])
+    finally:
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(hooked, unhooked)

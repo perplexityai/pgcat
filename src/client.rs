@@ -1,3 +1,4 @@
+use crate::client_writer::ClientWriter;
 use crate::errors::{ClientIdentifier, Error};
 use crate::held_replies::HeldReplies;
 use crate::identity::{
@@ -76,7 +77,7 @@ pub struct Client<S, T> {
 
     /// We buffer the writes ourselves because we know the protocol
     /// better than a stock buffer.
-    write: T,
+    write: ClientWriter<T>,
 
     /// Internal buffer, where we place messages until we have to flush
     /// them to the backend.
@@ -805,8 +806,9 @@ where
                 "Rejecting non-admin connection to {} when in admin only mode",
                 pool_name
             );
-            error_response_terminal(
+            fatal_response(
                 &mut write,
+                SHUTTING_DOWN,
                 "terminating connection due to administrator command",
             )
             .await?;
@@ -1110,7 +1112,7 @@ where
 
         Ok(Client {
             read: BufReader::new(read),
-            write,
+            write: ClientWriter::new(write),
             buffer: BytesMut::with_capacity(8196),
             response_message_queue_buffer: BytesMut::with_capacity(8196),
             held_replies: HeldReplies::default(),
@@ -1182,7 +1184,7 @@ where
         let secret_key = bytes.get_i32();
         Ok(Client {
             read: BufReader::new(read),
-            write,
+            write: ClientWriter::new(write),
             buffer: BytesMut::with_capacity(8196),
             response_message_queue_buffer: BytesMut::with_capacity(8196),
             held_replies: HeldReplies::default(),
@@ -1336,8 +1338,17 @@ where
                         _ = tokio::time::sleep_until(
                             self.drain_at.unwrap_or_else(tokio::time::Instant::now)
                         ), if self.drain_at.is_some() => {
-                            error_response_terminal(
+                            // No server connection is held here, but one let
+                            // go mid-exchange may have run what the client sent
+                            // since its last ReadyForQuery.
+                            let code = if self.write.unanswered() {
+                                SERVER_CONNECTION_LOST
+                            } else {
+                                SHUTTING_DOWN
+                            };
+                            fatal_response(
                                 &mut self.write,
+                                code,
                                 "terminating connection due to administrator command"
                             ).await?;
 
@@ -1563,16 +1574,26 @@ where
                     self.response_rewriter.reset();
                     self.query_plan = None;
 
-                    if message[0] as char == 'S' {
-                        error!("Got Sync message but failed to get a connection from the pool");
-                        self.reset_buffered_state();
+                    let error = with_sqlstate(
+                        NO_SERVER_CONNECTION,
+                        &format!("could not get connection from the pool - {}", err),
+                    );
+                    match message[0] {
+                        // The buffered batch was not sent, so it is dropped: a
+                        // later Sync must not run it. On Flush, as the server
+                        // would, everything until the next Sync is ignored,
+                        // and no ReadyForQuery is sent before it.
+                        b'S' | b'H' => {
+                            let sync = message[0] == b'S';
+                            if sync {
+                                error!(
+                                    "Got Sync message but failed to get a connection from the pool"
+                                );
+                            }
+                            self.reject_batch(&error, sync, None).await?;
+                        }
+                        _ => error_response(&mut self.write, &error).await?,
                     }
-
-                    error_response(
-                        &mut self.write,
-                        format!("could not get connection from the pool - {}", err).as_str(),
-                    )
-                    .await?;
 
                     error!(
                         "Could not get connection from pool: \
@@ -1596,8 +1617,9 @@ where
                                 "Checkout failure limit reached ({} / {}) - disconnecting client",
                                 checkout_failure_count, limit
                             );
-                            error_response_terminal(
+                            fatal_response(
                                 &mut self.write,
+                                NO_SERVER_CONNECTION,
                                 &format!(
                                     "checkout failure limit reached ({} / {})",
                                     checkout_failure_count, limit
@@ -2229,7 +2251,8 @@ where
                         // The server answers an extended-protocol COPY's end at the
                         // client's next Sync, and runs what comes before that Sync in
                         // the COPY's batch: pgcat takes only the Sync.
-                        if std::mem::take(&mut self.copy_in_extended) {
+                        let extended = std::mem::take(&mut self.copy_in_extended);
+                        if extended {
                             // The COPY is still running on the server: the wait is bounded
                             // as the client's idleness is and as the statement is.
                             let (budget, timed_out) = match pool.settings.user.statement_timeout {
@@ -2274,19 +2297,47 @@ where
                         // Clear the buffer
                         self.buffer.clear();
 
-                        let response = self
-                            .receive_server_message(server, &address, &pool, &self.stats.clone())
-                            .await?;
+                        // The rest of a simple Query can follow the COPY, so the reply
+                        // can take more than one read. The client has its
+                        // ReadyForQuery before the server is checked in.
+                        let mut failed = false;
+                        loop {
+                            let response = self
+                                .receive_server_message(
+                                    server,
+                                    &address,
+                                    &pool,
+                                    &self.stats.clone(),
+                                )
+                                .await?;
+                            failed |= server.last_reply().0;
 
-                        match write_all_flush(&mut self.write, &response).await {
-                            Ok(_) => (),
-                            Err(err) => {
-                                server.mark_bad(err.to_string().as_str());
-                                return Err(err);
+                            match write_all_flush(&mut self.write, &response).await {
+                                Ok(_) => (),
+                                Err(err) => {
+                                    server.mark_bad(err.to_string().as_str());
+                                    return Err(err);
+                                }
+                            };
+
+                            if !server.is_data_available() {
+                                break;
                             }
-                        };
+                        }
 
-                        if !server.in_transaction() {
+                        // An extended COPY that fails before the server reads the
+                        // client's first Sync, e.g. at a statement trigger, answers
+                        // that Sync and then the one after CopyDone, each with a
+                        // ReadyForQuery. pgcat can't tell which one this reply
+                        // ended with, so the server may still owe one. It isn't
+                        // checked in to answer another client's request with it.
+                        if extended && failed {
+                            server.mark_bad("an extended-protocol COPY failed, and its server may owe a ReadyForQuery");
+                        }
+
+                        // The same Query can start another COPY, which is
+                        // still part of it and still needs the server.
+                        if !server.in_transaction() && !server.in_copy_mode() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -3337,6 +3388,12 @@ where
         if interrupted {
             server.mark_bad("a plugin hook was cut off while it queried the server");
         }
+        // A hook that lost the server, cut off or by an I/O error on its
+        // query, may have run something with effects, which sending the
+        // client's request again would repeat.
+        if interrupted || server.is_bad() {
+            self.write.forwarded();
+        }
 
         let message = match rewritten {
             Ok(Some(sql)) => simple_query(&sql),
@@ -3489,6 +3546,12 @@ where
             self.implicit_transaction |= began_transaction;
             if interrupted {
                 server.mark_bad("a plugin hook was cut off while it queried the server");
+            }
+            // A hook that lost the server, cut off or by an I/O error on its
+            // query, may have run something with effects, which sending the
+            // client's request again would repeat.
+            if interrupted || server.is_bad() {
+                self.write.forwarded();
             }
 
             if let Err(err) = result {
@@ -4812,6 +4875,7 @@ where
         address: &Address,
         pool: &ConnectionPool,
     ) -> Result<(), Error> {
+        self.write.forwarded();
         match server.send(message).await {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -4879,8 +4943,9 @@ where
                 Err(err) => {
                     trace_context::server_failed(&mut self.traces, address, "server_connection");
                     pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
-                    error_response_terminal(
+                    fatal_response(
                         &mut self.write,
+                        SERVER_CONNECTION_LOST,
                         &format!("error receiving data from server: {:?}", err),
                     )
                     .await?;

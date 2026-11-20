@@ -41,6 +41,9 @@ default: 1000 # milliseconds
 
 How long the client waits to obtain a server connection before aborting (ms).
 This is similar to PgBouncer's `query_wait_timeout`.
+The client then gets an ERROR `could not get connection from the pool` with SQLSTATE `53300` (too_many_connections), and its connection stays usable.
+An extended-protocol batch waiting at a Sync or Flush is dropped, and never runs.
+After a Flush no ReadyForQuery is sent, and extended-protocol messages are discarded until the next Sync, which answers with one ReadyForQuery.
 
 ### idle_timeout
 ```
@@ -129,6 +132,8 @@ default: 0 # milliseconds
 ```
 
 On SIGINT, close each idle client after a random delay between 0 and this value, instead of closing them all at once. This spreads their reconnects to other instances over the window. Must be less than `shutdown_timeout`. 0 closes idle clients right away.
+
+Each client gets a FATAL `terminating connection due to administrator command` before pgcat closes it. Its SQLSTATE is `PS001` when pgcat forwarded nothing the client sent after its last ReadyForQuery, so none of it ran and the client can send it again on a new connection. A non-admin client that connects after SIGINT gets `PS001` too. If pgcat did forward something since, as when it let a server connection go mid-exchange, or a plugin hook's query was cut off or lost the server, the SQLSTATE is `08006` instead: what ran may have had effects. Before `PS001`, pgcat sent this error with SQLSTATE `58000`.
 
 ### ban_time
 ```
@@ -403,6 +408,9 @@ behind a single load balancer. If for any reason a client lands on a PgCat insta
 a large number of connected clients, it might get stuck in perpetual checkout failure loop especially
 in session mode
 `
+
+The client gets a FATAL `checkout failure limit reached` with SQLSTATE `53300` before pgcat closes its connection.
+
 ### default_role
 ```
 path: pools.<pool_name>.default_role

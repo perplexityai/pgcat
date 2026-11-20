@@ -384,12 +384,49 @@ pub fn or_sqlstate(code: &str, message: &str) -> String {
 
 /// An ErrorResponse message, as sent by `error_response_terminal`.
 pub fn error_message(message: &str) -> BytesMut {
-    let (code, message) = sqlstate_of(message);
-    let (severity, code) = match code {
-        Some(code) => ("ERROR", code),
+    match sqlstate_of(message) {
+        (Some(code), message) => error_fields("ERROR", code, message),
         // Not sure how much this matters: system_error, see Appendix A.
-        None => ("FATAL", "58000"),
-    };
+        (None, message) => error_fields("FATAL", "58000", message),
+    }
+}
+
+/// pgcat is shutting down and closed the client connection before forwarding
+/// anything the client sent after its last ReadyForQuery. Nothing sent on the
+/// connection since then ran, so the client can send it again on a new
+/// connection. Sent FATAL to clients closed at shutdown, and to clients that
+/// connect while pgcat accepts only admin connections. Class PS is pgcat's
+/// own: Postgres defines no class starting with P but P0 (PL/pgSQL).
+pub const SHUTTING_DOWN: &str = "PS001";
+/// The server connection failed after pgcat forwarded the client's request,
+/// so the request may have run: connection_failure. Sent FATAL. Also sent
+/// FATAL, instead of `SHUTTING_DOWN`, to a client closed at shutdown after
+/// pgcat forwarded something it sent since its last ReadyForQuery, or a
+/// plugin hook's query for it was cut off or lost the server.
+pub const SERVER_CONNECTION_LOST: &str = "08006";
+/// pgcat got no server connection for the request in time, so it sent the
+/// server nothing: too_many_connections, Postgres's answer when it has no
+/// backend slot. Sent ERROR when the client can go on, and FATAL when
+/// `checkout_failure_limit` closes the connection.
+pub const NO_SERVER_CONNECTION: &str = "53300";
+
+/// A FATAL ErrorResponse with SQLSTATE `code`. pgcat closes the client
+/// connection after sending it.
+pub fn fatal_message(code: &str, message: &str) -> BytesMut {
+    error_fields("FATAL", code, message)
+}
+
+/// Tell the client why pgcat closes its connection, with SQLSTATE `code`.
+/// No ReadyForQuery follows.
+pub async fn fatal_response<S>(stream: &mut S, code: &str, message: &str) -> Result<(), Error>
+where
+    S: tokio::io::AsyncWrite + std::marker::Unpin,
+{
+    write_all_half(stream, &fatal_message(code, message)).await
+}
+
+/// An ErrorResponse with `severity`, SQLSTATE `code`, and `message`.
+fn error_fields(severity: &str, code: &str, message: &str) -> BytesMut {
     let message = message.replace('\0', " ");
 
     let mut error = BytesMut::new();
@@ -2486,6 +2523,82 @@ mod tests {
                 routine: None,
             },
             PgErrorMsg::parse(&only_mandatory_msg).unwrap()
+        );
+    }
+
+    /// Severity (S and V), SQLSTATE, and message of an ErrorResponse, which
+    /// must be the whole of `message`.
+    fn fields(message: &[u8]) -> (String, String, String, String) {
+        assert_eq!(message[0], b'E');
+        let length = i32::from_be_bytes(message[1..5].try_into().unwrap()) as usize;
+        assert_eq!(length + 1, message.len());
+        let error = PgErrorMsg::parse(&message[5..]).unwrap();
+        (
+            error.severity_localized,
+            error.severity,
+            error.code,
+            error.message,
+        )
+    }
+
+    fn expect(severity: &str, code: &str, message: &str) -> (String, String, String, String) {
+        (
+            severity.to_string(),
+            severity.to_string(),
+            code.to_string(),
+            message.to_string(),
+        )
+    }
+
+    // Clients match on these codes and severities, so each one is pinned.
+    #[test]
+    fn test_codes_pgcat_sends_on_its_own_behalf() {
+        use super::*;
+
+        let shutdown = "terminating connection due to administrator command";
+        assert_eq!(
+            fields(&fatal_message(SHUTTING_DOWN, shutdown)),
+            expect("FATAL", "PS001", shutdown)
+        );
+        let lost = "error receiving data from server: SocketError(\"closed\")";
+        assert_eq!(
+            fields(&fatal_message(SERVER_CONNECTION_LOST, lost)),
+            expect("FATAL", "08006", lost)
+        );
+        let checkout = "could not get connection from the pool - AllServersDown";
+        assert_eq!(
+            fields(&error_message(&with_sqlstate(
+                NO_SERVER_CONNECTION,
+                checkout
+            ))),
+            expect("ERROR", "53300", checkout)
+        );
+        let limit = "checkout failure limit reached (2 / 2)";
+        assert_eq!(
+            fields(&fatal_message(NO_SERVER_CONNECTION, limit)),
+            expect("FATAL", "53300", limit)
+        );
+        // An error pgcat gives no code keeps system_error, its connection
+        // closed.
+        assert_eq!(
+            fields(&error_message("pool statement timeout")),
+            expect("FATAL", "58000", "pool statement timeout")
+        );
+    }
+
+    #[test]
+    fn test_fatal_message_keeps_the_message_one_field() {
+        use super::*;
+
+        // A NUL would end the field early and make the rest a new field.
+        assert_eq!(
+            fields(&fatal_message(SHUTTING_DOWN, "a\0Cbad")),
+            expect("FATAL", "PS001", "a Cbad")
+        );
+        // A message that looks like with_sqlstate's encoding is only text.
+        assert_eq!(
+            fields(&fatal_message(SHUTTING_DOWN, &with_sqlstate("XX000", "m"))),
+            expect("FATAL", "PS001", " XX000 m")
         );
     }
 }
