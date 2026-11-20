@@ -507,7 +507,9 @@ pub async fn client_entrypoint(
         }
     };
 
-    match get_startup::<TcpStream>(&mut stream).await {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+
+    match by(deadline, get_startup::<TcpStream>(&mut stream)).await {
         // Client requested a TLS connection.
         Ok((ClientConnectionType::Tls, _)) => {
             // TLS settings are configured, will setup TLS now.
@@ -519,7 +521,12 @@ pub async fn client_entrypoint(
                 write_all(&mut stream, yes).await?;
 
                 // Negotiate TLS.
-                match startup_tls(stream, client_server_map, shutdown, admin_only).await {
+                match by(
+                    deadline,
+                    startup_tls(stream, client_server_map, shutdown, admin_only),
+                )
+                .await
+                {
                     Ok(mut client) => {
                         if log_client_connections {
                             info!("Client {:?} connected (TLS)", addr);
@@ -543,20 +550,23 @@ pub async fn client_entrypoint(
 
                 // Attempting regular startup. Client can disconnect now
                 // if they choose.
-                match get_startup::<TcpStream>(&mut stream).await {
+                match by(deadline, get_startup::<TcpStream>(&mut stream)).await {
                     // Client accepted unencrypted connection.
                     Ok((ClientConnectionType::Startup, bytes)) => {
                         let (read, write) = split(stream);
 
                         // Continue with regular startup.
-                        match Client::startup(
-                            read,
-                            write,
-                            addr,
-                            bytes,
-                            client_server_map,
-                            shutdown,
-                            admin_only,
+                        match by(
+                            deadline,
+                            Client::startup(
+                                read,
+                                write,
+                                addr,
+                                bytes,
+                                client_server_map,
+                                shutdown,
+                                admin_only,
+                            ),
                         )
                         .await
                         {
@@ -598,14 +608,17 @@ pub async fn client_entrypoint(
             let (read, write) = split(stream);
 
             // Continue with regular startup.
-            match Client::startup(
-                read,
-                write,
-                addr,
-                bytes,
-                client_server_map,
-                shutdown,
-                admin_only,
+            match by(
+                deadline,
+                Client::startup(
+                    read,
+                    write,
+                    addr,
+                    bytes,
+                    client_server_map,
+                    shutdown,
+                    admin_only,
+                ),
             )
             .await
             {
@@ -647,6 +660,41 @@ pub async fn client_entrypoint(
     }
 }
 
+/// The longest startup message body pgcat reads: Postgres's
+/// `MAX_STARTUP_PACKET_LENGTH`.
+const MAX_STARTUP_BODY: usize = 10_000;
+
+/// The longest password message body pgcat reads: Postgres's
+/// `PG_MAX_AUTH_TOKEN_LENGTH`.
+const MAX_PASSWORD_BODY: usize = 65_535;
+
+/// The body length a message's length word claims, if it's in `bodies`. The
+/// word counts itself. It's the client's claim, read before authentication, so
+/// it's bounded as Postgres bounds it.
+fn claimed_body(len: i32, bodies: std::ops::RangeInclusive<usize>) -> Option<usize> {
+    let body = usize::try_from(len).ok()?.checked_sub(4)?;
+    bodies.contains(&body).then_some(body)
+}
+
+/// How long a client has to connect: TLS, the startup message and
+/// authentication. Postgres's `authentication_timeout` default.
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `step`, if it finishes before `deadline`.
+async fn by<T>(
+    deadline: tokio::time::Instant,
+    step: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    tokio::time::timeout_at(deadline, step)
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::SocketError(format!(
+                "client startup didn't finish within {}s",
+                STARTUP_TIMEOUT.as_secs()
+            )))
+        })
+}
+
 /// Handle the first message the client sends.
 async fn get_startup<S>(stream: &mut S) -> Result<(ClientConnectionType, BytesMut), Error>
 where
@@ -658,8 +706,14 @@ where
         Err(_) => return Err(Error::ClientBadStartup),
     };
 
+    // The body starts with a 4-byte code.
+    let body = match claimed_body(len, 4..=MAX_STARTUP_BODY) {
+        Some(body) => body,
+        None => return Err(Error::ClientBadStartup),
+    };
+
     // Get the rest of the message.
-    let mut startup = vec![0u8; len as usize - 4];
+    let mut startup = vec![0u8; body];
     match stream.read_exact(&mut startup).await {
         Ok(_) => (),
         Err(_) => return Err(Error::ClientBadStartup),
@@ -849,9 +903,13 @@ where
                         )));
                     }
 
-                    let len = match read.read_i32().await {
-                        Ok(len) => len,
-                        Err(_) => {
+                    let body = match read.read_i32().await {
+                        Ok(len) => claimed_body(len, 0..=MAX_PASSWORD_BODY),
+                        Err(_) => None,
+                    };
+                    let body = match body {
+                        Some(body) => body,
+                        None => {
                             return Err(Error::ClientSocketError(
                                 "password message length".into(),
                                 client_identifier,
@@ -859,7 +917,7 @@ where
                         }
                     };
 
-                    let mut password_response = vec![0u8; (len - 4) as usize];
+                    let mut password_response = vec![0u8; body];
 
                     match read.read_exact(&mut password_response).await {
                         Ok(_) => (),
@@ -940,9 +998,13 @@ where
                         )));
                     }
 
-                    let len = match read.read_i32().await {
-                        Ok(len) => len,
-                        Err(_) => {
+                    let body = match read.read_i32().await {
+                        Ok(len) => claimed_body(len, 0..=MAX_PASSWORD_BODY),
+                        Err(_) => None,
+                    };
+                    let body = match body {
+                        Some(body) => body,
+                        None => {
                             return Err(Error::ClientSocketError(
                                 "password message length".into(),
                                 client_identifier,
@@ -950,7 +1012,7 @@ where
                         }
                     };
 
-                    let mut password_response = vec![0u8; (len - 4) as usize];
+                    let mut password_response = vec![0u8; body];
 
                     match read.read_exact(&mut password_response).await {
                         Ok(_) => (),
@@ -5103,6 +5165,79 @@ fn is_lock_release(statement: &sqlparser::ast::Statement) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    /// A startup message's length word and code, then `body` zero bytes.
+    fn startup_message(len: i32, code: i32, body: usize) -> Vec<u8> {
+        let mut message = len.to_be_bytes().to_vec();
+        message.extend(code.to_be_bytes());
+        message.resize(message.len() + body, 0);
+        message
+    }
+
+    #[tokio::test]
+    async fn startup_lengths_are_bounded_as_postgres_bounds_them() {
+        // Below 8 there's no room for the code, and past 10,004 the claim is
+        // refused before anything is reserved for it.
+        let too_long = (4 + MAX_STARTUP_BODY + 1) as i32;
+        for len in [i32::MIN, -1, 0, 3, 4, 7, too_long, i32::MAX] {
+            let (mut client, mut pgcat) = tokio::io::duplex(64);
+            client.write_all(&len.to_be_bytes()).await.unwrap();
+            assert!(
+                matches!(get_startup(&mut pgcat).await, Err(Error::ClientBadStartup)),
+                "{}",
+                len
+            );
+        }
+
+        let (mut client, mut pgcat) = tokio::io::duplex(64);
+        client
+            .write_all(&startup_message(8, SSL_REQUEST_CODE, 0))
+            .await
+            .unwrap();
+        assert!(matches!(
+            get_startup(&mut pgcat).await,
+            Ok((ClientConnectionType::Tls, _))
+        ));
+
+        let longest = startup_message(
+            (4 + MAX_STARTUP_BODY) as i32,
+            PROTOCOL_VERSION_NUMBER,
+            MAX_STARTUP_BODY - 4,
+        );
+        let (mut client, mut pgcat) = tokio::io::duplex(longest.len());
+        client.write_all(&longest).await.unwrap();
+        assert!(matches!(
+            get_startup(&mut pgcat).await,
+            Ok((ClientConnectionType::Startup, _))
+        ));
+    }
+
+    #[test]
+    fn password_lengths_are_bounded_as_postgres_bounds_them() {
+        let bodies = || 0..=MAX_PASSWORD_BODY;
+        let too_long = (4 + MAX_PASSWORD_BODY + 1) as i32;
+        for len in [i32::MIN, -1, 0, 3, too_long, i32::MAX] {
+            assert_eq!(claimed_body(len, bodies()), None, "{}", len);
+        }
+        assert_eq!(claimed_body(4, bodies()), Some(0));
+        assert_eq!(claimed_body(40, bodies()), Some(36));
+        assert_eq!(
+            claimed_body((4 + MAX_PASSWORD_BODY) as i32, bodies()),
+            Some(MAX_PASSWORD_BODY)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_sends_nothing_is_dropped_at_the_deadline() {
+        let started = tokio::time::Instant::now();
+        let (_client, mut pgcat) = tokio::io::duplex(64);
+        assert!(matches!(
+            by(started + STARTUP_TIMEOUT, get_startup(&mut pgcat)).await,
+            Err(Error::SocketError(_))
+        ));
+        assert_eq!(started.elapsed(), STARTUP_TIMEOUT);
+    }
 
     fn panicking_handler() -> Result<(), Error> {
         panic!("the client handler panicked")
