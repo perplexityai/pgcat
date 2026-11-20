@@ -232,16 +232,21 @@ statement:
 None of them comes from the identity's token, tenant or claims. A failed statement has an error
 status, `error.type` and, when the server sent one, `db.response.status_code` (the SQLSTATE).
 
-A statement pgcat answers with its own error, without a server running it, gets a span too: one a
-plugin, a hook timeout, the identity verifier or the tenant guard refuses, an identity command
-pgcat can't run, or one no server could be checked out for (`connect_timeout`). The span ends when
-pgcat sends the error. It has an error status, `pgcat.refused` (`true`) and, as `error.type`, the
-SQLSTATE of that error (`58000` if it has none, as the client sees it; `_OTHER` if it isn't five
-digits or capital letters). Nothing else from the error is read, and the span has no
-`pgcat.server.role`, `pgcat.shard` or `db.response.status_code`, since no server may have been
-checked out. When pgcat refuses the rest of a batch after the server failed one of its statements,
-the spans keep the server's error. A pipelined batch's statements share the refusal, as they share
-its outcome.
+A statement pgcat answers with its own error, without a server running it, gets a span too, whatever
+the reason. For example, one that a plugin, a hook timeout, the query parser, the identity verifier
+or the tenant guard refuses; one planned before a reload changed the pool's plugins; a COMMIT or
+ROLLBACK in a query whose results a plugin rewrites; one in a batch that mixes statements pgcat
+answers itself with ones for the server; an identity command pgcat can't run; one no server could be
+checked out for (`connect_timeout`); and the statement at which a reload ends the session, having
+changed the identity's verifier or, for a client holding a server, the pool's tenant guard or
+server-text withholding. Such a reload ends the session at the client's next message, so in the
+extended protocol an Execute pgcat hasn't read yet gets no span. The span ends when pgcat sends the
+error. It has an error status, `pgcat.refused` (`true`) and, as `error.type`, the SQLSTATE of that
+error (`58000` if it has none, as the client sees it; `_OTHER` if it isn't five digits or capital
+letters). Nothing else from the error is read, and the span has no `pgcat.server.role`,
+`pgcat.shard` or `db.response.status_code`, since no server may have been checked out. When pgcat
+refuses the rest of a batch after the server failed one of its statements, the spans keep the
+server's error. A pipelined batch's statements share the refusal, as they share its outcome.
 
 Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
 don't include them; other pgcat logging is unchanged. Other batches pgcat answers itself, such as
@@ -259,6 +264,8 @@ Known gaps:
   forgets every traced statement. Run otherwise, or as a prepared statement, they leave a traced name
   in place: if SQL `PREPARE` then reuses the name, the new statement is traced under the old one's
   traceparent.
+- The first statement after a reload that removes a name from `sql_observer_clients` can still carry
+  that name in `pgcat.client`.
 - When a simple Query runs while extended-protocol messages wait for their Sync, its reply ends pgcat's
   record of what those messages traced. If the server then rejects that batch, or pgcat drops it, a
   statement name the batch reused keeps the batch's traceparent, and the statement still under that

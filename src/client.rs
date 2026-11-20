@@ -1812,7 +1812,7 @@ where
                 {
                     let error = "the pool's plugin settings changed in a reload: connect again";
                     server.mark_bad(error);
-                    error_response_terminal(&mut self.write, &with_sqlstate(UNSUPPORTED, error))
+                    self.end_session_refused(&with_sqlstate(UNSUPPORTED, error))
                         .await?;
                     return Err(Error::ClientError(error.into()));
                 }
@@ -2667,7 +2667,7 @@ where
                 if let Some(server) = server {
                     server.mark_bad(error);
                 }
-                error_response_terminal(&mut self.write, &with_sqlstate(UNSUPPORTED, error))
+                self.end_session_refused(&with_sqlstate(UNSUPPORTED, error))
                     .await?;
                 Err(Error::ClientError(error.into()))
             }
@@ -3986,6 +3986,13 @@ where
             self.discard_until_sync = true;
             error_response_terminal(&mut self.write, error).await
         }
+    }
+
+    /// End the session at a statement pgcat refuses, before it runs: its
+    /// spans end as refused, then the client gets `error` and nothing more.
+    async fn end_session_refused(&mut self, error: &str) -> Result<(), Error> {
+        trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
+        error_response_terminal(&mut self.write, error).await
     }
 
     /// Answer a simple Query pgcat refused.

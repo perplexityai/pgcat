@@ -15,6 +15,7 @@ import pytest
 from psycopg import pq
 
 import utils
+from test_trace_context import ENV, STATUS_ERROR, Collector, comment, new_trace, only
 
 PORT = 6457
 RELOAD_PORT = 6473
@@ -576,6 +577,40 @@ TESTING_VERIFIER = """
 enabled = true
 verify_identity = true
 """
+
+
+def traced(config, collector):
+    """`config`, its statements with a sampled traceparent exported to `collector`."""
+    return config.replace(
+        'admin_password = "admin_pass"\n',
+        'admin_password = "admin_pass"\ntrace_sample_ratio = 1\n'
+        f'trace_otlp_endpoint = "{collector.endpoint}"\n',
+        1,
+    )
+
+
+def without_inherited_otel(monkeypatch):
+    # pgcat inherits the runner's environment, whose OTEL_ variables would
+    # change the spans checked here.
+    for name in [name for name in os.environ if name.startswith("OTEL_")]:
+        monkeypatch.delenv(name)
+
+
+def assert_refused_spans(spans, ended, extended, sqlstate):
+    """Each statement of `ended`, at which pgcat ended the session, has one
+    span, refused with `sqlstate`, and no other span is refused. In the
+    extended protocol the session ends at the Parse, before pgcat reads the
+    Execute that would get the span: there's none."""
+    traces = [] if extended else ended
+    assert {span["trace_id"] for span in spans} & set(ended) == set(traces)
+    for trace in traces:
+        span = only(spans, trace)
+        assert span["status"] == STATUS_ERROR
+        assert span["attributes"]["pgcat.refused"] is True
+        assert span["attributes"]["error.type"] == sqlstate
+        assert "pgcat.server.role" not in span["attributes"]
+    refused = [span for span in spans if span["attributes"].get("pgcat.refused")]
+    assert len(refused) == len(traces), refused
 
 
 def identity_config(port, extra="", metrics_port=None):
@@ -1282,12 +1317,16 @@ def test_a_plugin_can_withhold_the_server_text(extended):
 
 @pytest.mark.parametrize("extended", [False, True])
 @pytest.mark.parametrize("turns_on", [True, False])
-def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on):
+def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on, monkeypatch):
     """A client holding its server keeps whether the server's text is withheld
     from the pool it was checked out from. A reload that changes it ends the
     session at its next statement, whose reply would be sanitized for another."""
     port = WITHHOLD_RELOAD_PORT
-    process = utils.PgcatProcess(withholding(port, not turns_on), port, binary=BINARY)
+    without_inherited_otel(monkeypatch)
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(withholding(port, not turns_on), collector), port, binary=BINARY, env=ENV
+    )
     try:
         process.start()
         sock, message = bounded(lambda: utils.raw_connection(port, "configured"))
@@ -1295,13 +1334,16 @@ def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on
         replies = exchanges(sock, message)
         assert [code for code, _ in replies(query("BEGIN"))] == [b"C", b"Z"]
 
-        process.write_config(withholding(port, turns_on))
+        process.write_config(traced(withholding(port, turns_on), collector))
         utils.admin_reload(port)
 
+        # The statement is refused before it runs: its span says so.
+        ended = new_trace()
+        sql = f"{comment(ended)} SELECT 1"
         if extended:
-            sock.sendall(parse(b"", "SELECT 1") + bind(b"", b"") + execute(b"") + SYNC)
+            sock.sendall(parse(b"", sql) + bind(b"", b"") + execute(b"") + SYNC)
         else:
-            sock.sendall(query("SELECT 1"))
+            sock.sendall(query(sql))
         code, body = message()
         assert code == b"E", body
         assert error_of([(code, body)]) == ("0A000", HELD_SETTINGS_CHANGED)
@@ -1312,8 +1354,15 @@ def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on
         # A new client gets the pool's new setting.
         diag, _ = server_diagnostics(process.dsn("configured"), extended)
         assert (diag.message_primary == WITHHELD) == turns_on
+
+        # Spans export in the order statements end: this one's comes last.
+        marker = new_trace()
+        with psycopg.connect(process.dsn("configured"), autocommit=True) as connection:
+            connection.execute(f"{comment(marker)} SELECT 1", prepare=False)
+        assert_refused_spans(collector.spans_until(marker), [ended], extended, "0A000")
     finally:
         process.stop()
+        collector.close()
 
 
 WITHHOLD_WAIT_PORT = 6481
@@ -1460,16 +1509,20 @@ class RawSession:
 
 
 @pytest.mark.parametrize("extended", [False, True])
-def test_a_reload_of_the_verifier_verifies_identities_again(extended):
+def test_a_reload_of_the_verifier_verifies_identities_again(extended, monkeypatch):
     """A reload that changes the pool's verifier, or its section, has the
     token of a client's identity verified again before its next statement,
     once. The same tenant and claims keep the identity, in a transaction too;
     anything else ends the session."""
     port = RECHECK_PORT
-    process = utils.PgcatProcess(identity_config(port), port, binary=BINARY)
+    without_inherited_otel(monkeypatch)
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(identity_config(port), collector), port, binary=BINARY, env=ENV
+    )
 
     def reload(extra="", testing=""):
-        process.write_config(identity_config(port, extra) + testing)
+        process.write_config(traced(identity_config(port, extra) + testing, collector))
         utils.admin_reload(port)
 
     def verifications(session):
@@ -1512,7 +1565,9 @@ def test_a_reload_of_the_verifier_verifies_identities_again(extended):
         session.close()
 
         # Other claims, the tenant the same; verification turned off; the
-        # verifier removed: the session ends, in a transaction too.
+        # verifier removed: the session ends, in a transaction too, and the
+        # statement it ends at gets a refused span.
+        ended = []
         for changed in (
             identity_config(port, 'claim = "other"\n'),
             identity_config(port).replace("verify_identity = true", "verify_identity = false"),
@@ -1523,16 +1578,30 @@ def test_a_reload_of_the_verifier_verifies_identities_again(extended):
                 session = identified()
                 if transaction:
                     session.ok("BEGIN")
-                process.write_config(changed)
+                process.write_config(traced(changed, collector))
                 utils.admin_reload(port)
-                session.ended("SELECT 8003")
+                ended.append(new_trace())
+                session.ended(f"{comment(ended[-1])} SELECT 8003")
 
         # A new client gets the server, in the pool of one, and the verifier.
+        # Spans export in the order statements end: its statement's comes last.
         reload('claim = "other"\n')
         session = identified()
+        marker = new_trace()
+        session.ok(f"{comment(marker)} SELECT 1")
         session.close()
+        spans = collector.spans_until(marker)
+        assert_refused_spans(spans, ended, extended, "0A000")
+        # The client as pgcat read the statement: its identity verified.
+        for trace in [] if extended else ended:
+            attributes = only(spans, trace)["attributes"]
+            assert (attributes["pgcat.identity"], attributes["pgcat.identity.verified"]) == (
+                "present",
+                True,
+            )
     finally:
         process.stop()
+        collector.close()
 
 
 @pytest.mark.parametrize("extended", [False, True])
