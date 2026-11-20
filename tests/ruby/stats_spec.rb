@@ -162,7 +162,7 @@ describe "Stats" do
         threads = []
         connections = Array.new(5) { PG::connect("#{pgcat_conn_str}?application_name=one_query") }
         connections.each do |c|
-          threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::SystemError }
+          threads << Thread.new { c.async_exec("SELECT pg_sleep(1)") rescue PG::TooManyConnections }
         end
 
         sleep(2)

@@ -117,7 +117,7 @@ describe "Miscellaneous" do
       25.times do
         Thread.new do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
-          conn.async_exec("SELECT pg_sleep(5)") rescue PG::SystemError
+          conn.async_exec("SELECT pg_sleep(5)") rescue PG::TooManyConnections
         ensure
           conn&.close
         end
@@ -127,8 +127,8 @@ describe "Miscellaneous" do
       conn_under_test = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
       stdout, stderr = with_captured_stdout_stderr do
         15.times do |i|
-          conn_under_test.async_exec("SELECT 1") rescue PG::SystemError
-          conn_under_test.exec_params("SELECT #{i} + $1", [i]) rescue PG::SystemError
+          conn_under_test.async_exec("SELECT 1") rescue PG::TooManyConnections
+          conn_under_test.exec_params("SELECT #{i} + $1", [i]) rescue PG::TooManyConnections
           sleep 1
         end
       end

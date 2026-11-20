@@ -42,6 +42,8 @@ default: 1000 # milliseconds
 How long the client waits to obtain a server connection before aborting (ms).
 This is similar to PgBouncer's `query_wait_timeout`.
 The client then gets an ERROR `could not get connection from the pool` with SQLSTATE `53300` (too_many_connections), and its connection stays usable.
+An extended-protocol batch waiting at a Sync or Flush is dropped, and never runs.
+After a Flush no ReadyForQuery is sent, and extended-protocol messages are discarded until the next Sync, which answers with one ReadyForQuery.
 
 ### idle_timeout
 ```
@@ -408,6 +410,7 @@ in session mode
 `
 
 The client gets a FATAL `checkout failure limit reached` with SQLSTATE `53300` before pgcat closes its connection.
+
 ### default_role
 ```
 path: pools.<pool_name>.default_role

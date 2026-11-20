@@ -11,6 +11,7 @@ when the bug is fixed, so the marker goes with the fix.
 """
 
 import re
+import struct
 import subprocess
 import time
 
@@ -191,6 +192,46 @@ def test_checkout_times_out_while_pool_is_busy(pgcat):
     holder.execute("COMMIT")
     assert waiter.execute("SELECT 2").fetchone() == (2,)
     assert connect(pgcat, "sem_one").execute("SELECT 2").fetchone() == (2,)
+
+
+# A batch whose checkout timed out is dropped, as the server drops one after
+# an error: the client was told it failed, so a later Sync must not run it.
+# On Flush no ReadyForQuery comes until the client's Sync.
+@pytest.mark.parametrize("end", [b"H", b"S"], ids=["flush", "sync"])
+def test_a_batch_whose_checkout_timed_out_never_runs(pgcat, table, end):
+    holder = connect(pgcat, "sem_one")
+    holder.execute("BEGIN")
+    holder.execute("SELECT 1")
+    sock, message = utils.raw_connection(pgcat.port, "sem_one", timeout=5)
+    try:
+        insert = b"INSERT INTO pooler_semantics VALUES ('late')"
+        sock.sendall(
+            utils.frontend(b"P", b"\0" + insert + b"\0" + struct.pack("!h", 0))
+            + utils.frontend(b"B", b"\0\0" + struct.pack("!hhh", 0, 0, 0))
+            + utils.frontend(b"E", b"\0" + struct.pack("!i", 0))
+            + utils.frontend(end, b"")
+        )
+        code, body = message()
+        assert code == b"E", (code, body)
+        failed = utils.error_fields(body)
+        assert (failed["V"], failed["C"]) == ("ERROR", "53300"), failed
+
+        # A server is free now: a batch still buffered would run at the Sync.
+        holder.execute("COMMIT")
+        if end == b"H":
+            sock.sendall(utils.frontend(b"S", b""))
+        sock.sendall(utils.frontend(b"Q", b"SELECT 'fence'\0"))
+        codes = []
+        while b"D" not in codes or codes[-1] != b"Z":
+            code, _ = message()
+            # ParameterStatus and notices may come with the fence's server.
+            if code not in (b"S", b"N"):
+                codes.append(code)
+        assert codes == [b"Z", b"T", b"D", b"C", b"Z"], codes
+        assert table() == []
+    finally:
+        sock.close()
+        holder.close()
 
 
 # checkout_failure_limit ends the connection with FATAL 53300, after the

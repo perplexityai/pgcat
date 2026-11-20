@@ -1568,19 +1568,26 @@ where
                     self.response_rewriter.reset();
                     self.query_plan = None;
 
-                    if message[0] as char == 'S' {
-                        error!("Got Sync message but failed to get a connection from the pool");
-                        self.reset_buffered_state();
+                    let error = with_sqlstate(
+                        NO_SERVER_CONNECTION,
+                        &format!("could not get connection from the pool - {}", err),
+                    );
+                    match message[0] {
+                        // The buffered batch was not sent, so it is dropped: a
+                        // later Sync must not run it. On Flush, as the server
+                        // would, everything until the next Sync is ignored,
+                        // and no ReadyForQuery is sent before it.
+                        b'S' | b'H' => {
+                            let sync = message[0] == b'S';
+                            if sync {
+                                error!(
+                                    "Got Sync message but failed to get a connection from the pool"
+                                );
+                            }
+                            self.reject_batch(&error, sync, None).await?;
+                        }
+                        _ => error_response(&mut self.write, &error).await?,
                     }
-
-                    error_response(
-                        &mut self.write,
-                        &with_sqlstate(
-                            NO_SERVER_CONNECTION,
-                            &format!("could not get connection from the pool - {}", err),
-                        ),
-                    )
-                    .await?;
 
                     error!(
                         "Could not get connection from pool: \
