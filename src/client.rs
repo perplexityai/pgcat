@@ -663,6 +663,18 @@ pub async fn client_entrypoint(
 /// `MAX_STARTUP_PACKET_LENGTH`.
 const MAX_STARTUP_BODY: usize = 10_000;
 
+/// The longest password message body pgcat reads: Postgres's
+/// `PG_MAX_AUTH_TOKEN_LENGTH`.
+const MAX_PASSWORD_BODY: usize = 65_535;
+
+/// The body length a message's length word claims, if it's in `bodies`. The
+/// word counts itself. It's the client's claim, read before authentication, so
+/// it's bounded as Postgres bounds it.
+fn claimed_body(len: i32, bodies: std::ops::RangeInclusive<usize>) -> Option<usize> {
+    let body = usize::try_from(len).ok()?.checked_sub(4)?;
+    bodies.contains(&body).then_some(body)
+}
+
 /// How long a client has to connect: TLS, the startup message and
 /// authentication. Postgres's `authentication_timeout` default.
 const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -693,12 +705,10 @@ where
         Err(_) => return Err(Error::ClientBadStartup),
     };
 
-    // The length counts itself, and the body starts with a 4-byte code. It's
-    // the client's claim, read before authentication, so it's bounded as
-    // Postgres bounds it.
-    let body = match usize::try_from(len).ok().and_then(|len| len.checked_sub(4)) {
-        Some(body @ 4..=MAX_STARTUP_BODY) => body,
-        _ => return Err(Error::ClientBadStartup),
+    // The body starts with a 4-byte code.
+    let body = match claimed_body(len, 4..=MAX_STARTUP_BODY) {
+        Some(body) => body,
+        None => return Err(Error::ClientBadStartup),
     };
 
     // Get the rest of the message.
@@ -891,9 +901,13 @@ where
                         )));
                     }
 
-                    let len = match read.read_i32().await {
-                        Ok(len) => len,
-                        Err(_) => {
+                    let body = match read.read_i32().await {
+                        Ok(len) => claimed_body(len, 0..=MAX_PASSWORD_BODY),
+                        Err(_) => None,
+                    };
+                    let body = match body {
+                        Some(body) => body,
+                        None => {
                             return Err(Error::ClientSocketError(
                                 "password message length".into(),
                                 client_identifier,
@@ -901,7 +915,7 @@ where
                         }
                     };
 
-                    let mut password_response = vec![0u8; (len - 4) as usize];
+                    let mut password_response = vec![0u8; body];
 
                     match read.read_exact(&mut password_response).await {
                         Ok(_) => (),
@@ -982,9 +996,13 @@ where
                         )));
                     }
 
-                    let len = match read.read_i32().await {
-                        Ok(len) => len,
-                        Err(_) => {
+                    let body = match read.read_i32().await {
+                        Ok(len) => claimed_body(len, 0..=MAX_PASSWORD_BODY),
+                        Err(_) => None,
+                    };
+                    let body = match body {
+                        Some(body) => body,
+                        None => {
                             return Err(Error::ClientSocketError(
                                 "password message length".into(),
                                 client_identifier,
@@ -992,7 +1010,7 @@ where
                         }
                     };
 
-                    let mut password_response = vec![0u8; (len - 4) as usize];
+                    let mut password_response = vec![0u8; body];
 
                     match read.read_exact(&mut password_response).await {
                         Ok(_) => (),
@@ -5128,6 +5146,21 @@ mod tests {
             get_startup(&mut pgcat).await,
             Ok((ClientConnectionType::Startup, _))
         ));
+    }
+
+    #[test]
+    fn password_lengths_are_bounded_as_postgres_bounds_them() {
+        let bodies = || 0..=MAX_PASSWORD_BODY;
+        let too_long = (4 + MAX_PASSWORD_BODY + 1) as i32;
+        for len in [i32::MIN, -1, 0, 3, too_long, i32::MAX] {
+            assert_eq!(claimed_body(len, bodies()), None, "{}", len);
+        }
+        assert_eq!(claimed_body(4, bodies()), Some(0));
+        assert_eq!(claimed_body(40, bodies()), Some(36));
+        assert_eq!(
+            claimed_body((4 + MAX_PASSWORD_BODY) as i32, bodies()),
+            Some(MAX_PASSWORD_BODY)
+        );
     }
 
     #[tokio::test(start_paused = true)]
