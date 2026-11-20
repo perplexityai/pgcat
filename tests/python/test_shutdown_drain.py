@@ -207,3 +207,47 @@ def test_a_client_connecting_during_shutdown_gets_the_shutdown_code():
     finally:
         holder.close()
         pgcat.stop()
+
+
+def test_a_drain_after_a_copy_waits_for_the_rest_of_its_query():
+    # After CopyDone, the rest of a simple Query's reply can take more than
+    # one read from the server. Checking the server in after the first one
+    # leaves the client without its ReadyForQuery, so a drain then closes it
+    # with the shutdown code after its COPY ran.
+    table = "drain_copy_rows"
+    direct = f"postgres://sharding_user:sharding_user@127.0.0.1:{PG_PORT}/shard0"
+    with psycopg.connect(direct, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"CREATE TABLE {table} (n int)")
+    now = CONFIG.replace(
+        f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 0"
+    )
+    assert "shutdown_drain_spread = 0\n" in now, now
+    pgcat = utils.PgcatProcess(now, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
+        query = f"COPY {table} FROM STDIN; SELECT repeat('x', 10000)\0".encode()
+        sock.sendall(utils.frontend(b"Q", query))
+        assert message()[0] == b"G"
+        sock.sendall(utils.frontend(b"d", b"1\n") + utils.frontend(b"c", b""))
+
+        # The COPY ran.
+        replies = [message()]
+        assert replies == [(b"C", b"COPY 1\0")], replies
+        pgcat.process.send_signal(signal.SIGINT)
+        while True:
+            try:
+                replies.append(message())
+            except ConnectionError:
+                break
+
+        codes = [code for code, _ in replies]
+        assert codes == [b"C", b"T", b"D", b"C", b"Z", b"E"], codes
+        assert replies[2][1].endswith(b"x" * 10000), replies[2]
+        assert replies[4] == (b"Z", b"I"), replies[4]
+        assert utils.error_fields(replies[5][1]) == SHUTDOWN
+    finally:
+        pgcat.stop()
+    with psycopg.connect(direct, autocommit=True) as conn:
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (1,)
+        conn.execute(f"DROP TABLE {table}")

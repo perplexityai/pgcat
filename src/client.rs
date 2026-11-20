@@ -2290,17 +2290,31 @@ where
                         // Clear the buffer
                         self.buffer.clear();
 
-                        let response = self
-                            .receive_server_message(server, &address, &pool, &self.stats.clone())
-                            .await?;
+                        // The rest of a simple Query can follow the COPY, so the reply
+                        // can take more than one read. The client has its
+                        // ReadyForQuery before the server is checked in.
+                        loop {
+                            let response = self
+                                .receive_server_message(
+                                    server,
+                                    &address,
+                                    &pool,
+                                    &self.stats.clone(),
+                                )
+                                .await?;
 
-                        match write_all_flush(&mut self.write, &response).await {
-                            Ok(_) => (),
-                            Err(err) => {
-                                server.mark_bad(err.to_string().as_str());
-                                return Err(err);
+                            match write_all_flush(&mut self.write, &response).await {
+                                Ok(_) => (),
+                                Err(err) => {
+                                    server.mark_bad(err.to_string().as_str());
+                                    return Err(err);
+                                }
+                            };
+
+                            if !server.is_data_available() {
+                                break;
                             }
-                        };
+                        }
 
                         if !server.in_transaction() {
                             self.stats.transaction();
