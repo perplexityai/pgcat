@@ -75,9 +75,9 @@ pub const UNIDENTIFIED_LOG_TARGET: &str = "pgcat::sql_observer::unidentified";
 /// At most this many unidentified lines per pool and user per interval.
 pub const UNIDENTIFIED_LOG_LINES: u32 = 10;
 pub const UNIDENTIFIED_LOG_INTERVAL: Duration = Duration::from_secs(60);
-/// An unidentified line's `application_name` is cut to this many bytes, on a
-/// character boundary, before it is escaped: a client can send a longer one.
-pub const UNIDENTIFIED_LOG_NAME_BYTES: usize = 64;
+/// A log line's `application_name` is cut to this many bytes, on a character
+/// boundary, before it is escaped: a client can send a longer one.
+pub const LOG_APPLICATION_NAME_BYTES: usize = 64;
 
 /// Slot counters are allocated this many slots at a time, as names arrive.
 pub const CHUNK_SLOTS: usize = 64;
@@ -139,6 +139,19 @@ impl PartialEq for KeyBuf {
     fn eq(&self, other: &KeyBuf) -> bool {
         self.as_bytes() == other.as_bytes()
     }
+}
+
+/// Who sent a statement, for a log line: its `application_name`, which the
+/// client chose, so clipped, quoted and escaped, and its address, for when the
+/// name is missing or shared.
+fn who(caller: &Caller<'_>) -> String {
+    format!(
+        "application_name \"{}\", client {}",
+        log_escape(clip(caller.application_name, LOG_APPLICATION_NAME_BYTES)),
+        caller
+            .address
+            .map_or_else(|| "unknown".to_string(), |address| address.to_string()),
+    )
 }
 
 /// `value`'s first `max` bytes at most, cut on a character boundary.
@@ -707,14 +720,11 @@ impl RelationHub {
             String::new()
         };
         Some(format!(
-            "[pool: {}][user: {}] statement counted with identity {}: application_name \"{}\", client {}, first relation \"{}\"{}",
+            "[pool: {}][user: {}] statement counted with identity {}: {}, first relation \"{}\"{}",
             self.pool,
             self.user,
             caller.identity.as_str(),
-            log_escape(clip(caller.application_name, UNIDENTIFIED_LOG_NAME_BYTES)),
-            caller
-                .address
-                .map_or_else(|| "unknown".to_string(), |address| address.to_string()),
+            who(caller),
             log_escape(&self.first_relation(snap)),
             unlogged,
         ))
@@ -744,19 +754,16 @@ impl RelationHub {
     }
 
     /// The callers log line for `relation`'s first sighting with the caller's
-    /// identity state. The relation and application name come from the
-    /// client, so both are quoted and escaped.
+    /// identity state. The relation comes from the client, so it's quoted and
+    /// escaped.
     fn callers_line(&self, relation: &str, caller: &Caller<'_>) -> String {
         format!(
-            "[pool: {}][user: {}] relation \"{}\" first counted with identity {}: application_name \"{}\", client {}",
+            "[pool: {}][user: {}] relation \"{}\" first counted with identity {}: {}",
             self.pool,
             self.user,
             log_escape(relation),
             caller.identity.as_str(),
-            log_escape(caller.application_name),
-            caller
-                .address
-                .map_or_else(|| "unknown".to_string(), |address| address.to_string()),
+            who(caller),
         )
     }
 
@@ -2212,7 +2219,7 @@ mod tests {
         );
         // The name is cut before it is escaped, so escapes can't grow it past
         // the 64 bytes: 64 newlines log as exactly 64 escapes.
-        let newlines = "\n".repeat(UNIDENTIFIED_LOG_NAME_BYTES + 1);
+        let newlines = "\n".repeat(LOG_APPLICATION_NAME_BYTES + 1);
         let caller = Caller {
             identity: ABSENT,
             application_name: &newlines,
@@ -2224,7 +2231,7 @@ mod tests {
         assert!(
             line.contains(&format!(
                 "application_name \"{}\", client",
-                "\\n".repeat(UNIDENTIFIED_LOG_NAME_BYTES)
+                "\\n".repeat(LOG_APPLICATION_NAME_BYTES)
             )),
             "{line}"
         );
@@ -2258,6 +2265,17 @@ mod tests {
             line,
             r#"[pool: db][user: app] relation "\"x\n2026-11-09T00:00:00Z INFO forged \u{1b}[2J\"" first counted with identity absent: application_name "app\r\n\u{1b}]0;title\u{7}\"", client 127.0.0.1:5432"#
         );
+        // Its name is cut like the unidentified line's.
+        let newlines = "\n".repeat(LOG_APPLICATION_NAME_BYTES + 1);
+        let caller = Caller {
+            identity: ABSENT,
+            application_name: &newlines,
+            address: None,
+        };
+        assert!(hub.callers_line(&sighted[0], &caller).ends_with(&format!(
+            "application_name \"{}\", client unknown",
+            "\\n".repeat(LOG_APPLICATION_NAME_BYTES)
+        )));
     }
 
     // --- Epochs, publication, admission ---
