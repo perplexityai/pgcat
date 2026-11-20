@@ -528,7 +528,9 @@ With this setting, or while any process-wide plugin is registered (which makes p
 parsing on every pool), while table access lists any table, it also refuses a `CREATE FUNCTION` or
 `CREATE PROCEDURE` the parser reads whose body is a string, so no string body reaches the server.
 Without either, table access checks names only: those queries are forwarded, and so is a
-string-bodied function the parser reads.
+string-bodied function the parser reads. pgcat warns about such a pool when it loads the config.
+Table access matches a table's name without its schema, folded to lower case unless it's quoted, so
+it refuses a listed name with a `.` and warns about one with upper case letters.
 
 A plugin configured in a pool's `[plugins.<name>]` section refuses, while it's on, every query the
 parser can't handle on that pool, with or without this setting, unless it declares that it checks
