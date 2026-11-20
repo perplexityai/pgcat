@@ -18,17 +18,23 @@
 //!
 //! Nothing here logs or exports the comment, the statement, or anything else
 //! the client sent besides the trace and span ids: span attributes are pool,
-//! user, role and shard from the config, the protocol, and the SQLSTATE.
+//! user, role and shard from the config, the protocol, the SQLSTATE, and the
+//! caller (`Caller`): its identity's state, whether a plugin verified it, and
+//! its `application_name` only if the pool's `sql_observer_clients` name it.
+//! Every attribute takes a bounded set of values; none comes from the
+//! identity's token or tenant.
 //!
 //! A span starts when pgcat reads the Query or Execute and ends when the
 //! server's ReadyForQuery for its batch arrives, so the Executes of one
-//! pipelined batch all end at its Sync. A batch pgcat drops without sending it
-//! (a plugin refused it, or no server could be checked out) is forgotten with
-//! its statements. One pgcat answers itself (an identity command) gets no
-//! ReadyForQuery from a server: its spans are discarded when the client's next
-//! batch starts, as are those of a client that disconnects before its reply.
-//! A lone Sync doesn't start a batch (the server ignores it during COPY), so
-//! if pgcat sends one to the server, its reply ends them instead: a known gap.
+//! pipelined batch all end at its Sync. A statement pgcat refuses (`refused`),
+//! or can't check out a server for, ends when pgcat answers it with its error,
+//! with the SQLSTATE of that error and nothing else from it. One pgcat answers
+//! itself (an identity command) gets no ReadyForQuery from a server: its spans
+//! are discarded when the client's next batch starts, as are those of a client
+//! that disconnects before its reply. A lone Sync doesn't start a batch (the
+//! server ignores it during COPY), so if pgcat sends one to the server, its
+//! reply ends them instead, and if pgcat refuses it, its refusal does: a known
+//! gap.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,7 +53,7 @@ use opentelemetry::trace::{
     Link, Span as _, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags, TraceId,
     TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{Context, InstrumentationScope, Key, KeyValue};
+use opentelemetry::{Context, InstrumentationScope, Key, KeyValue, Value};
 use opentelemetry_http::{HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::{
@@ -59,6 +65,9 @@ use tokio::runtime::Handle;
 
 use crate::config::{Address, General};
 use crate::errors::Error;
+use crate::identity_label::IdentityState;
+use crate::messages::sqlstate_of;
+use crate::sql_observer::OTHER_LABEL;
 
 const SPAN_NAME: &str = "pgcat.statement";
 
@@ -531,26 +540,56 @@ pub struct ClientTraces {
     outcome: Outcome,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Who sent a traced statement, as the client was when pgcat read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// The client's `PGCAT_IDENTITY`, as the SQL observer labels it.
+    pub identity: IdentityState,
+    /// A plugin verified the identity's token: false when nothing on the
+    /// pool verifies identities, and whenever the identity isn't `present`.
+    pub verified: bool,
+    /// The client's `application_name` if the pool's `sql_observer_clients`
+    /// name it, else `None`, exported as `other`.
+    pub client: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Pending {
     parent: Parent,
     start: SystemTime,
     protocol: &'static str,
+    caller: Caller,
 }
 
 /// How the pending batch went: its first error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Outcome {
     failed: bool,
+    /// The server's SQLSTATE, or pgcat's when it refused the batch.
     sqlstate: Option<[u8; 5]>,
     /// The error pgcat saw itself, when the server sent none.
     error_type: Option<&'static str>,
+    /// pgcat refused the batch and answered it itself.
+    refused: bool,
+}
+
+/// Where a batch's spans end: at the server's reply, or at pgcat's refusal,
+/// which may come before any server is checked out.
+#[derive(Clone, Copy, Debug)]
+enum Ending<'a> {
+    Server(&'a Address),
+    Refused { pool: &'a str, user: &'a str },
 }
 
 /// Records what a client message starts, for a client in a pool. Call for
-/// every message pgcat reads from the client, before handling it.
+/// every message pgcat reads from the client, before handling it. `caller`
+/// runs only for a statement that gets a span.
 #[inline]
-pub fn client_message(traces: &mut Option<Box<ClientTraces>>, message: &[u8]) {
+pub fn client_message(
+    traces: &mut Option<Box<ClientTraces>>,
+    message: &[u8],
+    caller: impl FnOnce() -> Caller,
+) {
     if !enabled() {
         if traces.is_some() {
             *traces = None;
@@ -571,7 +610,7 @@ pub fn client_message(traces: &mut Option<Box<ClientTraces>>, message: &[u8]) {
         *traces = Some(Box::default());
     }
     if let Some(traces) = traces.as_deref_mut() {
-        traces.client_message(message, ratio, SystemTime::now());
+        traces.client_message(message, ratio, SystemTime::now(), caller);
     }
 }
 
@@ -586,7 +625,7 @@ pub fn server_replied(
 ) {
     if let Some(traces) = traces.as_deref_mut() {
         if let Some(outcome) = traces.server_replied(reply, error, ready_for_query.is_some()) {
-            traces.export(outcome, address);
+            traces.export(outcome, Ending::Server(address));
         }
     }
 }
@@ -599,7 +638,18 @@ pub fn server_failed(
 ) {
     if let Some(traces) = traces.as_deref_mut() {
         if let Some(outcome) = traces.server_failed(error_type) {
-            traces.export(outcome, address);
+            traces.export(outcome, Ending::Server(address));
+        }
+    }
+}
+
+/// pgcat refused the client's pending statements with `error`, the message it
+/// answers them with: their spans end now, failed with its SQLSTATE and
+/// nothing else from it. Call before the batch is dropped.
+pub fn refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
+    if let Some(traces) = traces.as_deref_mut() {
+        if let Some(outcome) = traces.refused(error) {
+            traces.export(outcome, Ending::Refused { pool, user });
         }
     }
 }
@@ -621,7 +671,13 @@ pub fn statements_discarded(traces: &mut Option<Box<ClientTraces>>) {
 }
 
 impl ClientTraces {
-    fn client_message(&mut self, message: &[u8], ratio: f64, now: SystemTime) {
+    fn client_message(
+        &mut self,
+        message: &[u8],
+        ratio: f64,
+        now: SystemTime,
+        caller: impl FnOnce() -> Caller,
+    ) {
         // pgcat finishes a batch before it reads the next one, so a message
         // that starts a batch while the last one is sealed means that batch
         // got no ReadyForQuery from a server: pgcat answered it. COPY data
@@ -646,6 +702,7 @@ impl ClientTraces {
                         parent,
                         start: now,
                         protocol: "simple",
+                        caller: caller(),
                     });
                 }
             }
@@ -690,6 +747,7 @@ impl ClientTraces {
                             parent,
                             start: now,
                             protocol: "extended",
+                            caller: caller(),
                         });
                     }
                 }
@@ -748,8 +806,31 @@ impl ClientTraces {
         if !outcome.failed {
             outcome = Outcome {
                 failed: true,
-                sqlstate: None,
                 error_type: Some(error_type),
+                ..Outcome::default()
+            };
+        }
+        Some(outcome)
+    }
+
+    /// The pending statements' outcome, refused with `error`, unless the
+    /// server failed them first: only its SQLSTATE is read, and only if it's
+    /// five of `[0-9A-Z]`.
+    fn refused(&mut self, error: &str) -> Option<Outcome> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let mut outcome = std::mem::take(&mut self.outcome);
+        if !outcome.failed {
+            // pgcat sends an error without one as 58000 (`messages::error_message`).
+            let code = sqlstate_of(error).0.unwrap_or("58000").as_bytes();
+            outcome = Outcome {
+                failed: true,
+                sqlstate: <[u8; 5]>::try_from(code)
+                    .ok()
+                    .filter(|code| code.iter().all(|byte| is_sqlstate_byte(*byte))),
+                error_type: None,
+                refused: true,
             };
         }
         Some(outcome)
@@ -790,35 +871,54 @@ impl ClientTraces {
         self.outcome = Outcome::default();
     }
 
-    fn export(&mut self, outcome: Outcome, address: &Address) {
+    fn export(&mut self, outcome: Outcome, ending: Ending<'_>) {
         let end = SystemTime::now();
         let exporter = EXPORTER.load();
         if let Some(exporter) = exporter.as_deref() {
             for pending in &self.pending {
-                export(exporter, pending, &outcome, address, end);
+                export(exporter, pending, &outcome, ending, end);
             }
         }
         self.discard();
     }
 }
 
-fn export(
-    exporter: &Exporter,
-    pending: &Pending,
-    outcome: &Outcome,
-    address: &Address,
-    end: SystemTime,
-) {
-    let mut attributes = Vec::with_capacity(8);
+/// A span's attributes: each from the config, a fixed set, a SQLSTATE, or a
+/// configured client name.
+fn attributes(pending: &Pending, outcome: &Outcome, ending: Ending<'_>) -> Vec<KeyValue> {
+    let mut attributes = Vec::with_capacity(12);
     attributes.push(KeyValue::new("db.system.name", "postgresql"));
-    attributes.push(KeyValue::new("pgcat.pool.name", address.pool_name.clone()));
-    attributes.push(KeyValue::new("pgcat.pool.user", address.username.clone()));
-    attributes.push(KeyValue::new("pgcat.server.role", address.role.as_str()));
-    attributes.push(KeyValue::new("pgcat.shard", address.shard as i64));
+    match ending {
+        Ending::Server(address) => {
+            attributes.push(KeyValue::new("pgcat.pool.name", address.pool_name.clone()));
+            attributes.push(KeyValue::new("pgcat.pool.user", address.username.clone()));
+            attributes.push(KeyValue::new("pgcat.server.role", address.role.as_str()));
+            attributes.push(KeyValue::new("pgcat.shard", address.shard as i64));
+        }
+        Ending::Refused { pool, user } => {
+            attributes.push(KeyValue::new("pgcat.pool.name", pool.to_string()));
+            attributes.push(KeyValue::new("pgcat.pool.user", user.to_string()));
+        }
+    }
     attributes.push(KeyValue::new("pgcat.protocol", pending.protocol));
+    let caller = &pending.caller;
+    attributes.push(KeyValue::new("pgcat.identity", caller.identity.as_str()));
+    attributes.push(KeyValue::new("pgcat.identity.verified", caller.verified));
+    attributes.push(KeyValue::new(
+        "pgcat.client",
+        match &caller.client {
+            Some(name) => Value::from(name.clone()),
+            None => Value::from(OTHER_LABEL),
+        },
+    ));
+    if outcome.refused {
+        attributes.push(KeyValue::new("pgcat.refused", true));
+    }
     if let Some(code) = outcome.sqlstate {
         let code = String::from_utf8_lossy(&code).into_owned();
-        attributes.push(KeyValue::new("db.response.status_code", code.clone()));
+        if !outcome.refused {
+            attributes.push(KeyValue::new("db.response.status_code", code.clone()));
+        }
         attributes.push(KeyValue::new("error.type", code));
     } else if outcome.failed {
         attributes.push(KeyValue::new(
@@ -826,13 +926,23 @@ fn export(
             outcome.error_type.unwrap_or("_OTHER"),
         ));
     }
+    attributes
+}
+
+fn export(
+    exporter: &Exporter,
+    pending: &Pending,
+    outcome: &Outcome,
+    ending: Ending<'_>,
+    end: SystemTime,
+) {
     let parent = Context::new().with_remote_span_context(pending.parent.span_context());
     let mut span = exporter
         .tracer
         .span_builder(SPAN_NAME)
         .with_kind(SpanKind::Server)
         .with_start_time(pending.start)
-        .with_attributes(attributes)
+        .with_attributes(attributes(pending, outcome, ending))
         .start_with_context(&exporter.tracer, &parent);
     if outcome.failed {
         span.set_status(Status::error(""));
@@ -900,6 +1010,10 @@ fn sqlstate(reply: &[u8]) -> Option<[u8; 5]> {
     None
 }
 
+fn is_sqlstate_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || byte.is_ascii_uppercase()
+}
+
 fn error_code(mut fields: &[u8]) -> Option<[u8; 5]> {
     while let Some((&kind, more)) = fields.split_first() {
         if kind == 0 {
@@ -910,7 +1024,7 @@ fn error_code(mut fields: &[u8]) -> Option<[u8; 5]> {
             let code: [u8; 5] = more[..end].try_into().ok()?;
             return code
                 .iter()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+                .all(|byte| is_sqlstate_byte(*byte))
                 .then_some(code);
         }
         fields = &more[end + 1..];
@@ -1387,9 +1501,17 @@ mod tests {
         )
     }
 
+    fn anonymous() -> Caller {
+        Caller {
+            identity: IdentityState::Absent,
+            verified: false,
+            client: None,
+        }
+    }
+
     fn run(traces: &mut ClientTraces, messages: &[Vec<u8>]) {
         for message in messages {
-            traces.client_message(message, 1.0, SystemTime::UNIX_EPOCH);
+            traces.client_message(message, 1.0, SystemTime::UNIX_EPOCH, anonymous);
         }
     }
 
@@ -1655,7 +1777,7 @@ mod tests {
             Some(Outcome {
                 failed: true,
                 sqlstate: Some(*b"22012"),
-                error_type: None,
+                ..Outcome::default()
             })
         );
 
@@ -1664,9 +1786,189 @@ mod tests {
             traces.server_failed("statement_timeout"),
             Some(Outcome {
                 failed: true,
-                sqlstate: None,
                 error_type: Some("statement_timeout"),
+                ..Outcome::default()
             })
+        );
+    }
+
+    #[test]
+    fn reads_the_caller_only_for_traced_statements() {
+        let mut traces = ClientTraces::default();
+        let calls = std::cell::Cell::new(0);
+        let send = |traces: &mut ClientTraces, message: &[u8]| {
+            traces.client_message(message, 1.0, SystemTime::UNIX_EPOCH, || {
+                calls.set(calls.get() + 1);
+                Caller {
+                    identity: IdentityState::Present,
+                    verified: true,
+                    client: Some("api".into()),
+                }
+            })
+        };
+        send(&mut traces, &query("SELECT 1"));
+        send(&mut traces, &parse("s", &sampled_sql(1)));
+        send(&mut traces, &bind("", "s"));
+        assert_eq!(calls.get(), 0);
+        send(&mut traces, &execute(""));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(traces.pending[0].caller.client.as_deref(), Some("api"));
+        send(&mut traces, &frame(b'S', b""));
+        assert!(ready(&mut traces).is_some());
+        send(&mut traces, &query(&sampled_sql(2)));
+        assert_eq!(calls.get(), 2);
+    }
+
+    fn refused(code: &str, message: &str) -> String {
+        crate::messages::with_sqlstate(code, message)
+    }
+
+    #[test]
+    fn a_refusal_ends_the_batch_with_its_sqlstate() {
+        let mut traces = ClientTraces::default();
+        assert_eq!(traces.refused(&refused("28000", "refused")), None);
+
+        run(&mut traces, &[query(&sampled_sql(1))]);
+        let outcome = traces.refused(&refused("28000", "PGCAT_IDENTITY refused: tok"));
+        assert_eq!(
+            outcome,
+            Some(Outcome {
+                failed: true,
+                sqlstate: Some(*b"28000"),
+                error_type: None,
+                refused: true,
+            })
+        );
+        traces.discard();
+
+        // An error pgcat sends without a SQLSTATE goes out as 58000.
+        run(&mut traces, &[query(&sampled_sql(1))]);
+        let outcome = traces.refused("no code").unwrap();
+        assert_eq!(outcome.sqlstate, Some(*b"58000"));
+        traces.discard();
+
+        // Never anything but five of [0-9A-Z].
+        run(&mut traces, &[query(&sampled_sql(1))]);
+        let outcome = traces.refused(&refused("28o00", "odd")).unwrap();
+        assert_eq!((outcome.refused, outcome.sqlstate), (true, None));
+        traces.discard();
+
+        // The server's error comes first.
+        run(&mut traces, &[query(&sampled_sql(1))]);
+        traces.server_replied(&error_response("22012"), true, false);
+        let outcome = traces.refused(&refused("28000", "refused")).unwrap();
+        assert_eq!(
+            (outcome.refused, outcome.sqlstate),
+            (false, Some(*b"22012"))
+        );
+    }
+
+    fn attribute_map(attributes: Vec<KeyValue>) -> Vec<(String, String)> {
+        attributes
+            .into_iter()
+            .map(|kv| (kv.key.as_str().to_string(), kv.value.to_string()))
+            .collect()
+    }
+
+    fn pending(caller: Caller) -> Pending {
+        Pending {
+            parent: parent(1, true),
+            start: SystemTime::UNIX_EPOCH,
+            protocol: "simple",
+            caller,
+        }
+    }
+
+    #[test]
+    fn exports_the_caller_bounded() {
+        let address = Address {
+            pool_name: "pool".into(),
+            username: "user".into(),
+            role: crate::config::Role::Primary,
+            shard: 2,
+            ..Address::default()
+        };
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            attribute_map(attributes(
+                &pending(anonymous()),
+                &Outcome::default(),
+                Ending::Server(&address)
+            )),
+            pairs(&[
+                ("db.system.name", "postgresql"),
+                ("pgcat.pool.name", "pool"),
+                ("pgcat.pool.user", "user"),
+                ("pgcat.server.role", "primary"),
+                ("pgcat.shard", "2"),
+                ("pgcat.protocol", "simple"),
+                ("pgcat.identity", "absent"),
+                ("pgcat.identity.verified", "false"),
+                ("pgcat.client", "other"),
+            ])
+        );
+
+        let caller = Caller {
+            identity: IdentityState::Present,
+            verified: true,
+            client: Some("api".into()),
+        };
+        let failed = Outcome {
+            failed: true,
+            sqlstate: Some(*b"22012"),
+            ..Outcome::default()
+        };
+        assert_eq!(
+            attribute_map(attributes(
+                &pending(caller.clone()),
+                &failed,
+                Ending::Server(&address)
+            ))[6..],
+            pairs(&[
+                ("pgcat.identity", "present"),
+                ("pgcat.identity.verified", "true"),
+                ("pgcat.client", "api"),
+                ("db.response.status_code", "22012"),
+                ("error.type", "22012"),
+            ])[..]
+        );
+
+        // A refusal has no server: no role or shard, and only pgcat's code.
+        let refused = Outcome {
+            failed: true,
+            sqlstate: Some(*b"28000"),
+            error_type: None,
+            refused: true,
+        };
+        let ending = Ending::Refused {
+            pool: "pool",
+            user: "user",
+        };
+        assert_eq!(
+            attribute_map(attributes(&pending(caller.clone()), &refused, ending)),
+            pairs(&[
+                ("db.system.name", "postgresql"),
+                ("pgcat.pool.name", "pool"),
+                ("pgcat.pool.user", "user"),
+                ("pgcat.protocol", "simple"),
+                ("pgcat.identity", "present"),
+                ("pgcat.identity.verified", "true"),
+                ("pgcat.client", "api"),
+                ("pgcat.refused", "true"),
+                ("error.type", "28000"),
+            ])
+        );
+        let odd = Outcome {
+            sqlstate: None,
+            ..refused
+        };
+        assert_eq!(
+            attribute_map(attributes(&pending(caller), &odd, ending)).pop(),
+            Some(("error.type".to_string(), "_OTHER".to_string()))
         );
     }
 

@@ -84,7 +84,8 @@ pub const MAX_CLIENT_NAME_BYTES: usize = 64;
 /// Column 0 is `other`; column `n` is the `n`th client name of the lineage.
 const COLUMNS: usize = MAX_CLIENTS + 1;
 const OTHER_CLIENT: usize = 0;
-const OTHER_LABEL: &str = "other";
+/// The `client` label of every name not configured.
+pub const OTHER_LABEL: &str = "other";
 
 /// Why `sql_observer_clients` is invalid, if it is.
 pub fn invalid_clients(clients: &[String]) -> Option<String> {
@@ -160,7 +161,7 @@ static PLACEHOLDER: Lazy<Arc<Counters>> = Lazy::new(|| Arc::new(Counters::new(""
 pub struct SqlObserver {
     enabled: bool,
     /// The pool's configured client names and their columns.
-    clients: Arc<[(Box<str>, u8)]>,
+    clients: Arc<[(Arc<str>, u8)]>,
     /// Shared with the pool this one replaced on reload, so the counts stay
     /// monotonic and clients still on the old pool aren't lost.
     counters: Arc<Counters>,
@@ -226,6 +227,16 @@ impl SqlObserver {
             .iter()
             .find(|(name, _)| **name == *application_name)
             .map_or(OTHER_CLIENT, |(_, column)| *column as usize)
+    }
+
+    /// The `client` label of an `application_name`, for statement spans: its
+    /// name if the pool counts it as itself, `None` for `other`. Whether or
+    /// not the pool observes.
+    pub fn client_label(&self, application_name: &str) -> Option<Arc<str>> {
+        self.clients
+            .iter()
+            .find(|(name, _)| **name == *application_name)
+            .map(|(name, _)| name.clone())
     }
 
     pub fn enabled(&self) -> bool {
@@ -1903,6 +1914,22 @@ mod tests {
             .any(|l| l.contains("client=\"other\",identity=\"absent\"} 5")));
         assert!(!lines.iter().any(|l| l.contains("app-32")));
         assert_eq!(c.counters.clients.lock().len(), MAX_CLIENTS);
+        // Spans label clients as the counts do.
+        assert_eq!(b.client_label("app-32"), None);
+        assert_eq!(c.client_label("app-0").as_deref(), Some("app-0"));
+    }
+
+    #[test]
+    fn client_labels_match_exactly_whether_or_not_the_pool_observes() {
+        let clients = vec!["app-a".to_string()];
+        for enabled in [true, false] {
+            let observer = SqlObserver::new(enabled, &clients, None, &id("db"));
+            assert_eq!(observer.client_label("app-a").as_deref(), Some("app-a"));
+            for other in ["App-A", "app-a ", "app", "", OTHER_LABEL] {
+                assert_eq!(observer.client_label(other), None, "{:?}", other);
+            }
+        }
+        assert_eq!(SqlObserver::default().client_label("app-a"), None);
     }
 
     #[test]

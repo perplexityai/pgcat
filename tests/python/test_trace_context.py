@@ -28,7 +28,7 @@ SPAN = "b7ad6b7169203331"
 ENV = {"OTEL_BSP_SCHEDULE_DELAY": "50"}
 
 
-def config(ratio, endpoint, statement_timeout=0):
+def config(ratio, endpoint, statement_timeout=0, pool="", sections="", general="", pool_size=5):
     endpoint = "" if endpoint is None else f'trace_otlp_endpoint = "{endpoint}"'
     return f"""
 [general]
@@ -38,20 +38,23 @@ admin_username = "admin_user"
 admin_password = "admin_pass"
 trace_sample_ratio = {ratio}
 {endpoint}
+{general}
 
 [pools.shard0]
 pool_mode = "transaction"
 prepared_statements_cache_size = 100
+{pool}
 
 [pools.shard0.users.0]
 username = "sharding_user"
 password = "sharding_user"
-pool_size = 5
+pool_size = {pool_size}
 statement_timeout = {statement_timeout}
 
 [pools.shard0.shards.0]
 servers = [["127.0.0.1", {PG_PORT}, "primary"]]
 database = "shard0"
+{sections}
 """
 
 
@@ -288,6 +291,9 @@ def test_a_sampled_statement_joins_the_callers_trace(pgcat, collector):
         "pgcat.server.role": "primary",
         "pgcat.shard": 0,
         "pgcat.protocol": "simple",
+        "pgcat.identity": "absent",
+        "pgcat.identity.verified": False,
+        "pgcat.client": "other",
     }
     assert span["resource"]["service.name"] == "pgcat"
     assert span["scope"][1] == "pgcat"
@@ -440,6 +446,161 @@ def test_a_failed_statement_has_an_error_status(pgcat, collector):
     assert span["status"] == STATUS_ERROR
     assert span["attributes"]["db.response.status_code"] == "22012"
     assert span["attributes"]["error.type"] == "22012"
+
+
+def run_as(pgcat, application_name, *statements):
+    conn = psycopg2.connect(pgcat.dsn("shard0").replace("testing_pgcat", application_name))
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        for statement in statements:
+            cur.execute(statement)
+    finally:
+        conn.close()
+
+
+def test_spans_name_only_configured_clients(collector):
+    pool = 'sql_observer_clients = ["api", "worker"]'
+    pgcat = utils.PgcatProcess(config(1, collector.endpoint, pool=pool), PORT, env=ENV).start()
+    try:
+        traces = {name: new_trace() for name in ("api", "worker", "API", "web", "")}
+        for name, trace in traces.items():
+            run_as(pgcat, name, f"{comment(trace)} SELECT 1")
+        spans = collector.spans_until(traces[""])
+    finally:
+        pgcat.stop()
+    clients = {name: only(spans, trace)["attributes"]["pgcat.client"] for name, trace in traces.items()}
+    # Only an exact match: any other name, the empty one too, is `other`.
+    assert clients == {"api": "api", "worker": "worker", "API": "other", "web": "other", "": "other"}
+
+
+def test_spans_record_the_identity_state_never_the_token(pgcat, collector):
+    # Nothing on this pool verifies identities: pgcat keeps the token as sent.
+    token = f"secret-{new_trace()}"
+    unverified, reset = new_trace(), new_trace()
+    run(
+        pgcat,
+        f"SET PGCAT_IDENTITY TO '{token}'",
+        f"{comment(unverified)} SELECT 1",
+        "RESET PGCAT_IDENTITY",
+        f"{comment(reset)} SELECT 1",
+    )
+    spans = collector.spans_until(reset)
+    attributes = only(spans, unverified)["attributes"]
+    assert (attributes["pgcat.identity"], attributes["pgcat.identity.verified"]) == ("present", False)
+    attributes = only(spans, reset)["attributes"]
+    assert (attributes["pgcat.identity"], attributes["pgcat.identity.verified"]) == ("absent", False)
+    assert token not in str(spans) and token not in pgcat.logs()
+
+
+def test_a_refused_statement_gets_a_span_with_pgcats_sqlstate(pgcat, collector):
+    # An identity command pgcat can't forward without sending its token: it
+    # refuses it without a server, with 0A000.
+    token = f"secret-{new_trace()}"
+    trace = new_trace()
+    with pytest.raises(psycopg2.errors.FeatureNotSupported):
+        run(pgcat, f"{comment(trace)} SET PGCAT_IDENTITY TO '{token}'; SELECT 1")
+
+    span = only(collector.spans_until(trace), trace)
+    assert span["parent_span_id"] == SPAN
+    assert span["status"] == STATUS_ERROR
+    assert span["attributes"] == {
+        "db.system.name": "postgresql",
+        "pgcat.pool.name": "shard0",
+        "pgcat.pool.user": "sharding_user",
+        "pgcat.protocol": "simple",
+        "pgcat.identity": "absent",
+        "pgcat.identity.verified": False,
+        "pgcat.client": "other",
+        "pgcat.refused": True,
+        "error.type": "0A000",
+    }
+    assert token not in str(span) and token not in pgcat.logs()
+
+
+@pytest.mark.parametrize("protocol", ["simple", "extended"])
+def test_a_statement_no_server_could_be_checked_out_for_gets_a_span(collector, protocol):
+    pgcat = utils.PgcatProcess(
+        config(1, collector.endpoint, general="connect_timeout = 300", pool_size=1), PORT, env=ENV
+    ).start()
+    try:
+        holder = connect(pgcat)
+        try:
+            holder.cursor().execute("BEGIN")
+            trace = new_trace()
+            if protocol == "simple":
+                with pytest.raises(psycopg2.errors.TooManyConnections):
+                    run(pgcat, f"{comment(trace)} SELECT 1")
+            else:
+                with psycopg.connect(pgcat.dsn("shard0"), autocommit=True) as conn:
+                    with pytest.raises(psycopg.errors.TooManyConnections):
+                        # With parameters, psycopg sends it in the extended protocol.
+                        conn.execute(comment(trace).replace("%", "%%") + " SELECT %s::int", (1,))
+        finally:
+            holder.close()
+        span = only(collector.spans_until(trace), trace)
+    finally:
+        pgcat.stop()
+    assert span["status"] == STATUS_ERROR
+    attributes = span["attributes"]
+    assert (attributes["pgcat.protocol"], attributes["pgcat.refused"]) == (protocol, True)
+    assert attributes["error.type"] == "53300"
+    assert "pgcat.server.role" not in attributes and "db.response.status_code" not in attributes
+
+
+PLUGINS = """
+[pools.shard0.plugins.testing]
+enabled = true
+verify_identity = true
+"""
+
+
+@pytest.mark.skipif(
+    os.environ.get("PGCAT_TEST_PLUGINS") != "1",
+    reason="needs pgcat built with --features test-plugins and PGCAT_TEST_PLUGINS=1",
+)
+def test_spans_record_whether_a_plugin_verified_the_identity(collector):
+    pool = """
+query_parser_enabled = true
+plugins_require_parse = true
+identity_tenant_parameter = "app.tenant"
+"""
+    pgcat = utils.PgcatProcess(
+        config(1, collector.endpoint, pool=pool, sections=PLUGINS), PORT, env=ENV
+    ).start()
+    try:
+        # The testing verifier accepts this token and refuses one starting
+        # with `invalid`.
+        token, invalid = f"tenant:{new_trace()}", f"invalid-{new_trace()}"
+        verified, refused, after = new_trace(), new_trace(), new_trace()
+        conn = connect(pgcat)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SET PGCAT_IDENTITY TO '{token}'")
+            cur.execute(f"{comment(verified)} SELECT 1")
+            with pytest.raises(psycopg2.errors.InvalidAuthorizationSpecification):
+                cur.execute(f"{comment(refused)} SET PGCAT_IDENTITY TO '{invalid}'")
+            cur.execute(f"{comment(after)} SELECT 1")
+        finally:
+            conn.close()
+        spans = collector.spans_until(after)
+        logs = pgcat.logs()
+    finally:
+        pgcat.stop()
+
+    attributes = only(spans, verified)["attributes"]
+    assert (attributes["pgcat.identity"], attributes["pgcat.identity.verified"]) == ("present", True)
+    # The refused SET runs with the identity before it, and fails with 28000.
+    span = only(spans, refused)
+    assert span["status"] == STATUS_ERROR
+    assert span["attributes"]["pgcat.identity"] == "present"
+    assert span["attributes"]["pgcat.refused"] is True
+    assert span["attributes"]["error.type"] == "28000"
+    assert "pgcat.server.role" not in span["attributes"]
+    attributes = only(spans, after)["attributes"]
+    assert (attributes["pgcat.identity"], attributes["pgcat.identity.verified"]) == ("refused", False)
+    for secret in (token, invalid):
+        assert secret not in str(spans) and secret not in logs, secret
 
 
 def test_a_statement_timeout_ends_the_span(collector):

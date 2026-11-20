@@ -519,11 +519,34 @@ impl std::fmt::Debug for VerifiedIdentity {
 pub struct Identity {
     token: IdentityToken,
     verified: VerifiedIdentity,
+    /// A plugin verified the token: false when nothing on the pool verifies
+    /// identities, and pgcat keeps any token as sent.
+    by_plugin: bool,
 }
 
 impl Identity {
+    /// A token a plugin verified.
     pub fn new(token: IdentityToken, verified: VerifiedIdentity) -> Identity {
-        Identity { token, verified }
+        Identity {
+            token,
+            verified,
+            by_plugin: true,
+        }
+    }
+
+    /// A token kept as the client sent it: nothing on the pool verifies
+    /// identities, so it names no tenant and has no claims or expiry.
+    pub fn unverified(token: IdentityToken) -> Identity {
+        Identity {
+            token,
+            verified: VerifiedIdentity::default(),
+            by_plugin: false,
+        }
+    }
+
+    /// Whether a plugin verified the token, when it was set or again since.
+    pub fn verified_by_plugin(&self) -> bool {
+        self.by_plugin
     }
 
     pub fn token(&self) -> &IdentityToken {
@@ -544,11 +567,12 @@ impl Identity {
     /// a reload: `None` if nothing verifies identities now. A kept identity
     /// takes the new verification, which names the same tenant and claims, so
     /// it expires when the verifier says now, as a new `SET` of the token
-    /// would.
+    /// would, and counts as verified by a plugin from then on.
     pub fn recheck(&mut self, verified: Option<Result<VerifiedIdentity, String>>) -> Recheck {
         match verified {
             Some(Ok(verified)) if self.verified.same_identity(&verified) => {
                 self.verified = verified;
+                self.by_plugin = true;
                 Recheck::Keep
             }
             Some(Err(error))
@@ -576,6 +600,7 @@ impl std::fmt::Debug for Identity {
         f.debug_struct("Identity")
             .field("token", &self.token)
             .field("verified", &self.verified)
+            .field("by_plugin", &self.by_plugin)
             .finish()
     }
 }
@@ -1201,6 +1226,38 @@ mod tests {
             Recheck::Keep
         );
         assert_eq!(bare.recheck(None), Recheck::End);
+    }
+
+    #[test]
+    fn test_only_a_plugin_verifies_an_identity() {
+        let token = || IdentityToken::new("token".into());
+        assert!(Identity::new(token(), verified("acme", None)).verified_by_plugin());
+
+        // Kept as sent: nothing verified it, until a verifier added in a
+        // reload keeps it.
+        let mut unverified = Identity::unverified(token());
+        assert!(!unverified.verified_by_plugin());
+        assert_eq!(unverified.tenant(), None);
+        assert!(!unverified.expired(SystemTime::now()));
+        assert_eq!(
+            unverified.recheck(Some(Ok(VerifiedIdentity::default()))),
+            Recheck::Keep
+        );
+        assert!(unverified.verified_by_plugin());
+
+        // A verifier that doesn't keep it doesn't verify it.
+        let mut unverified = Identity::unverified(token());
+        let busy = crate::messages::with_sqlstate(crate::plugins::HOOK_BUSY, "no hook slot");
+        assert_eq!(
+            unverified.recheck(Some(Err(busy.clone()))),
+            Recheck::Unavailable(busy)
+        );
+        assert!(!unverified.verified_by_plugin());
+        assert_eq!(
+            unverified.recheck(Some(Ok(verified("acme", None)))),
+            Recheck::End
+        );
+        assert!(!unverified.verified_by_plugin());
     }
     #[test]
     fn test_a_kept_identity_expires_when_verified_again() {

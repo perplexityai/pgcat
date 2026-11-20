@@ -29,7 +29,7 @@ use crate::config::{
     get_config, get_idle_client_in_transaction_timeout, Address, AuthType, PoolMode,
 };
 use crate::constants::*;
-use crate::identity_label::IdentityLapse;
+use crate::identity_label::{IdentityLapse, IdentityState};
 use crate::messages::*;
 use crate::plugins::diagnostics::withhold_server_text;
 use crate::plugins::hook_errors::Hook;
@@ -1375,7 +1375,14 @@ where
                 continue;
             }
 
-            trace_context::client_message(&mut self.traces, &message);
+            trace_context::client_message(&mut self.traces, &message, || {
+                span_caller(
+                    self.identity.as_ref(),
+                    &self.identity_lapse,
+                    &self.server_parameters,
+                    &query_router.pool_settings().sql_observer,
+                )
+            });
 
             // Plan statements with the pool's current settings. A reload since the
             // client's last transaction may have changed what the plugins cover,
@@ -1592,7 +1599,15 @@ where
                             }
                             self.reject_batch(&error, sync, None).await?;
                         }
-                        _ => error_response(&mut self.write, &error).await?,
+                        _ => {
+                            trace_context::refused(
+                                &mut self.traces,
+                                &error,
+                                &self.pool_name,
+                                &self.username,
+                            );
+                            error_response(&mut self.write, &error).await?
+                        }
                     }
 
                     error!(
@@ -1712,7 +1727,14 @@ where
                         .await
                         {
                             Ok(Ok(message)) => {
-                                trace_context::client_message(&mut self.traces, &message);
+                                trace_context::client_message(&mut self.traces, &message, || {
+                                    span_caller(
+                                        self.identity.as_ref(),
+                                        &self.identity_lapse,
+                                        &self.server_parameters,
+                                        &query_router.pool_settings().sql_observer,
+                                    )
+                                });
                                 message
                             }
                             Ok(Err(err)) => {
@@ -2666,6 +2688,9 @@ where
             IdentityCommand::Show => return Ok(IdentityAction::Show),
         };
 
+        // 0 when nothing on the pool verifies identities: `verify_identity`
+        // then keeps any token as sent. `recheck_identity` reads it alike.
+        let by_plugin = query_router.verifier_key() != 0;
         let verified =
             query_router
                 .verify_identity(&token)
@@ -2678,7 +2703,8 @@ where
                 });
 
         match verified {
-            Ok(verified) => Ok(IdentityAction::Set(Identity::new(token, verified))),
+            Ok(verified) if by_plugin => Ok(IdentityAction::Set(Identity::new(token, verified))),
+            Ok(_) => Ok(IdentityAction::Set(Identity::unverified(token))),
             Err(error) => {
                 debug!("Caller identity refused ({})", token);
                 self.set_identity(None);
@@ -3950,6 +3976,7 @@ where
         sync: bool,
         server: Option<&mut Server>,
     ) -> Result<(), Error> {
+        trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
         self.reset_buffered_state();
         let status = self.fail_transaction(server).await?;
 
@@ -3967,6 +3994,7 @@ where
         error: &str,
         server: Option<&mut Server>,
     ) -> Result<(), Error> {
+        trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
         let status = self.fail_transaction(server).await?;
         error_response_with_status(&mut self.write, error, status).await
     }
@@ -5002,6 +5030,31 @@ fn caller_of<'a>(
             .get("application_name")
             .unwrap_or_default(),
         address: Some(addr),
+    }
+}
+
+/// Who sent a statement, for its span: the identity's state and whether a
+/// plugin verified it, and the client's `application_name` only if the pool
+/// labels it as itself (`sql_observer_clients`). An identity whose token has
+/// expired is `expired`, as `expire_identity` makes it before the statement
+/// runs.
+fn span_caller(
+    identity: Option<&Identity>,
+    lapse: &IdentityLapse,
+    server_parameters: &ServerParameters,
+    observer: &SqlObserver,
+) -> trace_context::Caller {
+    let (identity, verified) = match identity {
+        Some(identity) if identity.expired(SystemTime::now()) => (IdentityState::Expired, false),
+        Some(identity) => (IdentityState::Present, identity.verified_by_plugin()),
+        None => (lapse.state(false), false),
+    };
+    trace_context::Caller {
+        identity,
+        verified,
+        client: server_parameters
+            .get("application_name")
+            .and_then(|name| observer.client_label(name)),
     }
 }
 
