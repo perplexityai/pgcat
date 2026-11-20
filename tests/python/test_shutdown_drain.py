@@ -9,6 +9,7 @@ import struct
 import time
 
 import psycopg
+import pytest
 
 import utils
 
@@ -209,45 +210,159 @@ def test_a_client_connecting_during_shutdown_gets_the_shutdown_code():
         pgcat.stop()
 
 
+DIRECT = f"postgres://sharding_user:sharding_user@127.0.0.1:{PG_PORT}/shard0"
+# Zero spread: a client is drained as soon as it is idle.
+NOW = CONFIG.replace(
+    f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 0"
+)
+assert "shutdown_drain_spread = 0\n" in NOW, NOW
+SESSION_POOL = f"""
+[pools.shard0_session]
+pool_mode = "session"
+
+[pools.shard0_session.users.0]
+username = "sharding_user"
+password = "sharding_user"
+pool_size = 1
+
+[pools.shard0_session.shards.0]
+servers = [["127.0.0.1", {PG_PORT}, "primary"]]
+database = "shard0"
+"""
+
+
+def fresh_tables(*tables):
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        for table in tables:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(f"CREATE TABLE {table} (n int)")
+
+
+def drop_tables(*tables):
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        for table in tables:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+def rows(table):
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        return [n for (n,) in conn.execute(f"SELECT n FROM {table} ORDER BY n")]
+
+
+def replies_until(message, last):
+    """Read messages through `last` or an ErrorResponse. Each read is bounded
+    by the socket's timeout."""
+    replies = []
+    while not replies or replies[-1][0] not in (last, b"E"):
+        replies.append(message())
+    return replies
+
+
+def replies_until_closed(message):
+    replies = []
+    while True:
+        try:
+            replies.append(message())
+        except ConnectionError:
+            return replies
+
+
+def copy_data(*values):
+    return b"".join(utils.frontend(b"d", f"{v}\n".encode()) for v in values) + (
+        utils.frontend(b"c", b"")
+    )
+
+
 def test_a_drain_after_a_copy_waits_for_the_rest_of_its_query():
     # After CopyDone, the rest of a simple Query's reply can take more than
     # one read from the server. Checking the server in after the first one
     # leaves the client without its ReadyForQuery, so a drain then closes it
     # with the shutdown code after its COPY ran.
     table = "drain_copy_rows"
-    direct = f"postgres://sharding_user:sharding_user@127.0.0.1:{PG_PORT}/shard0"
-    with psycopg.connect(direct, autocommit=True) as conn:
-        conn.execute(f"DROP TABLE IF EXISTS {table}")
-        conn.execute(f"CREATE TABLE {table} (n int)")
-    now = CONFIG.replace(
-        f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 0"
-    )
-    assert "shutdown_drain_spread = 0\n" in now, now
-    pgcat = utils.PgcatProcess(now, PORT).start()
+    fresh_tables(table)
+    pgcat = utils.PgcatProcess(NOW, PORT).start()
     try:
         sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
         query = f"COPY {table} FROM STDIN; SELECT repeat('x', 10000)\0".encode()
         sock.sendall(utils.frontend(b"Q", query))
         assert message()[0] == b"G"
-        sock.sendall(utils.frontend(b"d", b"1\n") + utils.frontend(b"c", b""))
+        sock.sendall(copy_data(1))
 
         # The COPY ran.
         replies = [message()]
         assert replies == [(b"C", b"COPY 1\0")], replies
         pgcat.process.send_signal(signal.SIGINT)
-        while True:
-            try:
-                replies.append(message())
-            except ConnectionError:
-                break
+        replies += replies_until_closed(message)
 
         codes = [code for code, _ in replies]
         assert codes == [b"C", b"T", b"D", b"C", b"Z", b"E"], codes
         assert replies[2][1].endswith(b"x" * 10000), replies[2]
         assert replies[4] == (b"Z", b"I"), replies[4]
         assert utils.error_fields(replies[5][1]) == SHUTDOWN
+        assert rows(table) == [1]
     finally:
         pgcat.stop()
-    with psycopg.connect(direct, autocommit=True) as conn:
-        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (1,)
-        conn.execute(f"DROP TABLE {table}")
+        drop_tables(table)
+
+
+@pytest.mark.parametrize("db", ["shard0", "shard0_session"])
+def test_a_query_with_rows_between_two_copies_completes(db):
+    # The server sends nothing after CopyInResponse until the client's
+    # data. A DataRow earlier in the reply must not leave pgcat reading the
+    # server for more while the server waits for the client.
+    first, second = "copy_first_rows", "copy_second_rows"
+    fresh_tables(first, second)
+    pgcat = utils.PgcatProcess(CONFIG + SESSION_POOL, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, db, timeout=TIMEOUT)
+        query = (
+            f"COPY {first} FROM STDIN; SELECT repeat('x', 10000); "
+            f"COPY {second} FROM STDIN\0"
+        ).encode()
+        sock.sendall(utils.frontend(b"Q", query))
+        assert [code for code, _ in replies_until(message, b"G")] == [b"G"]
+
+        sock.sendall(copy_data(1))
+        replies = replies_until(message, b"G")
+        assert [code for code, _ in replies] == [b"C", b"T", b"D", b"C", b"G"], replies
+        assert replies[0] == (b"C", b"COPY 1\0"), replies[0]
+        assert replies[2][1].endswith(b"x" * 10000), replies[2]
+
+        sock.sendall(copy_data(2, 3))
+        assert replies_until(message, b"Z") == [(b"C", b"COPY 2\0"), (b"Z", b"I")]
+        assert (rows(first), rows(second)) == ([1], [2, 3])
+    finally:
+        pgcat.stop()
+        drop_tables(first, second)
+
+
+def test_a_drain_between_two_copies_of_a_query_waits_for_the_second():
+    # In transaction mode, the server stays with the client from one COPY
+    # of a Query to the next: checked in between, the second COPY has no
+    # server, and a drain closes the client with the shutdown code after the
+    # first COPY ran.
+    first, second = "drain_first_rows", "drain_second_rows"
+    fresh_tables(first, second)
+    pgcat = utils.PgcatProcess(NOW, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
+        query = f"COPY {first} FROM STDIN; COPY {second} FROM STDIN\0".encode()
+        sock.sendall(utils.frontend(b"Q", query))
+        assert message()[0] == b"G"
+
+        sock.sendall(copy_data(1))
+        replies = replies_until(message, b"G")
+        assert [code for code, _ in replies] == [b"C", b"G"], replies
+        assert replies[0] == (b"C", b"COPY 1\0"), replies[0]
+
+        # The first COPY ran.
+        pgcat.process.send_signal(signal.SIGINT)
+        sock.sendall(copy_data(2, 3))
+        replies = replies_until_closed(message)
+        assert [code for code, _ in replies] == [b"C", b"Z", b"E"], replies
+        assert replies[:2] == [(b"C", b"COPY 2\0"), (b"Z", b"I")], replies
+        assert utils.error_fields(replies[2][1]) == SHUTDOWN
+        assert (rows(first), rows(second)) == ([1], [2, 3])
+    finally:
+        pgcat.stop()
+        drop_tables(first, second)

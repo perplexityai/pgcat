@@ -1161,8 +1161,11 @@ impl Server {
                 }
 
                 // CopyInResponse: copy is starting from client to server.
+                // The server sends nothing more until the client's data, even
+                // if a DataRow earlier in this reply said there was more.
                 'G' => {
                     self.in_copy_mode = true;
+                    self.data_available = false;
                     break;
                 }
 
