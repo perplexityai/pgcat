@@ -3387,8 +3387,11 @@ where
         self.implicit_transaction |= began_transaction;
         if interrupted {
             server.mark_bad("a plugin hook was cut off while it queried the server");
-            // What the hook ran may have had effects, which sending the
-            // client's request again would repeat.
+        }
+        // A hook that lost the server, cut off or by an I/O error on its
+        // query, may have run something with effects, which sending the
+        // client's request again would repeat.
+        if interrupted || server.is_bad() {
             self.write.forwarded();
         }
 
@@ -3543,8 +3546,11 @@ where
             self.implicit_transaction |= began_transaction;
             if interrupted {
                 server.mark_bad("a plugin hook was cut off while it queried the server");
-                // What the hook ran may have had effects, which sending
-                // the client's request again would repeat.
+            }
+            // A hook that lost the server, cut off or by an I/O error on its
+            // query, may have run something with effects, which sending the
+            // client's request again would repeat.
+            if interrupted || server.is_bad() {
                 self.write.forwarded();
             }
 

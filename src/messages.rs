@@ -402,7 +402,7 @@ pub const SHUTTING_DOWN: &str = "PS001";
 /// so the request may have run: connection_failure. Sent FATAL. Also sent
 /// FATAL, instead of `SHUTTING_DOWN`, to a client closed at shutdown after
 /// pgcat forwarded something it sent since its last ReadyForQuery, or a
-/// plugin hook was cut off while it queried the server for it.
+/// plugin hook's query for it was cut off or lost the server.
 pub const SERVER_CONNECTION_LOST: &str = "08006";
 /// pgcat got no server connection for the request in time, so it sent the
 /// server nothing: too_many_connections, Postgres's answer when it has no

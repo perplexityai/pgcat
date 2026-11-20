@@ -30,7 +30,7 @@ impl<T> ClientWriter<T> {
     }
 
     /// pgcat is sending a server something for the client: the client's
-    /// messages, or a plugin hook's query that was cut off.
+    /// messages, or a plugin hook's query that was cut off or lost the server.
     pub fn forwarded(&self) {
         self.unanswered.store(true, Ordering::Relaxed);
     }

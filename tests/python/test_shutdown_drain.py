@@ -374,31 +374,39 @@ def test_a_drain_between_two_copies_of_a_query_waits_for_the_second():
             drop_tables(first, second)
 
 
-HOOKED_POOL = f"""
-[pools.drain_hooks]
+def hooked_pool(name, hook_timeout):
+    """A pool whose testing plugin copies drain_hooked_rows' a to b."""
+    return f"""
+[pools.{name}]
 pool_mode = "transaction"
 query_parser_enabled = true
 plugins_require_parse = true
-plugin_hook_timeout = 300
+plugin_hook_timeout = {hook_timeout}
 
-[pools.drain_hooks.plugins.testing]
+[pools.{name}.plugins.testing]
 enabled = true
 
-[pools.drain_hooks.plugins.testing.copy_param]
+[pools.{name}.plugins.testing.copy_param]
 table = "drain_hooked_rows"
 from = "a"
 to = "b"
 
-[pools.drain_hooks.users.0]
+[pools.{name}.users.0]
 username = "sharding_user"
 password = "sharding_user"
 pool_size = 1
 statement_timeout = 0
 
-[pools.drain_hooks.shards.0]
+[pools.{name}.shards.0]
 servers = [["127.0.0.1", {PG_PORT}, "primary"]]
 database = "shard0"
 """
+
+
+# The testing plugin's slow-query Bind outlives this pool's hook timeout,
+HOOKED_POOL = hooked_pool("drain_hooks", 300)
+# and runs within this one's.
+PATIENT_POOL = hooked_pool("drain_hooks_patient", 10000)
 CONNECTION_LOST = dict(SHUTDOWN, C="08006")
 
 
@@ -418,28 +426,55 @@ def extended(query, *params):
     )
 
 
+def backend_pid(message, sock):
+    """The pid of the server answering `sock` in this transaction."""
+    sock.sendall(utils.frontend(b"Q", b"SELECT pg_backend_pid()\0"))
+    replies = replies_until(message, b"Z")
+    assert [code for code, _ in replies] == [b"T", b"D", b"C", b"Z"], replies
+    columns, length = struct.unpack("!hi", replies[1][1][:6])
+    assert columns == 1, replies
+    return int(replies[1][1][6 : 6 + length])
+
+
+def terminate_once_running(pid, query):
+    """Ends server connection `pid` once it runs `query`."""
+    deadline = time.monotonic() + TIMEOUT
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        while time.monotonic() < deadline:
+            terminated = conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                " WHERE pid = %s AND query = %s AND state = 'active'",
+                [pid, query],
+            ).fetchall()
+            if terminated:
+                assert terminated == [(True,)], terminated
+                return
+    raise AssertionError(f"server {pid} didn't run {query!r} within {TIMEOUT}s")
+
+
 @pytest.mark.skipif(
     os.environ.get("PGCAT_TEST_PLUGINS") != "1",
     reason="needs pgcat built with --features test-plugins and PGCAT_TEST_PLUGINS=1",
 )
-@pytest.mark.parametrize(
-    "insert_first", [True, False], ids=["after-an-insert", "hook-only"]
-)
+@pytest.mark.parametrize("case", ["after-an-insert", "hook-only", "hook-query-lost"])
 def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it(
-    insert_first,
+    case,
 ):
     # In transaction mode, pgcat runs an INSERT sent with Flush and keeps the
     # server for the client's Sync. A Bind hook cut off at the next Flush
     # loses that server, and with it the client's last ReadyForQuery: the
     # INSERT is committed, so the drain must not tell the client to retry.
     # Without the INSERT, what the hook's own query ran may still have had
-    # effects, so the same holds.
+    # effects, so the same holds, and also when that query loses the server
+    # instead of being cut off.
+    insert_first = case == "after-an-insert"
+    lost = case == "hook-query-lost"
     hooked, unhooked = "drain_hooked_rows", "drain_unhooked_rows"
     fresh_tables(unhooked)
     with psycopg.connect(DIRECT, autocommit=True) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {hooked}")
         conn.execute(f"CREATE TABLE {hooked} (a text, b text)")
-    pgcat = utils.PgcatProcess(NOW + HOOKED_POOL, PORT).start()
+    pgcat = utils.PgcatProcess(NOW + HOOKED_POOL + PATIENT_POOL, PORT).start()
     try:
         # Its INSERT is answered with a ReadyForQuery before the drain.
         answered, answered_message = utils.raw_connection(
@@ -452,18 +487,26 @@ def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it(
         answered.sendall(utils.frontend(b"S", b""))
         assert replies_until(answered_message, b"Z") == [(b"Z", b"I")]
 
-        sock, message = utils.raw_connection(PORT, "drain_hooks", timeout=TIMEOUT)
+        pool = "drain_hooks_patient" if lost else "drain_hooks"
+        sock, message = utils.raw_connection(PORT, pool, timeout=TIMEOUT)
+        if lost:
+            # The pool's one server answers the slow Bind too.
+            pid = backend_pid(message, sock)
         if insert_first:
             sock.sendall(extended(insert % 1) + utils.frontend(b"H", b""))
             replies = replies_until(message, b"C")
             assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
 
-        # The hook queries the server and outlives plugin_hook_timeout.
+        # The hook queries the server and outlives plugin_hook_timeout, or
+        # its server connection ends while it waits for the query.
         slow = f"INSERT INTO {hooked} (a) VALUES ($1)"
         sock.sendall(extended(slow, b"slow-query") + utils.frontend(b"H", b""))
+        if lost:
+            terminate_once_running(pid, "SELECT pg_sleep(1)")
         replies = replies_until(message, b"Z")
         assert replies[-1][0] == b"E", replies
-        assert utils.error_fields(replies[-1][1])["C"] == "PH001", replies
+        code = utils.error_fields(replies[-1][1])["C"]
+        assert code == ("XX000" if lost else "PH001"), replies
 
         pgcat.process.send_signal(signal.SIGINT)
         replies = replies_until_closed(message)
