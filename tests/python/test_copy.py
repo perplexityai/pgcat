@@ -303,6 +303,57 @@ def test_copy_fail_by_extended_protocol(pgcat, rows):
     assert stored() == []
 
 
+@pytest.fixture
+def refused():
+    """A table whose statement trigger refuses any COPY into it, before the
+    server reads a row of it."""
+    table = "copy_refused_rows"
+    with postgres() as conn, conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+        cur.execute(f"CREATE TABLE {table} (id int)")
+        cur.execute(
+            "CREATE OR REPLACE FUNCTION copy_refuse() RETURNS trigger LANGUAGE plpgsql"
+            " AS $$ BEGIN RAISE EXCEPTION 'copy refused'; END $$"
+        )
+        cur.execute(
+            f"CREATE TRIGGER copy_refuse BEFORE INSERT ON {table}"
+            " FOR EACH STATEMENT EXECUTE FUNCTION copy_refuse()"
+        )
+    yield table
+    with postgres() as conn, conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+        cur.execute("DROP FUNCTION IF EXISTS copy_refuse()")
+
+
+def backend_pid(message, sock):
+    sock.sendall(query("SELECT pg_backend_pid()"))
+    seen = replies(message)
+    assert codes(seen) == "TDCZ", seen
+    return seen[1][1]
+
+
+def test_an_extended_copy_refused_before_its_data_retires_the_server(pgcat, refused):
+    # The trigger fails the COPY before the server reads anything after
+    # Execute, so the error skips to the client's first Sync, which the
+    # server answers. It then answers the Sync after CopyDone with another
+    # ReadyForQuery. pgcat can't tell which one ended its reply, so the
+    # server must not answer the next client's query with the other.
+    sock, message = raw()
+    pid = backend_pid(message, sock)
+    sock.sendall(parse("", f"COPY {refused} FROM STDIN") + bind("") + EXECUTE + SYNC)
+    assert codes([message(), message(), message()]) == "12G"
+    sock.sendall(copy_data(b"1\n") + COPY_DONE + SYNC)
+    seen = replies(message)
+    assert codes(seen) == "EZ", seen
+    assert sqlstate(seen[0][1]) == "P0001"
+    sock.close()
+
+    sock, message = raw()
+    assert backend_pid(message, sock) != pid
+    still_works(message, sock)
+    sock.close()
+
+
 def test_copy_out_by_extended_protocol_beside_a_cached_statement(pgcat):
     cached = "SELECT 'cached by another client'"
     sock, message = raw()

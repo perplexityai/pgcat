@@ -422,11 +422,18 @@ def extended(query, *params):
     os.environ.get("PGCAT_TEST_PLUGINS") != "1",
     reason="needs pgcat built with --features test-plugins and PGCAT_TEST_PLUGINS=1",
 )
-def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it():
+@pytest.mark.parametrize(
+    "insert_first", [True, False], ids=["after-an-insert", "hook-only"]
+)
+def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it(
+    insert_first,
+):
     # In transaction mode, pgcat runs an INSERT sent with Flush and keeps the
     # server for the client's Sync. A Bind hook cut off at the next Flush
     # loses that server, and with it the client's last ReadyForQuery: the
     # INSERT is committed, so the drain must not tell the client to retry.
+    # Without the INSERT, what the hook's own query ran may still have had
+    # effects, so the same holds.
     hooked, unhooked = "drain_hooked_rows", "drain_unhooked_rows"
     fresh_tables(unhooked)
     with psycopg.connect(DIRECT, autocommit=True) as conn:
@@ -446,9 +453,10 @@ def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it()
         assert replies_until(answered_message, b"Z") == [(b"Z", b"I")]
 
         sock, message = utils.raw_connection(PORT, "drain_hooks", timeout=TIMEOUT)
-        sock.sendall(extended(insert % 1) + utils.frontend(b"H", b""))
-        replies = replies_until(message, b"C")
-        assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
+        if insert_first:
+            sock.sendall(extended(insert % 1) + utils.frontend(b"H", b""))
+            replies = replies_until(message, b"C")
+            assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
 
         # The hook queries the server and outlives plugin_hook_timeout.
         slow = f"INSERT INTO {hooked} (a) VALUES ($1)"
@@ -464,7 +472,7 @@ def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it()
         replies = replies_until_closed(answered_message)
         assert [code for code, _ in replies] == [b"E"], replies
         assert utils.error_fields(replies[0][1]) == SHUTDOWN
-        assert rows(unhooked) == [1, 2]
+        assert rows(unhooked) == ([1, 2] if insert_first else [2])
     finally:
         try:
             pgcat.stop()

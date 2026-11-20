@@ -2251,7 +2251,8 @@ where
                         // The server answers an extended-protocol COPY's end at the
                         // client's next Sync, and runs what comes before that Sync in
                         // the COPY's batch: pgcat takes only the Sync.
-                        if std::mem::take(&mut self.copy_in_extended) {
+                        let extended = std::mem::take(&mut self.copy_in_extended);
+                        if extended {
                             // The COPY is still running on the server: the wait is bounded
                             // as the client's idleness is and as the statement is.
                             let (budget, timed_out) = match pool.settings.user.statement_timeout {
@@ -2299,6 +2300,7 @@ where
                         // The rest of a simple Query can follow the COPY, so the reply
                         // can take more than one read. The client has its
                         // ReadyForQuery before the server is checked in.
+                        let mut failed = false;
                         loop {
                             let response = self
                                 .receive_server_message(
@@ -2308,6 +2310,7 @@ where
                                     &self.stats.clone(),
                                 )
                                 .await?;
+                            failed |= server.last_reply().0;
 
                             match write_all_flush(&mut self.write, &response).await {
                                 Ok(_) => (),
@@ -2320,6 +2323,16 @@ where
                             if !server.is_data_available() {
                                 break;
                             }
+                        }
+
+                        // An extended COPY that fails before the server reads the
+                        // client's first Sync, e.g. at a statement trigger, answers
+                        // that Sync and then the one after CopyDone, each with a
+                        // ReadyForQuery. pgcat can't tell which one this reply
+                        // ended with, so the server may still owe one. It isn't
+                        // checked in to answer another client's request with it.
+                        if extended && failed {
+                            server.mark_bad("an extended-protocol COPY failed, and its server may owe a ReadyForQuery");
                         }
 
                         // The same Query can start another COPY, which is
@@ -3374,6 +3387,9 @@ where
         self.implicit_transaction |= began_transaction;
         if interrupted {
             server.mark_bad("a plugin hook was cut off while it queried the server");
+            // What the hook ran may have had effects, which sending the
+            // client's request again would repeat.
+            self.write.forwarded();
         }
 
         let message = match rewritten {
@@ -3527,6 +3543,9 @@ where
             self.implicit_transaction |= began_transaction;
             if interrupted {
                 server.mark_bad("a plugin hook was cut off while it queried the server");
+                // What the hook ran may have had effects, which sending
+                // the client's request again would repeat.
+                self.write.forwarded();
             }
 
             if let Err(err) = result {

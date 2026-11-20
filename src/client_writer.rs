@@ -8,12 +8,12 @@ use std::task::{ready, Context, Poll};
 use tokio::io::AsyncWrite;
 
 /// Writes to the client, and notes whether the client has been sent a
-/// ReadyForQuery since pgcat last forwarded its messages to a server. Until it
-/// has, what pgcat forwarded may have run, whatever the client was told.
+/// ReadyForQuery since pgcat last sent a server something for it. Until it
+/// has, what pgcat sent may have run, whatever the client was told.
 pub struct ClientWriter<T> {
     inner: T,
-    /// Set when pgcat forwards the client's messages to a server, cleared once
-    /// a whole ReadyForQuery is written to the client. Atomic because pgcat
+    /// Set when pgcat sends a server something for the client, cleared once a
+    /// whole ReadyForQuery is written to the client. Atomic because pgcat
     /// forwards through a shared reference to the client.
     unanswered: AtomicBool,
     frames: Frames,
@@ -29,13 +29,14 @@ impl<T> ClientWriter<T> {
         }
     }
 
-    /// pgcat is forwarding the client's messages to a server.
+    /// pgcat is sending a server something for the client: the client's
+    /// messages, or a plugin hook's query that was cut off.
     pub fn forwarded(&self) {
         self.unanswered.store(true, Ordering::Relaxed);
     }
 
-    /// pgcat forwarded something the client hasn't been sent a ReadyForQuery
-    /// for since.
+    /// pgcat sent a server something for the client, and hasn't sent the
+    /// client a ReadyForQuery since.
     pub fn unanswered(&self) -> bool {
         self.unanswered.load(Ordering::Relaxed)
     }
@@ -143,6 +144,17 @@ mod tests {
         let row = message(b'd', &message(b'Z', b"I"));
         assert!(!frames.ready_for_query_in(&row));
         assert!(!frames.ready_for_query_in(&message(b'C', b"COPY 1\0")));
+        assert!(frames.ready_for_query_in(&message(b'Z', b"I")));
+    }
+
+    #[test]
+    fn a_length_below_four_ends_the_message_at_its_header() {
+        let mut frames = Frames::default();
+        for len in [i32::MIN, -1, 0, 3] {
+            let mut short = vec![b'C'];
+            short.extend_from_slice(&len.to_be_bytes());
+            assert!(!frames.ready_for_query_in(&short));
+        }
         assert!(frames.ready_for_query_in(&message(b'Z', b"I")));
     }
 
