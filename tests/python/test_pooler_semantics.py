@@ -63,6 +63,7 @@ idle_client_in_transaction_timeout = {IDLE_IN_TRANSACTION_MS}
     + pool("sem_timeout", statement_timeout=STATEMENT_TIMEOUT_MS)
     + pool("sem_lifetime", extra=f"server_lifetime = {SERVER_LIFETIME_MS}")
     + pool("sem_appname_off", extra="sync_application_name = false")
+    + pool("sem_limit", extra="checkout_failure_limit = 1")
 )
 
 
@@ -179,13 +180,44 @@ def test_checkout_times_out_while_pool_is_busy(pgcat):
     waiter = connect(pgcat, "sem_one")
 
     started = time.monotonic()
-    with pytest.raises(psycopg.Error, match="could not get connection from the pool"):
+    with pytest.raises(psycopg.Error, match="could not get connection from the pool") as raised:
         waiter.execute("SELECT 1")
     waited = time.monotonic() - started
     assert CONNECT_TIMEOUT_MS / 1000 * 0.8 <= waited < 5, waited
+    # too_many_connections, at ERROR: the waiter's connection stays usable.
+    diag = raised.value.diag
+    assert (diag.sqlstate, diag.severity_nonlocalized) == ("53300", "ERROR")
 
     holder.execute("COMMIT")
+    assert waiter.execute("SELECT 2").fetchone() == (2,)
     assert connect(pgcat, "sem_one").execute("SELECT 2").fetchone() == (2,)
+
+
+# checkout_failure_limit ends the connection with FATAL 53300, after the
+# failed checkout's own ERROR.
+def test_checkout_failure_limit_closes_with_fatal_too_many_connections(pgcat):
+    holder = connect(pgcat, "sem_limit")
+    holder.execute("BEGIN")
+    holder.execute("SELECT 1")
+    sock, message = utils.raw_connection(pgcat.port, "sem_limit", timeout=5)
+    try:
+        sock.sendall(utils.frontend(b"Q", b"SELECT 1\0"))
+        replies = [message() for _ in range(3)]
+        assert [code for code, _ in replies] == [b"E", b"Z", b"E"], replies
+
+        failed = utils.error_fields(replies[0][1])
+        assert (failed["V"], failed["C"]) == ("ERROR", "53300"), failed
+        assert failed["M"].startswith("could not get connection from the pool"), failed
+        assert utils.error_fields(replies[2][1]) == {
+            "S": "FATAL",
+            "V": "FATAL",
+            "C": "53300",
+            "M": "checkout failure limit reached (1 / 1)",
+        }
+        assert utils.closed(sock)
+    finally:
+        sock.close()
+        holder.execute("COMMIT")
 
 
 # Regression: a server connection released by one client doesn't wake a
@@ -476,3 +508,30 @@ def test_statement_timeout_cancels_query(pgcat, table):
     su.close()
     known_bug(rows == ["late"], "query committed after the client saw the timeout")
     assert rows == []
+
+
+# The server connection dies after pgcat forwarded the statement, which may
+# have run: FATAL 08006, never the shutdown code a client may retry, and not
+# Postgres's own 57P01 either.
+def test_a_lost_server_reply_is_fatal_connection_failure(pgcat):
+    su = psycopg.connect(PG, autocommit=True)
+    marker = "lost_reply_probe"
+    sock, message = utils.raw_connection(pgcat.port, "sem_two", timeout=10)
+    try:
+        sock.sendall(utils.frontend(b"Q", f"SELECT pg_sleep(30) /* {marker} */\0".encode()))
+        wait_until(lambda: backend_running(su, marker), "the query to reach Postgres")
+        su.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+            " WHERE query LIKE %s AND pid <> pg_backend_pid()",
+            [f"%{marker}%"],
+        )
+
+        code, body = message()
+        assert code == b"E", (code, body)
+        error = utils.error_fields(body)
+        assert (error["S"], error["V"], error["C"]) == ("FATAL", "FATAL", "08006"), error
+        assert error["M"].startswith("error receiving data from server"), error
+        assert utils.closed(sock)
+    finally:
+        sock.close()
+        su.close()

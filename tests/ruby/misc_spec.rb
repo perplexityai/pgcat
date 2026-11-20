@@ -207,7 +207,7 @@ describe "Miscellaneous" do
               begin
                 conn.async_exec("SELECT pg_sleep(0.5);")
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::SystemError
+              rescue PG::TooManyConnections
                 expect(conn.status).to eq(PG::CONNECTION_OK)
               end
             end
@@ -236,7 +236,7 @@ describe "Miscellaneous" do
               begin
                 conn.async_exec("SELECT pg_sleep(0.5);")
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::SystemError
+              rescue PG::TooManyConnections
                 expect(conn.status).to eq(PG::CONNECTION_OK)
               end
             end
@@ -266,7 +266,7 @@ describe "Miscellaneous" do
               begin
                 conn.async_exec("SELECT pg_sleep(1);")
                 expect(conn.status).to eq(PG::CONNECTION_OK)
-              rescue PG::SystemError
+              rescue PG::TooManyConnections
                 checkout_failure_count += 1
                 expect(conn.status).to eq(PG::CONNECTION_OK)
               rescue PG::ConnectionBad

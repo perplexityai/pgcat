@@ -281,3 +281,13 @@ def recv_exactly(sock, n):
 
 def frontend(code, body):
     return code + struct.pack("!i", 4 + len(body)) + body
+
+
+def error_fields(body):
+    """An ErrorResponse's fields by their one-letter code, e.g. "C" for the SQLSTATE."""
+    return {field[:1].decode(): field[1:].decode() for field in body.rstrip(b"\0").split(b"\0")}
+
+
+def closed(sock):
+    """Whether the peer closed `sock`, waiting at most the socket's timeout."""
+    return sock.recv(1) == b""

@@ -805,8 +805,9 @@ where
                 "Rejecting non-admin connection to {} when in admin only mode",
                 pool_name
             );
-            error_response_terminal(
+            fatal_response(
                 &mut write,
+                SHUTTING_DOWN,
                 "terminating connection due to administrator command",
             )
             .await?;
@@ -1336,8 +1337,12 @@ where
                         _ = tokio::time::sleep_until(
                             self.drain_at.unwrap_or_else(tokio::time::Instant::now)
                         ), if self.drain_at.is_some() => {
-                            error_response_terminal(
+                            // No server connection is held here, so nothing
+                            // the client sent after its last ReadyForQuery
+                            // was forwarded.
+                            fatal_response(
                                 &mut self.write,
+                                SHUTTING_DOWN,
                                 "terminating connection due to administrator command"
                             ).await?;
 
@@ -1570,7 +1575,10 @@ where
 
                     error_response(
                         &mut self.write,
-                        format!("could not get connection from the pool - {}", err).as_str(),
+                        &with_sqlstate(
+                            NO_SERVER_CONNECTION,
+                            &format!("could not get connection from the pool - {}", err),
+                        ),
                     )
                     .await?;
 
@@ -1596,8 +1604,9 @@ where
                                 "Checkout failure limit reached ({} / {}) - disconnecting client",
                                 checkout_failure_count, limit
                             );
-                            error_response_terminal(
+                            fatal_response(
                                 &mut self.write,
+                                NO_SERVER_CONNECTION,
                                 &format!(
                                     "checkout failure limit reached ({} / {})",
                                     checkout_failure_count, limit
@@ -4879,8 +4888,9 @@ where
                 Err(err) => {
                     trace_context::server_failed(&mut self.traces, address, "server_connection");
                     pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
-                    error_response_terminal(
+                    fatal_response(
                         &mut self.write,
+                        SERVER_CONNECTION_LOST,
                         &format!("error receiving data from server: {:?}", err),
                     )
                     .await?;

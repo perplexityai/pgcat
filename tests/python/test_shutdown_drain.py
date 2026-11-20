@@ -4,7 +4,11 @@ over the window, not all at once, so they don't all reconnect elsewhere at once.
 import os
 import selectors
 import signal
+import socket
+import struct
 import time
+
+import psycopg
 
 import utils
 
@@ -13,6 +17,14 @@ PG_PORT = int(os.environ.get("PGCAT_TEST_PG_PORT", "5432"))
 SPREAD = 5.0
 TIMEOUT = 10.0
 CLIENTS = 50
+# What a client may retry on a new connection: pgcat sent nothing it got on
+# this one to a server.
+SHUTDOWN = {
+    "S": "FATAL",
+    "V": "FATAL",
+    "C": "PS001",
+    "M": "terminating connection due to administrator command",
+}
 
 CONFIG = f"""
 [general]
@@ -137,4 +149,61 @@ def test_a_reload_raising_both_settings_moves_the_hard_exit():
         assert len(closed_after) == CLIENTS
         assert max(closed_after) > 2, closed_after
     finally:
+        pgcat.stop()
+
+
+def test_a_drained_client_gets_the_shutdown_code_and_is_closed():
+    now = CONFIG.replace(
+        f"shutdown_drain_spread = {int(SPREAD * 1000)}", "shutdown_drain_spread = 0"
+    )
+    assert "shutdown_drain_spread = 0\n" in now, now
+    pgcat = utils.PgcatProcess(now, PORT).start()
+    try:
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=TIMEOUT)
+        pgcat.process.send_signal(signal.SIGINT)
+
+        code, body = message()
+        assert code == b"E", (code, body)
+        assert utils.error_fields(body) == SHUTDOWN
+        assert utils.closed(sock)
+    finally:
+        pgcat.stop()
+
+
+def startup(port, db):
+    """Send a StartupMessage as sharding_user; return the socket and pgcat's
+    first reply."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT)
+    params = f"user\0sharding_user\0database\0{db}\0\0".encode()
+    sock.sendall(struct.pack("!ii", 8 + len(params), 196608) + params)
+    code, length = struct.unpack("!ci", utils.recv_exactly(sock, 5))
+    return sock, code, utils.recv_exactly(sock, length - 4)
+
+
+def test_a_client_connecting_during_shutdown_gets_the_shutdown_code():
+    pgcat = utils.PgcatProcess(CONFIG, PORT).start()
+    # pgcat exits once no non-admin client is left, and drains a client only
+    # between transactions, so this one keeps it running.
+    holder = psycopg.connect(
+        f"postgres://sharding_user:sharding_user@127.0.0.1:{PORT}/shard0"
+    )
+    try:
+        holder.execute("SELECT 1")
+        pgcat.process.send_signal(signal.SIGINT)
+
+        # A connection that starts before pgcat handles SIGINT is admitted.
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            sock, code, body = startup(PORT, "shard0")
+            if code != b"R":
+                break
+            sock.close()
+            assert time.monotonic() < deadline, "pgcat admitted clients after SIGINT"
+
+        assert code == b"E", (code, body)
+        assert utils.error_fields(body) == SHUTDOWN
+        assert utils.closed(sock)
+        sock.close()
+    finally:
+        holder.close()
         pgcat.stop()
