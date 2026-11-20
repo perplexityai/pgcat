@@ -301,8 +301,10 @@ def test_a_drain_after_a_copy_waits_for_the_rest_of_its_query():
         assert utils.error_fields(replies[5][1]) == SHUTDOWN
         assert rows(table) == [1]
     finally:
-        pgcat.stop()
-        drop_tables(table)
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(table)
 
 
 @pytest.mark.parametrize("db", ["shard0", "shard0_session"])
@@ -332,8 +334,10 @@ def test_a_query_with_rows_between_two_copies_completes(db):
         assert replies_until(message, b"Z") == [(b"C", b"COPY 2\0"), (b"Z", b"I")]
         assert (rows(first), rows(second)) == ([1], [2, 3])
     finally:
-        pgcat.stop()
-        drop_tables(first, second)
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(first, second)
 
 
 def test_a_drain_between_two_copies_of_a_query_waits_for_the_second():
@@ -364,5 +368,105 @@ def test_a_drain_between_two_copies_of_a_query_waits_for_the_second():
         assert utils.error_fields(replies[2][1]) == SHUTDOWN
         assert (rows(first), rows(second)) == ([1], [2, 3])
     finally:
-        pgcat.stop()
-        drop_tables(first, second)
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(first, second)
+
+
+HOOKED_POOL = f"""
+[pools.drain_hooks]
+pool_mode = "transaction"
+query_parser_enabled = true
+plugins_require_parse = true
+plugin_hook_timeout = 300
+
+[pools.drain_hooks.plugins.testing]
+enabled = true
+
+[pools.drain_hooks.plugins.testing.copy_param]
+table = "drain_hooked_rows"
+from = "a"
+to = "b"
+
+[pools.drain_hooks.users.0]
+username = "sharding_user"
+password = "sharding_user"
+pool_size = 1
+statement_timeout = 0
+
+[pools.drain_hooks.shards.0]
+servers = [["127.0.0.1", {PG_PORT}, "primary"]]
+database = "shard0"
+"""
+CONNECTION_LOST = dict(SHUTDOWN, C="08006")
+
+
+def extended(query, *params):
+    """Parse, Bind, and Execute `query` unnamed, with text `params`."""
+    values = b"".join(struct.pack("!i", len(p)) + p for p in params)
+    return (
+        utils.frontend(b"P", b"\0" + query.encode() + b"\0" + struct.pack("!h", 0))
+        + utils.frontend(
+            b"B",
+            b"\0\0"
+            + struct.pack("!hh", 0, len(params))
+            + values
+            + struct.pack("!h", 0),
+        )
+        + utils.frontend(b"E", b"\0" + struct.pack("!i", 0))
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("PGCAT_TEST_PLUGINS") != "1",
+    reason="needs pgcat built with --features test-plugins and PGCAT_TEST_PLUGINS=1",
+)
+def test_a_client_drained_before_its_flushed_work_is_answered_may_not_retry_it():
+    # In transaction mode, pgcat runs an INSERT sent with Flush and keeps the
+    # server for the client's Sync. A Bind hook cut off at the next Flush
+    # loses that server, and with it the client's last ReadyForQuery: the
+    # INSERT is committed, so the drain must not tell the client to retry.
+    hooked, unhooked = "drain_hooked_rows", "drain_unhooked_rows"
+    fresh_tables(unhooked)
+    with psycopg.connect(DIRECT, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {hooked}")
+        conn.execute(f"CREATE TABLE {hooked} (a text, b text)")
+    pgcat = utils.PgcatProcess(NOW + HOOKED_POOL, PORT).start()
+    try:
+        # Its INSERT is answered with a ReadyForQuery before the drain.
+        answered, answered_message = utils.raw_connection(
+            PORT, "drain_hooks", timeout=TIMEOUT
+        )
+        insert = f"INSERT INTO {unhooked} VALUES (%s)"
+        answered.sendall(extended(insert % 2) + utils.frontend(b"H", b""))
+        replies = replies_until(answered_message, b"C")
+        assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
+        answered.sendall(utils.frontend(b"S", b""))
+        assert replies_until(answered_message, b"Z") == [(b"Z", b"I")]
+
+        sock, message = utils.raw_connection(PORT, "drain_hooks", timeout=TIMEOUT)
+        sock.sendall(extended(insert % 1) + utils.frontend(b"H", b""))
+        replies = replies_until(message, b"C")
+        assert [code for code, _ in replies] == [b"1", b"2", b"C"], replies
+
+        # The hook queries the server and outlives plugin_hook_timeout.
+        slow = f"INSERT INTO {hooked} (a) VALUES ($1)"
+        sock.sendall(extended(slow, b"slow-query") + utils.frontend(b"H", b""))
+        replies = replies_until(message, b"Z")
+        assert replies[-1][0] == b"E", replies
+        assert utils.error_fields(replies[-1][1])["C"] == "PH001", replies
+
+        pgcat.process.send_signal(signal.SIGINT)
+        replies = replies_until_closed(message)
+        assert [code for code, _ in replies] == [b"E"], replies
+        assert utils.error_fields(replies[0][1]) == CONNECTION_LOST
+        replies = replies_until_closed(answered_message)
+        assert [code for code, _ in replies] == [b"E"], replies
+        assert utils.error_fields(replies[0][1]) == SHUTDOWN
+        assert rows(unhooked) == [1, 2]
+    finally:
+        try:
+            pgcat.stop()
+        finally:
+            drop_tables(hooked, unhooked)

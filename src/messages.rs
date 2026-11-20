@@ -394,12 +394,14 @@ pub fn error_message(message: &str) -> BytesMut {
 /// pgcat is shutting down and closed the client connection before forwarding
 /// anything the client sent after its last ReadyForQuery. Nothing sent on the
 /// connection since then ran, so the client can send it again on a new
-/// connection. Sent FATAL to idle clients closed at shutdown, and to clients
-/// that connect while pgcat accepts only admin connections. Class PS is
-/// pgcat's own: Postgres defines no class starting with P but P0 (PL/pgSQL).
+/// connection. Sent FATAL to clients closed at shutdown, and to clients that
+/// connect while pgcat accepts only admin connections. Class PS is pgcat's
+/// own: Postgres defines no class starting with P but P0 (PL/pgSQL).
 pub const SHUTTING_DOWN: &str = "PS001";
 /// The server connection failed after pgcat forwarded the client's request,
-/// so the request may have run: connection_failure. Sent FATAL.
+/// so the request may have run: connection_failure. Sent FATAL. Also sent
+/// FATAL, instead of `SHUTTING_DOWN`, to a client closed at shutdown after
+/// pgcat forwarded something it sent since its last ReadyForQuery.
 pub const SERVER_CONNECTION_LOST: &str = "08006";
 /// pgcat got no server connection for the request in time, so it sent the
 /// server nothing: too_many_connections, Postgres's answer when it has no

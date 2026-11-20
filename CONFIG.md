@@ -133,7 +133,7 @@ default: 0 # milliseconds
 
 On SIGINT, close each idle client after a random delay between 0 and this value, instead of closing them all at once. This spreads their reconnects to other instances over the window. Must be less than `shutdown_timeout`. 0 closes idle clients right away.
 
-Each client gets a FATAL `terminating connection due to administrator command` with SQLSTATE `PS001` before pgcat closes it, and so does a non-admin client that connects after SIGINT. pgcat sends it only while it holds no server connection for the client, so nothing the client sent after its last ReadyForQuery ran, and the client can send it again on a new connection. Before `PS001`, pgcat sent this error with SQLSTATE `58000`.
+Each client gets a FATAL `terminating connection due to administrator command` before pgcat closes it. Its SQLSTATE is `PS001` when pgcat forwarded nothing the client sent after its last ReadyForQuery, so none of it ran and the client can send it again on a new connection. A non-admin client that connects after SIGINT gets `PS001` too. If pgcat did forward something since, as when it let a server connection go mid-exchange, the SQLSTATE is `08006` instead: what the client sent may have run. Before `PS001`, pgcat sent this error with SQLSTATE `58000`.
 
 ### ban_time
 ```

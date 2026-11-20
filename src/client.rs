@@ -1,3 +1,4 @@
+use crate::client_writer::ClientWriter;
 use crate::errors::{ClientIdentifier, Error};
 use crate::held_replies::HeldReplies;
 use crate::identity::{
@@ -76,7 +77,7 @@ pub struct Client<S, T> {
 
     /// We buffer the writes ourselves because we know the protocol
     /// better than a stock buffer.
-    write: T,
+    write: ClientWriter<T>,
 
     /// Internal buffer, where we place messages until we have to flush
     /// them to the backend.
@@ -1111,7 +1112,7 @@ where
 
         Ok(Client {
             read: BufReader::new(read),
-            write,
+            write: ClientWriter::new(write),
             buffer: BytesMut::with_capacity(8196),
             response_message_queue_buffer: BytesMut::with_capacity(8196),
             held_replies: HeldReplies::default(),
@@ -1183,7 +1184,7 @@ where
         let secret_key = bytes.get_i32();
         Ok(Client {
             read: BufReader::new(read),
-            write,
+            write: ClientWriter::new(write),
             buffer: BytesMut::with_capacity(8196),
             response_message_queue_buffer: BytesMut::with_capacity(8196),
             held_replies: HeldReplies::default(),
@@ -1337,12 +1338,17 @@ where
                         _ = tokio::time::sleep_until(
                             self.drain_at.unwrap_or_else(tokio::time::Instant::now)
                         ), if self.drain_at.is_some() => {
-                            // No server connection is held here, so nothing
-                            // the client sent after its last ReadyForQuery
-                            // was forwarded.
+                            // No server connection is held here, but one let
+                            // go mid-exchange may have run what the client sent
+                            // since its last ReadyForQuery.
+                            let code = if self.write.unanswered() {
+                                SERVER_CONNECTION_LOST
+                            } else {
+                                SHUTTING_DOWN
+                            };
                             fatal_response(
                                 &mut self.write,
-                                SHUTTING_DOWN,
+                                code,
                                 "terminating connection due to administrator command"
                             ).await?;
 
@@ -2316,7 +2322,9 @@ where
                             }
                         }
 
-                        if !server.in_transaction() {
+                        // The same Query can start another COPY, which is
+                        // still part of it and still needs the server.
+                        if !server.in_transaction() && !server.in_copy_mode() {
                             self.stats.transaction();
                             server
                                 .stats()
@@ -2324,8 +2332,7 @@ where
 
                             // Release server back to the pool if we are in transaction mode.
                             // If we are in session mode, we keep the server until the client disconnects.
-                            // The same Query can start another COPY, which still needs it.
-                            if self.transaction_mode && !server.in_copy_mode() {
+                            if self.transaction_mode {
                                 break;
                             }
                         }
@@ -4843,6 +4850,7 @@ where
         address: &Address,
         pool: &ConnectionPool,
     ) -> Result<(), Error> {
+        self.write.forwarded();
         match server.send(message).await {
             Ok(_) => Ok(()),
             Err(err) => {

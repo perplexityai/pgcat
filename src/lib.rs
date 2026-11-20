@@ -13,6 +13,7 @@ mod upstream_main;
 pub mod admin;
 pub mod auth_passthrough;
 pub mod client;
+pub mod client_writer;
 pub mod cmd_args;
 pub mod codec;
 pub mod config;
