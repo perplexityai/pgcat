@@ -849,6 +849,110 @@ def test_a_refused_function_call_leaves_the_execute_waiting_for_its_sync(collect
         assert (attributes["pgcat.server.role"], attributes["pgcat.shard"]) == ("primary", 0)
 
 
+def simple_query(sql):
+    return utils.frontend(b"Q", sql.encode() + b"\0")
+
+
+def queries_while_an_execute_waits(sock, message, executed, waiting, answer, local, failed):
+    """An Execute of `waiting` without its Sync, a Query pgcat answers or
+    refuses, then one a server runs and fails with 22012."""
+    sock.sendall(unsynced_execute(f"{comment(executed)} {waiting}"))
+    if answer == "answered":
+        sock.sendall(simple_query(f"{comment(local)} SHOW PGCAT_IDENTITY"))
+        expected = [b"T", b"D", b"C", b"Z"]
+    else:
+        sock.sendall(simple_query(f"{comment(local)} SET PGCAT_IDENTITY TO 'x'; SELECT 1"))
+        expected = [b"E", b"Z"]
+    replies = until_ready(message)
+    assert [code for code, _ in replies] == expected, replies
+    sock.sendall(simple_query(f"{comment(failed)} SELECT 1/0"))
+    replies = until_ready(message)
+    assert [code for code, _ in replies] == [b"E", b"Z"], replies
+    assert utils.error_fields(replies[0][1])["C"] == "22012", replies
+
+
+def server_errors(spans):
+    return [span for span in spans if span["attributes"].get("db.response.status_code") == "22012"]
+
+
+@pytest.mark.parametrize("answer", ["answered", "refused"])
+@pytest.mark.parametrize("waiting", ["SHOW PGCAT_IDENTITY", "SELECT 41"])
+def test_a_query_a_server_runs_ends_only_its_own_span(pgcat, collector, waiting, answer):
+    # The server's reply to a Query is the Query's, even with an Execute
+    # waiting for its Sync: the Execute's span ends at that Sync's reply.
+    executed, local, failed = new_trace(), new_trace(), new_trace()
+    sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+    try:
+        queries_while_an_execute_waits(sock, message, executed, waiting, answer, local, failed)
+        before = spans_after(pgcat, collector)
+        assert [span for span in before if span["trace_id"] == executed] == []
+
+        sock.sendall(utils.frontend(b"S", b""))
+        replies = until_ready(message)
+        assert [code for code, _ in replies] == [b"1", b"2", b"D", b"C", b"Z"], replies
+    finally:
+        sock.close()
+    spans = spans_after(pgcat, collector)
+
+    assert server_errors(spans) == [only(spans, failed)]
+    attributes = only(spans, failed)["attributes"]
+    assert (attributes["pgcat.protocol"], attributes["pgcat.server.role"]) == ("simple", "primary")
+    if waiting == "SELECT 41":
+        span = only(spans, executed)
+        assert span["status"] == 0
+        attributes = span["attributes"]
+        assert (attributes["pgcat.protocol"], attributes["pgcat.server.role"]) == ("extended", "primary")
+        assert "pgcat.refused" not in attributes and "error.type" not in attributes
+    else:
+        assert [span for span in spans if span["trace_id"] == executed] == []
+    if answer == "refused":
+        attributes = only(spans, local)["attributes"]
+        assert (attributes["pgcat.refused"], attributes["error.type"]) == (True, "0A000")
+    else:
+        assert [span for span in spans if span["trace_id"] == local] == []
+
+
+def test_an_execute_waiting_when_the_client_disconnects_gets_no_span(pgcat, collector):
+    executed, local, failed = new_trace(), new_trace(), new_trace()
+    sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+    try:
+        queries_while_an_execute_waits(sock, message, executed, "SELECT 41", "answered", local, failed)
+    finally:
+        sock.close()
+    spans = spans_after(pgcat, collector)
+    assert server_errors(spans) == [only(spans, failed)]
+    assert [span for span in spans if span["trace_id"] in (executed, local)] == []
+
+
+@pytest.mark.parametrize("ending", [b"S", b"H"])
+def test_a_copy_keeps_its_span_past_a_sync_in_its_data(pgcat, collector, ending):
+    # The server ignores a Sync or Flush during COPY IN; here a bad row before
+    # it has failed the COPY, whose span ends at the COPY's ReadyForQuery.
+    copy = new_trace()
+    sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+    try:
+        sock.sendall(simple_query("BEGIN; CREATE TEMP TABLE copied (n int) ON COMMIT DROP"))
+        assert [code for code, _ in until_ready(message)] == [b"C", b"C", b"Z"]
+        sock.sendall(simple_query(f"{comment(copy)} COPY copied FROM STDIN"))
+        assert message()[0] == b"G"
+        sock.sendall(utils.frontend(b"d", b"x\n") + utils.frontend(ending, b""))
+        code, body = message()
+        assert (code, utils.error_fields(body)["C"]) == (b"E", "22P02"), body
+        if ending == b"S":
+            assert message()[0] == b"Z"
+        sock.sendall(utils.frontend(b"c", b""))
+        assert message()[0] == b"Z"
+        sock.sendall(simple_query("ROLLBACK"))
+        assert [code for code, _ in until_ready(message)] == [b"C", b"Z"]
+    finally:
+        sock.close()
+    span = only(spans_after(pgcat, collector), copy)
+    assert span["status"] == STATUS_ERROR
+    attributes = span["attributes"]
+    assert (attributes["error.type"], attributes["db.response.status_code"]) == ("22P02", "22P02")
+    assert (attributes["pgcat.protocol"], attributes["pgcat.server.role"]) == ("simple", "primary")
+
+
 PLUGINS = """
 [pools.shard0.plugins.testing]
 enabled = true

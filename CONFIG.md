@@ -212,12 +212,15 @@ a child of a traceparent the client sent, and a statement without one isn't trac
 listed under Known gaps below.
 
 Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
-caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for its
-batch, so the Executes of a pipelined batch all end at its Sync and share its outcome: if any of them
-fails, all carry the first error. Its attributes are `db.system.name` (`postgresql`),
-`pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`, `pgcat.shard`, `pgcat.protocol`
-(`simple` or `extended`), and three about the caller, as the client was when pgcat read the
-statement:
+caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for
+it: a simple Query's own, and for an Execute, the one after its batch's Sync. The Executes of a
+pipelined batch all end there and share its outcome: if any of them fails, all carry the first
+error. A simple Query the client sends while extended-protocol messages wait for their Sync ends
+only its own span, whether a server runs it or pgcat answers or refuses it: those messages run at
+the Sync, and the server's reply to that ends theirs. A span's attributes are `db.system.name`
+(`postgresql`), `pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`, `pgcat.shard`,
+`pgcat.protocol` (`simple` or `extended`), and three about the caller, as the client was when pgcat
+read the statement:
 
 - `pgcat.identity`: the client's `PGCAT_IDENTITY` state, `present`, `absent`, `expired` or
   `refused`, as the SQL observer labels it (see `sql_observer_enabled`).
@@ -249,9 +252,7 @@ as the client sees it; `_OTHER` if it isn't five digits or capital letters). Not
 error is read, and the span has no `pgcat.server.role`, `pgcat.shard` or `db.response.status_code`,
 since no server may have been checked out. When pgcat refuses the rest of a batch after the server
 failed one of its statements, the spans keep the server's error. A pipelined batch's statements
-share the refusal, as they share its outcome. A simple Query pgcat refuses while extended-protocol
-messages wait for their Sync ends only its own span: those messages run at the Sync, and the
-server's reply ends theirs.
+share the refusal, as they share its outcome.
 
 Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
 don't include them; other pgcat logging is unchanged. Other batches pgcat answers itself, such as
@@ -269,10 +270,6 @@ Known gaps:
   still carry that name in `pgcat.client`. A client holding a server checked out before the reload
   keeps carrying it until that checkout ends, which in session mode is when the client disconnects,
   or until a reload changes the pool's plugins; the statement after either can carry it too.
-- When a simple Query runs while extended-protocol messages wait for their Sync, its reply ends pgcat's
-  record of what those messages traced. If the server then rejects that batch, or pgcat drops it, a
-  statement name the batch reused keeps the batch's traceparent, and the statement still under that
-  name is traced with it.
 
 Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
 and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.
