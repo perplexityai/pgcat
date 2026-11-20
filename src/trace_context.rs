@@ -645,11 +645,33 @@ pub fn server_failed(
 
 /// pgcat refused the client's pending statements with `error`, the message it
 /// answers them with: their spans end now, failed with its SQLSTATE and
-/// nothing else from it. Call before the batch is dropped.
+/// nothing else from it. Call before the batch is dropped, or the session
+/// ended; for a simple Query alone, see [`query_refused`].
 pub fn refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
     if let Some(traces) = traces.as_deref_mut() {
         if let Some(outcome) = traces.refused(error) {
             traces.export(outcome, Ending::Refused { pool, user });
+        }
+    }
+}
+
+/// pgcat refused the client's simple Query with `error` before a server ran
+/// it, and the session goes on: only the Query's span ends, refused as with
+/// [`refused`]. Extended-protocol statements the client sent before it, still
+/// waiting for their Sync, keep their spans: they run later.
+pub fn query_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
+    if let Some(traces) = traces.as_deref_mut() {
+        if let Some(pending) = traces.query_refused() {
+            if let Some(exporter) = EXPORTER.load().as_deref() {
+                let ending = Ending::Refused { pool, user };
+                export(
+                    exporter,
+                    &pending,
+                    &refusal(error),
+                    ending,
+                    SystemTime::now(),
+                );
+            }
         }
     }
 }
@@ -813,27 +835,31 @@ impl ClientTraces {
         Some(outcome)
     }
 
-    /// The pending statements' outcome, refused with `error`, unless the
-    /// server failed them first: only its SQLSTATE is read, and only if it's
-    /// five of `[0-9A-Z]`.
+    /// The pending statements' outcome, refused with `error` (see
+    /// [`refusal`]), unless the server failed them first.
     fn refused(&mut self, error: &str) -> Option<Outcome> {
         if self.pending.is_empty() {
             return None;
         }
         let mut outcome = std::mem::take(&mut self.outcome);
         if !outcome.failed {
-            // pgcat sends an error without one as 58000 (`messages::error_message`).
-            let code = sqlstate_of(error).0.unwrap_or("58000").as_bytes();
-            outcome = Outcome {
-                failed: true,
-                sqlstate: <[u8; 5]>::try_from(code)
-                    .ok()
-                    .filter(|code| code.iter().all(|byte| is_sqlstate_byte(*byte))),
-                error_type: None,
-                refused: true,
-            };
+            outcome = refusal(error);
         }
         Some(outcome)
+    }
+
+    /// The span of the simple Query just read, which pgcat refused, if it has
+    /// one. The Query sealed the batch, but its refusal ends only the Query:
+    /// what the client sent before it is unsealed again, as it was, so that
+    /// its next messages add to the same batch.
+    fn query_refused(&mut self) -> Option<Pending> {
+        self.sealed = false;
+        // A Query read while the batch is sealed discards it first, so a
+        // simple statement's span can only be the last, and this Query's.
+        match self.pending.last() {
+            Some(pending) if pending.protocol == "simple" => self.pending.pop(),
+            _ => None,
+        }
     }
 
     fn batch_dropped(&mut self) {
@@ -880,6 +906,21 @@ impl ClientTraces {
             }
         }
         self.discard();
+    }
+}
+
+/// pgcat's refusal with `error`: only its SQLSTATE is read, and only if it's
+/// five of `[0-9A-Z]`.
+fn refusal(error: &str) -> Outcome {
+    // pgcat sends an error without one as 58000 (`messages::error_message`).
+    let code = sqlstate_of(error).0.unwrap_or("58000").as_bytes();
+    Outcome {
+        failed: true,
+        sqlstate: <[u8; 5]>::try_from(code)
+            .ok()
+            .filter(|code| code.iter().all(|byte| is_sqlstate_byte(*byte))),
+        error_type: None,
+        refused: true,
     }
 }
 
@@ -1860,6 +1901,63 @@ mod tests {
         assert_eq!(
             (outcome.refused, outcome.sqlstate),
             (false, Some(*b"22012"))
+        );
+    }
+
+    #[test]
+    fn a_refused_query_ends_only_its_span() {
+        let mut traces = ClientTraces::default();
+        // Executes waiting for their Sync, then a Query pgcat refuses.
+        run(
+            &mut traces,
+            &[
+                parse("", &sampled_sql(1)),
+                bind("", ""),
+                execute(""),
+                query(&sampled_sql(2)),
+            ],
+        );
+        let span = traces.query_refused().unwrap();
+        assert_eq!(u128::from_be_bytes(span.parent.trace_id.to_bytes()), 2);
+        assert_eq!(span.protocol, "simple");
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        // The batch goes on, and its Sync's ReadyForQuery ends the rest.
+        run(&mut traces, &[execute(""), frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(1, "extended"), (1, "extended")]);
+        assert_eq!(ready(&mut traces), Some(Outcome::default()));
+
+        // An untraced Query has no span to end: the batch goes on too.
+        run(
+            &mut traces,
+            &[
+                parse("", &sampled_sql(3)),
+                bind("", ""),
+                execute(""),
+                query("SELECT 1"),
+            ],
+        );
+        assert_eq!(traces.query_refused(), None);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(3, "extended")]);
+        assert_eq!(ready(&mut traces), Some(Outcome::default()));
+
+        // A Query alone ends with its span, and the next batch starts afresh.
+        run(&mut traces, &[query(&sampled_sql(4))]);
+        assert_eq!(
+            traces.query_refused().map(|pending| pending.protocol),
+            Some("simple")
+        );
+        assert_eq!(traced(&traces), []);
+        run(&mut traces, &[query(&sampled_sql(5))]);
+        assert_eq!(traced(&traces), [(5, "simple")]);
+        assert_eq!(
+            refusal(&refused("28000", "PGCAT_IDENTITY refused: tok")),
+            Outcome {
+                failed: true,
+                sqlstate: Some(*b"28000"),
+                error_type: None,
+                refused: true,
+            }
         );
     }
 

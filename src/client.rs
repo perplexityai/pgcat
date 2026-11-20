@@ -1599,8 +1599,10 @@ where
                             }
                             self.reject_batch(&error, sync, None).await?;
                         }
+                        // Extended messages buffered before a simple Query
+                        // stay buffered: only the Query is refused.
                         _ => {
-                            trace_context::refused(
+                            trace_context::query_refused(
                                 &mut self.traces,
                                 &error,
                                 &self.pool_name,
@@ -1632,15 +1634,19 @@ where
                                 "Checkout failure limit reached ({} / {}) - disconnecting client",
                                 checkout_failure_count, limit
                             );
-                            fatal_response(
-                                &mut self.write,
-                                NO_SERVER_CONNECTION,
-                                &format!(
-                                    "checkout failure limit reached ({} / {})",
-                                    checkout_failure_count, limit
-                                ),
-                            )
-                            .await?;
+                            let error = format!(
+                                "checkout failure limit reached ({} / {})",
+                                checkout_failure_count, limit
+                            );
+                            // The session ends: extended messages still waiting
+                            // for their Sync never run.
+                            trace_context::refused(
+                                &mut self.traces,
+                                &with_sqlstate(NO_SERVER_CONNECTION, &error),
+                                &self.pool_name,
+                                &self.username,
+                            );
+                            fatal_response(&mut self.write, NO_SERVER_CONNECTION, &error).await?;
                             self.stats.disconnect();
                             return Ok(());
                         }
@@ -3995,13 +4001,14 @@ where
         error_response_terminal(&mut self.write, error).await
     }
 
-    /// Answer a simple Query pgcat refused.
+    /// Answer a simple Query pgcat refused. Extended messages the client sent
+    /// before it, waiting for their Sync, aren't: they run at that Sync.
     async fn refuse_query(
         &mut self,
         error: &str,
         server: Option<&mut Server>,
     ) -> Result<(), Error> {
-        trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
+        trace_context::query_refused(&mut self.traces, error, &self.pool_name, &self.username);
         let status = self.fail_transaction(server).await?;
         error_response_with_status(&mut self.write, error, status).await
     }
