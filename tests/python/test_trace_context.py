@@ -953,6 +953,56 @@ def test_a_copy_keeps_its_span_past_a_sync_in_its_data(pgcat, collector, ending)
     assert (attributes["pgcat.protocol"], attributes["pgcat.server.role"]) == ("simple", "primary")
 
 
+
+@pytest.mark.parametrize("row", [b"41\n", b"x\n"])
+def test_a_batch_refused_during_a_copy_leaves_the_copy_its_span(pgcat, collector, row):
+    # A Flush during COPY IN hands pgcat the batch buffered before the COPY,
+    # which it refuses for mixing in an identity command. The COPY goes on, and
+    # its own ReadyForQuery ends its span.
+    executed, copy = new_trace(), new_trace()
+    sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+    try:
+        sock.sendall(
+            unsynced_execute(f"{comment(executed)} SELECT 41")
+            + unsynced_execute("SHOW PGCAT_IDENTITY")
+            + simple_query(
+                f"{comment(copy)} CREATE TEMP TABLE copied (n int) ON COMMIT DROP; COPY copied FROM STDIN"
+            )
+        )
+        assert [message()[0], message()[0]] == [b"C", b"G"]
+        sock.sendall(utils.frontend(b"H", b""))
+        code, body = message()
+        assert (code, utils.error_fields(body)["C"]) == (b"E", "0A000"), body
+        before = spans_after(pgcat, collector)
+        attributes = only(before, executed)["attributes"]
+        assert (attributes["pgcat.refused"], attributes["error.type"]) == (True, "0A000")
+        assert [span for span in before if span["trace_id"] == copy] == []
+
+        sock.sendall(utils.frontend(b"d", row) + utils.frontend(b"c", b""))
+        (code, body), ready = until_ready(message)
+        if row == b"41\n":
+            assert (code, body) == (b"C", b"COPY 1\x00")
+        else:
+            assert (code, utils.error_fields(body)["C"]) == (b"E", "22P02"), body
+        assert ready[0] == b"Z"
+        # The Sync ends the discard the refused Flush began.
+        sock.sendall(utils.frontend(b"S", b""))
+        assert [code for code, _ in until_ready(message)] == [b"Z"]
+    finally:
+        sock.close()
+    spans = spans_after(pgcat, collector)
+    assert only(spans, executed)["attributes"]["pgcat.refused"] is True
+    span = only(spans, copy)
+    attributes = span["attributes"]
+    assert "pgcat.refused" not in attributes
+    assert (attributes["pgcat.protocol"], attributes["pgcat.server.role"]) == ("simple", "primary")
+    if row == b"41\n":
+        assert span["status"] == 0
+        assert "error.type" not in attributes
+    else:
+        assert span["status"] == STATUS_ERROR
+        assert (attributes["error.type"], attributes["db.response.status_code"]) == ("22P02", "22P02")
+
 PLUGINS = """
 [pools.shard0.plugins.testing]
 enabled = true

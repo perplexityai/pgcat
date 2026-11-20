@@ -213,14 +213,14 @@ listed under Known gaps below.
 
 Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
 caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for
-it: a simple Query's own, and for an Execute, the one after its batch's Sync. The Executes of a
-pipelined batch all end there and share its outcome: if any of them fails, all carry the first
-error. A simple Query the client sends while extended-protocol messages wait for their Sync ends
-only its own span, whether a server runs it or pgcat answers or refuses it: those messages run at
-the Sync, and the server's reply to that ends theirs. A span's attributes are `db.system.name`
-(`postgresql`), `pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`, `pgcat.shard`,
-`pgcat.protocol` (`simple` or `extended`), and three about the caller, as the client was when pgcat
-read the statement:
+it: a simple Query's own, and for an Execute, the one for its batch's Sync or Flush. The Executes of
+a pipelined batch all end there and share its outcome: if any of them fails, all carry the first
+error. A simple Query the client sends while extended-protocol messages wait for their Sync or
+Flush ends only its own span, whether a server runs it or pgcat answers or refuses it: those
+messages run at their Sync or Flush, and the server's reply to it ends theirs. A span's attributes
+are `db.system.name` (`postgresql`), `pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`,
+`pgcat.shard`, `pgcat.protocol` (`simple` or `extended`), and three about the caller, as the client
+was when pgcat read the statement:
 
 - `pgcat.identity`: the client's `PGCAT_IDENTITY` state, `present`, `absent`, `expired` or
   `refused`, as the SQL observer labels it (see `sql_observer_enabled`).
@@ -243,8 +243,9 @@ with ones for the server; an identity command pgcat can't run; one no server cou
 for (`connect_timeout`), and what waits for a Sync when that ends the session
 (`checkout_failure_limit`); and the statement at which a reload ends the session, having changed the
 identity's verifier or, for a client holding a server, the pool's tenant guard or server-text
-withholding. Such a reload ends the session at the client's next message, so in the extended
-protocol an Execute pgcat hasn't read yet gets no span. Nor does a statement whose pool a reload
+withholding. Such a reload ends the session at the next message at which pgcat checks the reloaded
+settings, a Query, Parse, Bind, Execute, Sync or Flush, so in the extended protocol an Execute pgcat
+hasn't read by then gets no span. Nor does a statement whose pool a reload
 removed before a server was checked out for it: pgcat answers it with `58000` ("No pool configured")
 and ends the session. The span ends when pgcat sends the error. It has an error status,
 `pgcat.refused` (`true`) and, as `error.type`, the SQLSTATE of that error (`58000` if it has none,
@@ -252,11 +253,15 @@ as the client sees it; `_OTHER` if it isn't five digits or capital letters). Not
 error is read, and the span has no `pgcat.server.role`, `pgcat.shard` or `db.response.status_code`,
 since no server may have been checked out. When pgcat refuses the rest of a batch after the server
 failed one of its statements, the spans keep the server's error. A pipelined batch's statements
-share the refusal, as they share its outcome.
+share the refusal, as they share its outcome. A batch pgcat refuses at a Sync or Flush during a
+simple Query's COPY IN doesn't refuse the COPY, which goes on and ends at its own ReadyForQuery.
 
 Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
-don't include them; other pgcat logging is unchanged. Other batches pgcat answers itself, such as
-the identity commands it runs, have no span, nor do replies a client disconnects before.
+don't include them; other pgcat logging is unchanged. Other statements pgcat answers itself, such
+as the identity commands it runs, have no span. Neither do those pgcat hasn't sent to a server when
+it sees the client disconnect, such as Executes still waiting for their Sync. A statement a server
+is already running still ends at the server's reply, even if the client has closed its socket by
+then.
 
 Known gaps:
 

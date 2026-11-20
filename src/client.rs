@@ -3985,7 +3985,7 @@ where
         sync: bool,
         server: Option<&mut Server>,
     ) -> Result<(), Error> {
-        trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
+        trace_context::batch_refused(&mut self.traces, error, &self.pool_name, &self.username);
         self.reset_buffered_state();
         let status = self.fail_transaction(server).await?;
 

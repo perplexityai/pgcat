@@ -33,7 +33,7 @@
 //! SQLSTATE of that error and nothing else from it. One pgcat answers itself,
 //! such as an identity command, has no span: a batch's spans end unexported
 //! when pgcat answers it, a simple Query's at the client's next message, and
-//! those of a client that disconnects before its reply go with it.
+//! those pgcat hasn't sent to a server when the client disconnects go with it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -665,17 +665,29 @@ pub fn server_failed(
     }
 }
 
-/// pgcat refused the client's pending statements, its open simple Query and
-/// its batch, with `error`, the message it answers them with: their spans end
-/// now, failed with its SQLSTATE and nothing else from it. Call before the
-/// batch is dropped, or the session ended; for a simple Query alone, see
-/// [`query_refused`].
+/// pgcat ends the session at the client's pending statements, its open simple
+/// Query and its batch, with `error`, the message it answers them with: their
+/// spans end now, failed with its SQLSTATE and nothing else from it. Call
+/// before the session ends; for a refusal the session goes on after, see
+/// [`batch_refused`] and [`query_refused`].
 pub fn refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
     if let Some(traces) = traces.as_deref_mut() {
         let ending = Ending::Refused { pool, user };
         let ended = [traces.query_refused(error), traces.refused(error)];
         for ended in ended.into_iter().flatten() {
             export_ended(&ended, ending);
+        }
+    }
+}
+
+/// pgcat refused the client's buffered batch with `error`, and the session
+/// goes on: only the batch's spans end, refused as with [`refused`]. Call
+/// before the batch is dropped. A simple Query a server is still running, as
+/// during COPY IN, goes on too, and its own ReadyForQuery ends its span.
+pub fn batch_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
+    if let Some(traces) = traces.as_deref_mut() {
+        if let Some(ended) = traces.refused(error) {
+            export_ended(&ended, Ending::Refused { pool, user });
         }
     }
 }
@@ -2221,6 +2233,35 @@ mod tests {
         run(&mut traces, &[parse("", "SELECT 1")]);
         assert_eq!(traced(&traces), []);
         assert_eq!(ready(&mut traces), None);
+    }
+
+    #[test]
+    fn a_batch_refusal_leaves_a_running_copy_its_span() {
+        // A Flush during COPY IN hands pgcat the batch the client buffered
+        // before the Query: refusing it ends only the batch's spans, and the
+        // COPY's ReadyForQuery ends its own. Ending the session ends both.
+        let copying = || {
+            let mut traces = ClientTraces::default();
+            run(&mut traces, &execute_traced(1));
+            run(&mut traces, &[query(&sampled_sql(4))]);
+            traces.server_replied(&frame(b'G', b"\0\0\0"), false, false);
+            run(&mut traces, &[frame(b'H', b"")]);
+            Some(Box::new(traces))
+        };
+        let mixed = refused("0A000", "mixed");
+
+        let mut traces = copying();
+        batch_refused(&mut traces, &mixed, "pool", "user");
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), [(4, "simple")]);
+        run(&mut traces, &[frame(b'd', b"1\n"), frame(b'c', b"")]);
+        let ended = ready_ended(&mut traces).unwrap();
+        assert_eq!(ids(&ended.spans), [(4, "simple")]);
+        assert_eq!(ended.outcome, Outcome::default());
+
+        let mut traces = copying();
+        super::refused(&mut traces, &mixed, "pool", "user");
+        assert_eq!(traced(&traces.unwrap()), []);
     }
 
     fn attribute_map(attributes: Vec<KeyValue>) -> Vec<(String, String)> {
