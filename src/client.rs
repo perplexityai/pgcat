@@ -1601,7 +1601,7 @@ where
                         }
                         // Extended messages buffered before a simple Query
                         // stay buffered: only the Query is refused.
-                        _ => {
+                        b'Q' => {
                             trace_context::query_refused(
                                 &mut self.traces,
                                 &error,
@@ -1610,6 +1610,8 @@ where
                             );
                             error_response(&mut self.write, &error).await?
                         }
+                        // A function call, say, which has no span.
+                        _ => error_response(&mut self.write, &error).await?,
                     }
 
                     error!(
@@ -3946,6 +3948,7 @@ where
         if let Some(bound) = self.bound_since_reload.as_mut() {
             bound.answered_locally();
         }
+        trace_context::batch_answered(&mut self.traces);
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.accept_local_batch();
         }

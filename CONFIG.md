@@ -255,14 +255,10 @@ server's reply ends theirs.
 
 Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
 don't include them; other pgcat logging is unchanged. Other batches pgcat answers itself, such as
-the identity commands it runs, normally have no span (see Known gaps), nor do replies a client
-disconnects before.
+the identity commands it runs, have no span, nor do replies a client disconnects before.
 
 Known gaps:
 
-- When a batch pgcat answers itself ends with a Flush, and the client's next message is a lone Sync
-  that pgcat sends to the server to end a transaction it opened at an earlier Flush, that batch's spans
-  end at the Sync's reply, with its time and outcome; if pgcat refuses that Sync, they end as refused.
 - A batch the server rejects forgets the prepared statements it traced, including ones the server
   created, so their later executions have no span until they're parsed again.
 - pgcat sees SQL `DEALLOCATE` and `DISCARD` only in a simple Query it successfully parses, and then

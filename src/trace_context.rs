@@ -676,6 +676,15 @@ pub fn query_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: 
     }
 }
 
+/// pgcat answered the client's buffered batch itself, every message of it,
+/// at its Sync or Flush: its spans end without being exported, as batches
+/// pgcat answers itself have none, and what it parsed and bound stays traced.
+pub fn batch_answered(traces: &mut Option<Box<ClientTraces>>) {
+    if let Some(traces) = traces.as_deref_mut() {
+        traces.batch_answered();
+    }
+}
+
 /// pgcat dropped the client's buffered batch without sending it: what it
 /// parsed and bound doesn't exist, and no reply will end its spans.
 pub fn batch_dropped(traces: &mut Option<Box<ClientTraces>>) {
@@ -700,10 +709,15 @@ impl ClientTraces {
         now: SystemTime,
         caller: impl FnOnce() -> Caller,
     ) {
-        // pgcat finishes a batch before it reads the next one, so a message
-        // that starts a batch while the last one is sealed means that batch
-        // got no ReadyForQuery from a server: pgcat answered it. COPY data
-        // (d, c, f) belongs to the sealed batch and doesn't end it.
+        // A simple Query a server runs ends at its ReadyForQuery, before
+        // pgcat reads the next message, so a Query still pending here is one
+        // pgcat answered itself: its span ends, unexported, and what the
+        // client sent before it, waiting for its Sync, is unsealed. A message
+        // that starts a batch then ends the rest. COPY data (d, c, f) is read
+        // while a server runs the Query and ends neither.
+        if self.sealed && !matches!(message.first(), Some(b'd' | b'c' | b'f') | None) {
+            self.query_answered();
+        }
         if self.sealed
             && matches!(
                 message.first(),
@@ -854,12 +868,33 @@ impl ClientTraces {
     /// its next messages add to the same batch.
     fn query_refused(&mut self) -> Option<Pending> {
         self.sealed = false;
-        // A Query read while the batch is sealed discards it first, so a
-        // simple statement's span can only be the last, and this Query's.
+        self.take_query()
+    }
+
+    /// pgcat answered the simple Query that sealed the batch itself: its
+    /// span ends unexported, and what the client sent before it is unsealed.
+    fn query_answered(&mut self) {
+        if self.take_query().is_some() {
+            self.sealed = false;
+        }
+    }
+
+    /// The last simple Query's span, if it's still pending.
+    fn take_query(&mut self) -> Option<Pending> {
+        // A message read after a Query ends its span (see `client_message`),
+        // so a simple statement's span can only be the last, and this Query's.
         match self.pending.last() {
             Some(pending) if pending.protocol == "simple" => self.pending.pop(),
             _ => None,
         }
+    }
+
+    /// pgcat answered the whole batch itself: like a server's ReadyForQuery,
+    /// it ends the batch's spans, here unexported, and what the batch parsed
+    /// and bound stays traced.
+    fn batch_answered(&mut self) {
+        self.end_batch(false);
+        self.discard();
     }
 
     fn batch_dropped(&mut self) {
@@ -1959,6 +1994,75 @@ mod tests {
                 refused: true,
             }
         );
+    }
+
+    #[test]
+    fn a_batch_pgcat_answered_ends_unexported() {
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s", &sampled_sql(1)),
+                bind("p", "s"),
+                execute("p"),
+                frame(b'S', b""),
+            ],
+        );
+        traces.batch_answered();
+        // A trailing Flush or Sync has nothing to end, even if it's refused.
+        run(&mut traces, &[frame(b'H', b"")]);
+        assert_eq!(traced(&traces), []);
+        assert!(!traces.sealed);
+        assert_eq!(traces.refused(&refused("53300", "no server")), None);
+        // What the batch parsed and bound stays traced, past a later batch
+        // pgcat drops too.
+        run(&mut traces, &[bind("q", "s"), frame(b'S', b"")]);
+        traces.batch_dropped();
+        run(&mut traces, &[execute("p"), frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+    }
+
+    #[test]
+    fn a_query_pgcat_answered_ends_alone() {
+        let mut traces = ClientTraces::default();
+        // An Execute waiting for its Sync, then a Query pgcat answered: the
+        // next message ends only the Query's span, and a Sync runs the rest.
+        let waiting = [
+            parse("", &sampled_sql(1)),
+            bind("", ""),
+            execute(""),
+            query(&sampled_sql(2)),
+        ];
+        run(&mut traces, &waiting);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        assert!(traces.sealed);
+        assert_eq!(ready(&mut traces), Some(Outcome::default()));
+        // A function call, or another message of the batch.
+        for next in [frame(b'F', b"\0\0\0\0"), parse("", "SELECT 1")] {
+            run(&mut traces, &waiting);
+            run(&mut traces, &[next]);
+            assert_eq!(traced(&traces), [(1, "extended")]);
+            assert!(!traces.sealed);
+            traces.discard();
+        }
+
+        // COPY data belongs to the Query.
+        run(
+            &mut traces,
+            &[
+                query(&sampled_sql(3)),
+                frame(b'd', b"1\n"),
+                frame(b'c', b""),
+            ],
+        );
+        assert_eq!(traced(&traces), [(3, "simple")]);
+        traces.discard();
+        // A Query alone leaves nothing to refuse.
+        run(&mut traces, &[query(&sampled_sql(4)), frame(b'S', b"")]);
+        assert_eq!(traced(&traces), []);
+        assert!(!traces.sealed);
+        assert_eq!(traces.refused(&refused("53300", "no server")), None);
     }
 
     fn attribute_map(attributes: Vec<KeyValue>) -> Vec<(String, String)> {

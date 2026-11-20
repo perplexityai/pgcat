@@ -678,6 +678,177 @@ def test_the_checkout_failure_limit_ends_the_spans_waiting_for_a_sync(collector)
         assert "pgcat.server.role" not in attributes
 
 
+def one_server(collector, pool=""):
+    """pgcat with one server, for a test to hold so checkouts fail."""
+    return utils.PgcatProcess(
+        config(1, collector.endpoint, pool=pool, general="connect_timeout = 300", pool_size=1),
+        PORT,
+        env=ENV,
+    ).start()
+
+
+def held(pgcat):
+    holder = connect(pgcat)
+    holder.cursor().execute("BEGIN")
+    return holder
+
+
+def spans_after(pgcat, collector):
+    """Every span exported so far, once a marker statement's span arrives."""
+    marker = new_trace()
+    run(pgcat, f"{comment(marker)} SELECT 1")
+    return collector.spans_until(marker)
+
+
+def test_an_identity_command_pgcat_answered_in_a_pipeline_gets_no_span(collector):
+    # Psycopg sends a pipelined statement as Parse, Bind, Describe, Execute,
+    # Sync and Flush. pgcat answers the identity command at the Sync, so the
+    # Flush that finds no server has nothing left to refuse.
+    pgcat = one_server(collector)
+    try:
+        answered = new_trace()
+        holder = held(pgcat)
+        conn = psycopg.connect(pgcat.dsn("shard0"), autocommit=True)
+        try:
+            with pytest.raises(psycopg.Error):
+                with conn.pipeline():
+                    cur = conn.execute(f"{comment(answered)} SHOW PGCAT_IDENTITY")
+                    assert cur.fetchone() == (False, None)
+        finally:
+            conn.close()
+            holder.close()
+        spans = spans_after(pgcat, collector)
+    finally:
+        pgcat.stop()
+    assert [span for span in spans if span["trace_id"] == answered] == []
+
+
+@pytest.mark.parametrize("end", ["sync", "flush", "query"])
+def test_a_batch_pgcat_answered_gets_no_span_when_the_next_sync_is_refused(collector, end):
+    pgcat = one_server(collector)
+    try:
+        answered = new_trace()
+        sql = f"{comment(answered)} SHOW PGCAT_IDENTITY"
+        holder = held(pgcat)
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+        try:
+            if end == "query":
+                sock.sendall(utils.frontend(b"Q", sql.encode() + b"\0"))
+                replies = until_ready(message)
+                assert [code for code, _ in replies] == [b"T", b"D", b"C", b"Z"], replies
+            elif end == "sync":
+                sock.sendall(unsynced_execute(sql) + utils.frontend(b"S", b""))
+                replies = until_ready(message)
+                assert [code for code, _ in replies] == [b"1", b"2", b"D", b"C", b"Z"], replies
+            else:
+                sock.sendall(unsynced_execute(sql) + utils.frontend(b"H", b""))
+                replies = [message() for _ in range(4)]
+                assert [code for code, _ in replies] == [b"1", b"2", b"D", b"C"], replies
+
+            # A Sync on its own, with no server to check out.
+            sock.sendall(utils.frontend(b"S", b""))
+            replies = until_ready(message)
+            assert [code for code, _ in replies] == [b"E", b"Z"], replies
+            assert utils.error_fields(replies[0][1])["C"] == "53300", replies
+        finally:
+            sock.close()
+            holder.close()
+        spans = spans_after(pgcat, collector)
+    finally:
+        pgcat.stop()
+    assert [span for span in spans if span["trace_id"] == answered] == []
+
+
+def test_each_execute_of_a_refused_batch_gets_one_span(collector):
+    # After a batch pgcat answered, a batch no server could be checked out for
+    # still ends each Execute's span as refused, once.
+    pgcat = one_server(collector)
+    try:
+        answered, first, second = new_trace(), new_trace(), new_trace()
+        holder = held(pgcat)
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+        try:
+            sock.sendall(unsynced_execute(f"{comment(answered)} SHOW PGCAT_IDENTITY") + utils.frontend(b"S", b""))
+            replies = until_ready(message)
+            assert [code for code, _ in replies] == [b"1", b"2", b"D", b"C", b"Z"], replies
+            sock.sendall(
+                unsynced_execute(f"{comment(first)} SELECT 1")
+                + unsynced_execute(f"{comment(second)} SELECT 2")
+                + utils.frontend(b"S", b"")
+            )
+            for _ in range(2):
+                replies = until_ready(message)
+                assert [code for code, _ in replies] == [b"E", b"Z"], replies
+                assert utils.error_fields(replies[0][1])["C"] == "53300", replies
+                sock.sendall(utils.frontend(b"S", b""))
+        finally:
+            sock.close()
+            holder.close()
+        spans = spans_after(pgcat, collector)
+    finally:
+        pgcat.stop()
+    assert [span for span in spans if span["trace_id"] == answered] == []
+    for trace in (first, second):
+        span = only(spans, trace)
+        assert span["status"] == STATUS_ERROR
+        attributes = span["attributes"]
+        assert (attributes["pgcat.protocol"], attributes["pgcat.refused"]) == ("extended", True)
+        assert attributes["error.type"] == "53300"
+
+
+def function_call():
+    """A FunctionCall of no function, no arguments: never reaches a server here."""
+    return utils.frontend(b"F", struct.pack("!ihhh", 0, 0, 0, 0))
+
+
+@pytest.mark.parametrize("limit", [False, True])
+def test_a_refused_function_call_leaves_the_execute_waiting_for_its_sync(collector, limit):
+    # An Execute waits for its Sync, and pgcat answers a Query in between.
+    # A function call no server could be checked out for refuses only itself.
+    pgcat = one_server(collector, pool="checkout_failure_limit = 1" if limit else "")
+    try:
+        executed, answered = new_trace(), new_trace()
+        holder = held(pgcat)
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+        try:
+            sock.sendall(
+                unsynced_execute(f"{comment(executed)} SELECT 41")
+                + utils.frontend(b"Q", f"{comment(answered)} SHOW PGCAT_IDENTITY".encode() + b"\0")
+            )
+            replies = until_ready(message)
+            assert [code for code, _ in replies] == [b"T", b"D", b"C", b"Z"], replies
+
+            sock.sendall(function_call())
+            replies = until_ready(message)
+            assert [code for code, _ in replies] == [b"E", b"Z"], replies
+            assert utils.error_fields(replies[0][1])["C"] == "53300", replies
+            if limit:
+                # The limit ends the session: the Execute never runs.
+                code, body = message()
+                assert code == b"E" and utils.error_fields(body)["S"] == "FATAL", (code, body)
+                assert utils.closed(sock)
+            else:
+                holder.close()
+                sock.sendall(utils.frontend(b"S", b""))
+                replies = until_ready(message)
+                assert [code for code, _ in replies] == [b"1", b"2", b"D", b"C", b"Z"], replies
+                assert replies[2][1].endswith(b"41"), replies
+        finally:
+            sock.close()
+            holder.close()
+        spans = spans_after(pgcat, collector)
+    finally:
+        pgcat.stop()
+
+    assert [span for span in spans if span["trace_id"] == answered] == []
+    attributes = only(spans, executed)["attributes"]
+    if limit:
+        assert (attributes["pgcat.refused"], attributes["error.type"]) == (True, "53300")
+    else:
+        assert "pgcat.refused" not in attributes, attributes
+        assert (attributes["pgcat.server.role"], attributes["pgcat.shard"]) == ("primary", 0)
+
+
 PLUGINS = """
 [pools.shard0.plugins.testing]
 enabled = true
