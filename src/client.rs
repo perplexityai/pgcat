@@ -2816,8 +2816,8 @@ where
     }
 
     /// The server goes back to the pool: its portals are gone, and a simple
-    /// Query it was running, a COPY whose data it was still reading, gets no
-    /// ReadyForQuery from it. Every check-in goes through here.
+    /// Query or batch it was running, such as a COPY whose data it was still
+    /// reading, gets no ReadyForQuery from it. Every check-in goes through here.
     fn detach_server(&mut self) {
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.server_released();

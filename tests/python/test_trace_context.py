@@ -1060,6 +1060,56 @@ def test_a_copy_whose_server_pgcat_let_go_gets_no_span(collector):
     assert [span for span in spans if span["trace_id"] == copy] == []
 
 
+def test_an_extended_copy_whose_server_pgcat_let_go_gets_no_span(collector):
+    # An extended-protocol COPY the server is running when the client goes
+    # idle in it: pgcat gives the server back to the pool, which closes it
+    # mid-COPY. The batch's ReadyForQuery never comes, and a later refusal
+    # mustn't end its span.
+    pgcat = utils.PgcatProcess(
+        config(
+            1,
+            collector.endpoint,
+            pool="checkout_failure_limit = 1",
+            general="connect_timeout = 300\nidle_client_in_transaction_timeout = 500",
+            pool_size=1,
+        ),
+        PORT,
+        env=ENV,
+    ).start()
+    table = f"copied_{new_trace()[:12]}"
+    try:
+        run(pgcat, f"CREATE TABLE {table} (n int)")
+        copy = new_trace()
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+        try:
+            sock.sendall(
+                unsynced_execute(f"{comment(copy)} COPY {table} FROM STDIN") + utils.frontend(b"S", b"")
+            )
+            assert [message()[0] for _ in range(3)] == [b"1", b"2", b"G"]
+            (code, _), ready = until_ready(message)
+            assert (code, ready[0]) == (b"E", b"Z")
+            assert [span for span in spans_after(pgcat, collector) if span["trace_id"] == copy] == []
+
+            # With the only server held, the next Sync ends the session.
+            holder = held(pgcat)
+            try:
+                sock.sendall(utils.frontend(b"S", b""))
+                replies = [message() for _ in range(3)]
+                assert [code for code, _ in replies] == [b"E", b"Z", b"E"], replies
+                assert utils.error_fields(replies[0][1])["C"] == "53300", replies
+                assert utils.error_fields(replies[2][1])["S"] == "FATAL", replies
+                assert utils.closed(sock)
+            finally:
+                holder.close()
+        finally:
+            sock.close()
+        spans = spans_after(pgcat, collector)
+        run(pgcat, f"DROP TABLE {table}")
+    finally:
+        pgcat.stop()
+    assert [span for span in spans if span["trace_id"] == copy] == []
+
+
 PLUGINS = """
 [pools.shard0.plugins.testing]
 enabled = true

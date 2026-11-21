@@ -34,7 +34,7 @@
 //! such as an identity command, has no span: a batch's spans end unexported
 //! when pgcat answers it, a simple Query's at the client's next message, and
 //! those pgcat hasn't sent to a server when the client disconnects go with it.
-//! So does a simple Query whose server pgcat lets go of before its
+//! So does a simple Query or a batch whose server pgcat lets go of before its
 //! ReadyForQuery, such as a COPY still reading the client's data.
 
 use std::collections::HashMap;
@@ -539,6 +539,11 @@ pub struct ClientTraces {
     /// server reply leaves its spans here: the next batch discards them.
     sealed: bool,
     outcome: Outcome,
+    /// A server replied to the batch and hasn't ended it with its
+    /// ReadyForQuery, as during an extended-protocol COPY IN, when pgcat reads
+    /// the client again first. Like an open Query's, the batch is valid only
+    /// while that server stays attached (`server_detached`).
+    batch_at_server: bool,
     /// The simple Query being answered, from when pgcat reads it until its
     /// ReadyForQuery. pgcat sends it to the server on its own, while the batch
     /// the client sent before it waits for its Sync: the server's replies until
@@ -698,15 +703,15 @@ pub fn batch_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: 
 }
 
 /// pgcat let go of the client's server: it checked the server in, or closes
-/// it with the session. A simple Query the server replied to but hasn't
-/// ended, a COPY whose data it was reading, gets no ReadyForQuery now: its
-/// span ends unexported. One no server replied to isn't the server's, and
-/// the batch's spans, which no server has run, stay pending.
+/// it with the session. What the server replied to but hasn't ended gets no
+/// ReadyForQuery now, and its spans end unexported: a simple Query, or a
+/// batch, whose statements and portals are forgotten too. Either can be a
+/// COPY whose data the server was reading. A Query or batch no server has
+/// replied to isn't the server's: it stays pending, and a refusal can still
+/// end it.
 pub fn server_detached(traces: &mut Option<Box<ClientTraces>>) {
     if let Some(traces) = traces.as_deref_mut() {
-        if traces.query.as_ref().is_some_and(|query| query.at_server) {
-            traces.query = None;
-        }
+        traces.server_detached();
     }
 }
 
@@ -883,6 +888,7 @@ impl ClientTraces {
             }
             return self.query.take().and_then(Query::ended);
         }
+        self.batch_at_server = !ready_for_query;
         if error || ready_for_query {
             self.end_batch(error);
         }
@@ -898,6 +904,17 @@ impl ClientTraces {
         }
         let outcome = std::mem::take(&mut self.outcome);
         Some(self.batch_ended(outcome))
+    }
+
+    /// See [`server_detached`].
+    fn server_detached(&mut self) {
+        if self.query.as_ref().is_some_and(|query| query.at_server) {
+            self.query = None;
+        }
+        if self.batch_at_server {
+            self.end_batch(true);
+            self.discard();
+        }
     }
 
     /// The server failed: the open simple Query's span ends failed if there is
@@ -997,6 +1014,7 @@ impl ClientTraces {
         self.pending.clear();
         self.sealed = false;
         self.outcome = Outcome::default();
+        self.batch_at_server = false;
     }
 }
 
@@ -2304,6 +2322,53 @@ mod tests {
         let ended = traces.query_refused(&no_server).unwrap();
         assert_eq!(ids(&ended.spans), [(4, "simple")]);
         assert!(ended.outcome.refused);
+    }
+
+    #[test]
+    fn a_batch_lives_only_while_its_server_is_attached() {
+        // An extended-protocol COPY: the server answered the batch's Sync
+        // with CopyInResponse. Once pgcat lets go of the server, its
+        // ReadyForQuery can't come: the batch's spans end unexported, and what
+        // it parsed and bound is forgotten.
+        let no_server = refused("53300", "no server");
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s", &sampled_sql(1)),
+                bind("p", "s"),
+                execute("p"),
+                frame(b'S', b""),
+            ],
+        );
+        for reply in [frame(b'1', b""), frame(b'2', b""), frame(b'G', b"\0\0\0")] {
+            assert_eq!(traces.server_replied(&reply, false, false), None);
+        }
+        let mut traces = Some(Box::new(traces));
+        server_detached(&mut traces);
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), []);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traces.refused(&no_server), None);
+        run(&mut traces, &[bind("q", "s"), execute("q")]);
+        assert_eq!(traced(&traces), []);
+
+        // A batch the server ended with its ReadyForQuery is done with it,
+        // spans or not: the next batch, still being sent, stays pending.
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[parse("s", &sampled_sql(2)), frame(b'S', b"")],
+        );
+        assert_eq!(traces.server_replied(&frame(b'1', b""), false, false), None);
+        assert_eq!(ready(&mut traces), None);
+        run(&mut traces, &[bind("p", "s"), execute("p")]);
+        let mut traces = Some(Box::new(traces));
+        server_detached(&mut traces);
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), [(2, "extended")]);
+        let ended = traces.refused(&no_server).unwrap();
+        assert_eq!(ids(&ended.spans), [(2, "extended")]);
     }
 
     fn attribute_map(attributes: Vec<KeyValue>) -> Vec<(String, String)> {
