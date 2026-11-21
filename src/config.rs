@@ -1,6 +1,6 @@
 /// Parse the configuration file.
 use arc_swap::ArcSwap;
-use log::{error, info};
+use log::{error, info, warn};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserializer, Serializer};
@@ -816,6 +816,9 @@ impl Pool {
     ) -> Result<(), Error> {
         if let Some(ref mut own) = self.plugins {
             plugins.load_sections(own)?;
+            if let Some(ref access) = own.table_access {
+                access.validate()?;
+            }
         }
 
         if let Some(ref parameter) = self.identity_tenant_parameter {
@@ -1170,6 +1173,32 @@ impl Plugin for Intercept {
 pub struct TableAccess {
     pub enabled: bool,
     pub tables: Vec<String>,
+}
+
+impl TableAccess {
+    /// The plugin compares a name it reads with each listed one, after
+    /// Postgres's folding, so a listed name that can't match leaves its table
+    /// open.
+    fn validate(&self) -> Result<(), Error> {
+        for table in &self.tables {
+            // Only a name's last part is compared, so `public.users` never matches.
+            if table.is_empty() || table.contains('.') {
+                error!(
+                    "table_access tables must be table names without a schema, like 'users', got: '{}'",
+                    table
+                );
+                return Err(Error::BadConfig);
+            }
+            if table.chars().any(|c| c.is_ascii_uppercase()) {
+                warn!(
+                    "table_access table '{}' matches only the quoted name \"{}\": \
+                     Postgres folds an unquoted name to lower case",
+                    table, table
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Plugin for TableAccess {
@@ -1831,12 +1860,37 @@ impl Config {
         // or invalid one fails the config either way.
         if let Some(ref mut global) = self.plugins {
             plugins.load_sections(global)?;
+            if let Some(ref access) = global.table_access {
+                access.validate()?;
+            }
         }
 
         for (name, pool) in self.pools.iter_mut() {
             if let Err(err) = pool.validate_with_plugins(self.plugins.as_ref(), plugins) {
                 error!("Error in pool {{ {} }}", name);
                 return Err(err);
+            }
+
+            // A process-wide plugin makes every pool parse every query.
+            let gates_tables = pool
+                .plugins_inheriting(self.plugins.as_ref())
+                .and_then(|own| own.table_access.as_ref())
+                .is_some_and(|access| access.enabled && !access.tables.is_empty());
+            if gates_tables && !plugins.has_process_plugins() {
+                if !pool.query_parser_enabled {
+                    warn!(
+                        "[pool: {}] table_access is on, but query_parser_enabled is off, \
+                         so it checks nothing",
+                        name
+                    );
+                } else if !pool.plugins_require_parse {
+                    warn!(
+                        "[pool: {}] table_access is on, but plugins_require_parse is off, \
+                         so a query the parser can't read, or longer than \
+                         query_parser_max_length, is forwarded without the check",
+                        name
+                    );
+                }
             }
         }
 
@@ -2413,6 +2467,38 @@ mod test {
 
         intercept.enabled = true;
         assert!(intercept.is_enabled());
+    }
+
+    #[test]
+    fn test_table_access_names_that_cant_match_are_refused() {
+        let pool = |tables: &[&str]| Pool {
+            query_parser_enabled: true,
+            plugins: Some(Plugins {
+                table_access: Some(TableAccess {
+                    enabled: true,
+                    tables: tables.iter().map(|table| table.to_string()).collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Uppercase only warns: it's a quoted, mixed-case table's name.
+        for tables in [&["users"][..], &["Users"], &[]] {
+            assert!(pool(tables).validate(None).is_ok(), "{:?}", tables);
+        }
+        for tables in [&["public.users"][..], &[""], &["users", "app.users"]] {
+            assert!(pool(tables).validate(None).is_err(), "{:?}", tables);
+        }
+
+        // Global ones are checked even when no pool runs them.
+        let mut config = Config {
+            plugins: pool(&["users"]).plugins,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        config.plugins = pool(&["public.users"]).plugins;
+        assert!(config.validate().is_err());
     }
 
     #[test]
