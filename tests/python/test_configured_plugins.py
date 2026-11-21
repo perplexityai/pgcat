@@ -15,6 +15,16 @@ import pytest
 from psycopg import pq
 
 import utils
+# no_inherited_otel is autouse: no pgcat started here inherits OTEL_ variables.
+from test_trace_context import (  # noqa: F401
+    ENV,
+    STATUS_ERROR,
+    Collector,
+    comment,
+    new_trace,
+    no_inherited_otel,
+    only,
+)
 
 PORT = 6457
 RELOAD_PORT = 6473
@@ -576,6 +586,32 @@ TESTING_VERIFIER = """
 enabled = true
 verify_identity = true
 """
+
+
+def traced(config, collector):
+    """`config`, its statements with a sampled traceparent exported to `collector`."""
+    return config.replace(
+        'admin_password = "admin_pass"\n',
+        'admin_password = "admin_pass"\ntrace_sample_ratio = 1\n'
+        f'trace_otlp_endpoint = "{collector.endpoint}"\n',
+        1,
+    )
+
+
+def assert_refused_spans(spans, ended, sqlstate, unspanned=()):
+    """Each statement of `ended`, at which pgcat ended the session, has one
+    span, refused with `sqlstate`, and no other span is refused. Those of
+    `unspanned` have none: the session ended at their Parse, before pgcat
+    read the Execute that would get the span."""
+    assert not {span["trace_id"] for span in spans} & set(unspanned)
+    for trace in ended:
+        span = only(spans, trace)
+        assert span["status"] == STATUS_ERROR
+        assert span["attributes"]["pgcat.refused"] is True
+        assert span["attributes"]["error.type"] == sqlstate
+        assert "pgcat.server.role" not in span["attributes"]
+    refused = [span for span in spans if span["attributes"].get("pgcat.refused")]
+    assert len(refused) == len(ended), refused
 
 
 def identity_config(port, extra="", metrics_port=None):
@@ -1287,21 +1323,28 @@ def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on
     from the pool it was checked out from. A reload that changes it ends the
     session at its next statement, whose reply would be sanitized for another."""
     port = WITHHOLD_RELOAD_PORT
-    process = utils.PgcatProcess(withholding(port, not turns_on), port, binary=BINARY)
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(withholding(port, not turns_on), collector), port, binary=BINARY, env=ENV
+    )
     try:
         process.start()
         sock, message = bounded(lambda: utils.raw_connection(port, "configured"))
         sock.settimeout(10)
         replies = exchanges(sock, message)
         assert [code for code, _ in replies(query("BEGIN"))] == [b"C", b"Z"]
+        ended = new_trace()
+        sql = f"{comment(ended)} SELECT 1"
+        if extended:
+            # Bound before the reload, so that its Execute is the next message.
+            sent = replies(parse(b"held", sql), bind(b"held", b"held"), SYNC)
+            assert [code for code, _ in sent] == [b"1", b"2", b"Z"]
 
-        process.write_config(withholding(port, turns_on))
+        process.write_config(traced(withholding(port, turns_on), collector))
         utils.admin_reload(port)
 
-        if extended:
-            sock.sendall(parse(b"", "SELECT 1") + bind(b"", b"") + execute(b"") + SYNC)
-        else:
-            sock.sendall(query("SELECT 1"))
+        # The statement is refused before it runs: its span says so.
+        sock.sendall(execute(b"held") + SYNC if extended else query(sql))
         code, body = message()
         assert code == b"E", body
         assert error_of([(code, body)]) == ("0A000", HELD_SETTINGS_CHANGED)
@@ -1312,8 +1355,58 @@ def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on
         # A new client gets the pool's new setting.
         diag, _ = server_diagnostics(process.dsn("configured"), extended)
         assert (diag.message_primary == WITHHELD) == turns_on
+
+        # Spans export in the order statements end: this one's comes last.
+        marker = new_trace()
+        with psycopg.connect(process.dsn("configured"), autocommit=True) as connection:
+            connection.execute(f"{comment(marker)} SELECT 1", prepare=False)
+        assert_refused_spans(collector.spans_until(marker), [ended], "0A000")
     finally:
         process.stop()
+        collector.close()
+
+
+WITHHOLD_COPY_PORT = 6482
+
+
+def test_a_reload_that_ends_a_session_mid_copy_leaves_the_copy_no_span():
+    """A reload that changes withholding ends a session holding a server
+    mid-COPY at its next Sync. The session's end closes the server before the
+    COPY's ReadyForQuery, and pgcat didn't refuse the COPY: it has no span."""
+    port = WITHHOLD_COPY_PORT
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(withholding(port, False), collector), port, binary=BINARY, env=ENV
+    )
+    try:
+        process.start()
+        sock, message = bounded(lambda: utils.raw_connection(port, "configured"))
+        sock.settimeout(10)
+        copy = new_trace()
+        sock.sendall(
+            query(f"{comment(copy)} CREATE TEMP TABLE copied (n int) ON COMMIT DROP; COPY copied FROM STDIN")
+        )
+        assert [message()[0], message()[0]] == [b"C", b"G"]
+
+        process.write_config(traced(withholding(port, True), collector))
+        utils.admin_reload(port)
+
+        sock.sendall(utils.frontend(b"d", b"41\n") + SYNC)
+        code, body = message()
+        assert code == b"E", body
+        assert error_of([(code, body)]) == ("0A000", HELD_SETTINGS_CHANGED)
+        with pytest.raises(ConnectionError):
+            message()
+        sock.close()
+
+        marker = new_trace()
+        with psycopg.connect(process.dsn("configured"), autocommit=True) as connection:
+            connection.execute(f"{comment(marker)} SELECT 1", prepare=False)
+        spans = collector.spans_until(marker)
+        assert [span for span in spans if span["trace_id"] == copy] == []
+    finally:
+        process.stop()
+        collector.close()
 
 
 WITHHOLD_WAIT_PORT = 6481
@@ -1447,7 +1540,10 @@ class RawSession:
 
     def ended(self, sql):
         """The statement ends the session, with 0A000."""
-        self.sock.sendall(b"".join(self.messages(sql)))
+        self.ended_at(*self.messages(sql))
+
+    def ended_at(self, *messages):
+        self.sock.sendall(b"".join(messages))
         code, body = self.message()
         assert code == b"E" and b"C0A000\0" in body, body
         assert CONNECT_AGAIN.encode() in body, body
@@ -1466,10 +1562,13 @@ def test_a_reload_of_the_verifier_verifies_identities_again(extended):
     once. The same tenant and claims keep the identity, in a transaction too;
     anything else ends the session."""
     port = RECHECK_PORT
-    process = utils.PgcatProcess(identity_config(port), port, binary=BINARY)
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(identity_config(port), collector), port, binary=BINARY, env=ENV
+    )
 
     def reload(extra="", testing=""):
-        process.write_config(identity_config(port, extra) + testing)
+        process.write_config(traced(identity_config(port, extra) + testing, collector))
         utils.admin_reload(port)
 
     def verifications(session):
@@ -1512,7 +1611,11 @@ def test_a_reload_of_the_verifier_verifies_identities_again(extended):
         session.close()
 
         # Other claims, the tenant the same; verification turned off; the
-        # verifier removed: the session ends, in a transaction too.
+        # verifier removed: the session ends, in a transaction too, and the
+        # statement it ends at gets a refused span. In the extended protocol,
+        # that's an Execute of a portal bound before the reload; a new
+        # statement's batch ends the session at its Parse, with no span.
+        ended, unspanned = [], []
         for changed in (
             identity_config(port, 'claim = "other"\n'),
             identity_config(port).replace("verify_identity = true", "verify_identity = false"),
@@ -1521,18 +1624,41 @@ def test_a_reload_of_the_verifier_verifies_identities_again(extended):
             for transaction in (False, True):
                 reload()
                 session = identified()
+                trace = new_trace()
+                held = extended and transaction
                 if transaction:
                     session.ok("BEGIN")
-                process.write_config(changed)
+                if held:
+                    sql = f"{comment(trace)} SELECT current_setting('app.tenant', true)"
+                    sent = session.replies(parse(b"held", sql), bind(b"held", b"held"), SYNC)
+                    assert [code for code, _ in sent] == [b"1", b"2", b"Z"]
+                process.write_config(traced(changed, collector))
                 utils.admin_reload(port)
-                session.ended("SELECT 8003")
+                if held:
+                    session.ended_at(execute(b"held"), SYNC)
+                else:
+                    session.ended(f"{comment(trace)} SELECT 8003")
+                (unspanned if extended and not held else ended).append(trace)
 
         # A new client gets the server, in the pool of one, and the verifier.
+        # Spans export in the order statements end: its statement's comes last.
         reload('claim = "other"\n')
         session = identified()
+        marker = new_trace()
+        session.ok(f"{comment(marker)} SELECT 1")
         session.close()
+        spans = collector.spans_until(marker)
+        assert_refused_spans(spans, ended, "0A000", unspanned)
+        # The client as pgcat read the statement: its identity verified.
+        for trace in ended:
+            attributes = only(spans, trace)["attributes"]
+            assert (attributes["pgcat.identity"], attributes["pgcat.identity.verified"]) == (
+                "present",
+                True,
+            )
     finally:
         process.stop()
+        collector.close()
 
 
 @pytest.mark.parametrize("extended", [False, True])
@@ -1579,6 +1705,61 @@ def test_a_verifier_unavailable_after_a_reload_fails_statements_fast(extended):
         session.close()
     finally:
         process.stop()
+
+
+MID_COPY_RECHECK_PORT = 6483
+
+
+@pytest.mark.parametrize("end", [b"S", b"H"])
+def test_a_sync_or_flush_refused_during_an_extended_copy_leaves_the_copy_its_span(end):
+    """A Sync or Flush the client sends during an extended-protocol COPY IN,
+    refused with PH001 as the verifier hangs after a reload, refuses only
+    itself: the COPY goes on, and its span, ended by the server's
+    ReadyForQuery, isn't refused."""
+    port = MID_COPY_RECHECK_PORT
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(identity_config(port), collector), port, binary=BINARY, env=ENV
+    )
+    table = f"copied_{new_trace()[:12]}"
+    try:
+        process.start()
+        with psycopg.connect(process.dsn("plain"), autocommit=True) as connection:
+            connection.execute(f"CREATE TABLE {table} (n int)")
+        session = RawSession(port, False)
+        session.ok("SET PGCAT_IDENTITY = 'synthetic:acme'")
+        copy = new_trace()
+        sql = f"{comment(copy)} COPY {table} FROM STDIN"
+        session.sock.sendall(parse(b"", sql) + bind(b"", b"") + execute(b"") + SYNC)
+        assert [session.message()[0] for _ in range(3)] == [b"1", b"2", b"G"]
+
+        process.write_config(traced(identity_config(port, "hang = true\n"), collector))
+        utils.admin_reload(port)
+        session.sock.sendall(utils.frontend(end, b""))
+        received = [bounded(session.message)]
+        if end == b"S":
+            received.append(session.message())
+        assert [code for code, _ in received] == ([b"E", b"Z"] if end == b"S" else [b"E"]), received
+        assert error_of(received)[0] == "PH001"
+
+        received = session.replies(utils.frontend(b"d", b"41\n") + utils.frontend(b"c", b"") + SYNC)
+        assert received == [(b"C", b"COPY 1\0"), (b"Z", b"I")], received
+        session.close()
+
+        marker = new_trace()
+        with psycopg.connect(process.dsn("plain"), autocommit=True) as connection:
+            connection.execute(f"{comment(marker)} SELECT 1", prepare=False)
+            assert connection.execute(f"SELECT n FROM {table}").fetchall() == [(41,)]
+            connection.execute(f"DROP TABLE {table}")
+        spans = collector.spans_until(marker)
+    finally:
+        process.stop()
+        collector.close()
+    span = only(spans, copy)
+    assert span["status"] == 0, span
+    assert span["attributes"]["pgcat.protocol"] == "extended"
+    assert span["attributes"]["pgcat.server.role"] == "primary"
+    assert "pgcat.refused" not in span["attributes"]
 
 
 REFUSED_RECHECK_PORT = 6480

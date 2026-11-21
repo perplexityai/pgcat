@@ -18,17 +18,24 @@
 //!
 //! Nothing here logs or exports the comment, the statement, or anything else
 //! the client sent besides the trace and span ids: span attributes are pool,
-//! user, role and shard from the config, the protocol, and the SQLSTATE.
+//! user, role and shard from the config, the protocol, the SQLSTATE, and the
+//! caller (`Caller`): its identity's state, whether a plugin verified it, and
+//! its `application_name` only if the pool's `sql_observer_clients` name it.
+//! Every attribute takes a bounded set of values; none comes from the
+//! identity's token or tenant.
 //!
 //! A span starts when pgcat reads the Query or Execute and ends when the
-//! server's ReadyForQuery for its batch arrives, so the Executes of one
-//! pipelined batch all end at its Sync. A batch pgcat drops without sending it
-//! (a plugin refused it, or no server could be checked out) is forgotten with
-//! its statements. One pgcat answers itself (an identity command) gets no
-//! ReadyForQuery from a server: its spans are discarded when the client's next
-//! batch starts, as are those of a client that disconnects before its reply.
-//! A lone Sync doesn't start a batch (the server ignores it during COPY), so
-//! if pgcat sends one to the server, its reply ends them instead: a known gap.
+//! server's ReadyForQuery for it arrives. pgcat sends a simple Query to the
+//! server on its own, so its ReadyForQuery ends only its span; the Executes of
+//! an extended-protocol batch all end at the one after its Sync or Flush, even
+//! with Queries in between. A statement pgcat refuses (`refused`), or can't
+//! check out a server for, ends when pgcat answers it with its error, with the
+//! SQLSTATE of that error and nothing else from it. One pgcat answers itself,
+//! such as an identity command, has no span: a batch's spans end unexported
+//! when pgcat answers it, a simple Query's at the client's next message, and
+//! those pgcat hasn't sent to a server when the client disconnects go with it.
+//! So does a simple Query or a batch whose server pgcat lets go of before its
+//! ReadyForQuery, such as a COPY still reading the client's data.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,7 +54,7 @@ use opentelemetry::trace::{
     Link, Span as _, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags, TraceId,
     TraceState, Tracer, TracerProvider,
 };
-use opentelemetry::{Context, InstrumentationScope, Key, KeyValue};
+use opentelemetry::{Context, InstrumentationScope, Key, KeyValue, Value};
 use opentelemetry_http::{HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::{
@@ -59,6 +66,9 @@ use tokio::runtime::Handle;
 
 use crate::config::{Address, General};
 use crate::errors::Error;
+use crate::identity_label::IdentityState;
+use crate::messages::sqlstate_of;
+use crate::sql_observer::OTHER_LABEL;
 
 const SPAN_NAME: &str = "pgcat.statement";
 
@@ -515,42 +525,105 @@ pub struct ClientTraces {
     statements: HashMap<Box<[u8]>, Parent>,
     /// Portals bound to those statements.
     portals: HashMap<Box<[u8]>, Parent>,
-    /// The statements and portals traced since the server's last
-    /// ReadyForQuery. A batch the server rejects may not have created them (a
-    /// Parse of a name in use fails, and the old statement stays), nor one
-    /// pgcat drops, so they're forgotten then; past the caps, all of them are.
+    /// The statements and portals the batch traced. A batch the server
+    /// rejects may not have created them (a Parse of a name in use fails, and
+    /// the old statement stays), nor one pgcat drops, so they're forgotten
+    /// then; past the caps, all of them are.
     batch_statements: Vec<Box<[u8]>>,
     batch_portals: Vec<Box<[u8]>>,
     batch_overflowed: bool,
-    /// The spans of the batch in flight, ended by the server's ReadyForQuery.
+    /// The spans of the extended-protocol batch, ended by the server's
+    /// ReadyForQuery after its Sync or Flush.
     pending: Vec<Pending>,
-    /// The client ended the pending spans' batch (Query, Sync or Flush). A
-    /// batch that was answered without a server reply leaves its spans here:
-    /// the next batch discards them.
+    /// The client ended the batch (Sync or Flush). A batch answered without a
+    /// server reply leaves its spans here: the next batch discards them.
     sealed: bool,
+    outcome: Outcome,
+    /// A server replied to the batch and hasn't ended it with its
+    /// ReadyForQuery, as during an extended-protocol COPY IN, when pgcat reads
+    /// the client again first. The batch is that server's then: refusing or
+    /// dropping what the client sent since leaves it alone, and like an open
+    /// Query's, it's valid only while that server stays attached
+    /// (`server_detached`).
+    batch_at_server: bool,
+    /// The simple Query being answered, from when pgcat reads it until its
+    /// ReadyForQuery. pgcat sends it to the server on its own, while the batch
+    /// the client sent before it waits for its Sync: the server's replies until
+    /// then are the Query's, traced or not. Once a server replied to it, it's
+    /// valid only while that server stays attached: when pgcat checks the
+    /// server in or closes it with the session, the ReadyForQuery can't come
+    /// (`server_detached`).
+    query: Option<Query>,
+}
+
+/// A simple Query being answered.
+#[derive(Debug, Default)]
+struct Query {
+    /// Its span, if it's traced.
+    span: Option<Pending>,
+    outcome: Outcome,
+    /// A server replied to it. Until its ReadyForQuery, pgcat reads the
+    /// client again only during COPY IN.
+    at_server: bool,
+}
+
+/// Spans that ended together, and how their statements went.
+#[derive(Debug, PartialEq)]
+struct Ended {
+    spans: Vec<Pending>,
     outcome: Outcome,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Who sent a traced statement, as the client was when pgcat read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// The client's `PGCAT_IDENTITY`, as the SQL observer labels it.
+    pub identity: IdentityState,
+    /// A plugin verified the identity's token: false when nothing on the
+    /// pool verifies identities, and whenever the identity isn't `present`.
+    pub verified: bool,
+    /// The client's `application_name` if the pool's `sql_observer_clients`
+    /// name it, else `None`, exported as `other`.
+    pub client: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Pending {
     parent: Parent,
     start: SystemTime,
     protocol: &'static str,
+    caller: Caller,
 }
 
-/// How the pending batch went: its first error.
+/// How the pending statements went: their first error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Outcome {
     failed: bool,
+    /// The server's SQLSTATE, or pgcat's when it refused the batch.
     sqlstate: Option<[u8; 5]>,
     /// The error pgcat saw itself, when the server sent none.
     error_type: Option<&'static str>,
+    /// pgcat refused the batch and answered it itself.
+    refused: bool,
+}
+
+/// Where a batch's spans end: at the server's reply, or at pgcat's refusal,
+/// which may come before any server is checked out.
+#[derive(Clone, Copy, Debug)]
+enum Ending<'a> {
+    Server(&'a Address),
+    Refused { pool: &'a str, user: &'a str },
 }
 
 /// Records what a client message starts, for a client in a pool. Call for
-/// every message pgcat reads from the client, before handling it.
+/// every message pgcat reads from the client, before handling it. `caller`
+/// runs only for a statement that gets a span.
 #[inline]
-pub fn client_message(traces: &mut Option<Box<ClientTraces>>, message: &[u8]) {
+pub fn client_message(
+    traces: &mut Option<Box<ClientTraces>>,
+    message: &[u8],
+    caller: impl FnOnce() -> Caller,
+) {
     if !enabled() {
         if traces.is_some() {
             *traces = None;
@@ -571,7 +644,7 @@ pub fn client_message(traces: &mut Option<Box<ClientTraces>>, message: &[u8]) {
         *traces = Some(Box::default());
     }
     if let Some(traces) = traces.as_deref_mut() {
-        traces.client_message(message, ratio, SystemTime::now());
+        traces.client_message(message, ratio, SystemTime::now(), caller);
     }
 }
 
@@ -585,8 +658,8 @@ pub fn server_replied(
     address: &Address,
 ) {
     if let Some(traces) = traces.as_deref_mut() {
-        if let Some(outcome) = traces.server_replied(reply, error, ready_for_query.is_some()) {
-            traces.export(outcome, address);
+        if let Some(ended) = traces.server_replied(reply, error, ready_for_query.is_some()) {
+            export_ended(&ended, Ending::Server(address));
         }
     }
 }
@@ -598,14 +671,80 @@ pub fn server_failed(
     error_type: &'static str,
 ) {
     if let Some(traces) = traces.as_deref_mut() {
-        if let Some(outcome) = traces.server_failed(error_type) {
-            traces.export(outcome, address);
+        if let Some(ended) = traces.server_failed(error_type) {
+            export_ended(&ended, Ending::Server(address));
         }
     }
 }
 
+/// pgcat ends the session at the client's pending statements, its open simple
+/// Query and its batch, with `error`, the message it answers them with: their
+/// spans end now, failed with its SQLSTATE and nothing else from it. Call
+/// before the session ends; for a refusal the session goes on after, see
+/// [`batch_refused`] and [`query_refused`].
+pub fn refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
+    if let Some(traces) = traces.as_deref_mut() {
+        let ending = Ending::Refused { pool, user };
+        let ended = [traces.query_refused(error), traces.refused(error)];
+        for ended in ended.into_iter().flatten() {
+            export_ended(&ended, ending);
+        }
+    }
+}
+
+/// pgcat refused the client's buffered batch with `error`, and the session
+/// goes on: only the batch's spans end, refused as with [`refused`]. Call
+/// before the batch is dropped. What a server is still running goes on, and
+/// its own ReadyForQuery ends its spans: a simple Query, as during COPY IN,
+/// or a batch the server replied to, as during an extended-protocol COPY IN,
+/// where only the client's Sync or Flush is refused.
+pub fn batch_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
+    if let Some(traces) = traces.as_deref_mut() {
+        if let Some(ended) = traces.refused(error) {
+            export_ended(&ended, Ending::Refused { pool, user });
+        }
+    }
+}
+
+/// pgcat let go of the client's server: it checked the server in, or closes
+/// it with the session. What the server replied to but hasn't ended gets no
+/// ReadyForQuery now, and its spans end unexported: a simple Query, or a
+/// batch. Either can be a COPY whose data the server was reading. What the
+/// batch parsed and bound stays traced, as at a ReadyForQuery: the
+/// prepared-statement cache prepares the client's statements again on its
+/// next server, and what went with the server fails there, in its span. A
+/// Query or batch no server has replied to isn't the server's: it stays
+/// pending, and a refusal can still end it.
+pub fn server_detached(traces: &mut Option<Box<ClientTraces>>) {
+    if let Some(traces) = traces.as_deref_mut() {
+        traces.server_detached();
+    }
+}
+
+/// pgcat refused the client's simple Query with `error` before a server ran
+/// it, and the session goes on: only the Query's span ends, refused as with
+/// [`refused`]. Extended-protocol statements the client sent before it, still
+/// waiting for their Sync, keep their spans: they run later.
+pub fn query_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
+    if let Some(traces) = traces.as_deref_mut() {
+        if let Some(ended) = traces.query_refused(error) {
+            export_ended(&ended, Ending::Refused { pool, user });
+        }
+    }
+}
+
+/// pgcat answered the client's buffered batch itself, every message of it,
+/// at its Sync or Flush: its spans end without being exported, as batches
+/// pgcat answers itself have none, and what it parsed and bound stays traced.
+pub fn batch_answered(traces: &mut Option<Box<ClientTraces>>) {
+    if let Some(traces) = traces.as_deref_mut() {
+        traces.batch_answered();
+    }
+}
+
 /// pgcat dropped the client's buffered batch without sending it: what it
-/// parsed and bound doesn't exist, and no reply will end its spans.
+/// parsed and bound doesn't exist, and no reply will end its spans. A batch a
+/// server replied to goes on, as with [`batch_refused`].
 pub fn batch_dropped(traces: &mut Option<Box<ClientTraces>>) {
     if let Some(traces) = traces.as_deref_mut() {
         traces.batch_dropped();
@@ -621,11 +760,25 @@ pub fn statements_discarded(traces: &mut Option<Box<ClientTraces>>) {
 }
 
 impl ClientTraces {
-    fn client_message(&mut self, message: &[u8], ratio: f64, now: SystemTime) {
-        // pgcat finishes a batch before it reads the next one, so a message
-        // that starts a batch while the last one is sealed means that batch
-        // got no ReadyForQuery from a server: pgcat answered it. COPY data
-        // (d, c, f) belongs to the sealed batch and doesn't end it.
+    fn client_message(
+        &mut self,
+        message: &[u8],
+        ratio: f64,
+        now: SystemTime,
+        caller: impl FnOnce() -> Caller,
+    ) {
+        // A server ends a simple Query with its ReadyForQuery before pgcat
+        // reads the client again, except during COPY IN, where it ignores a
+        // Sync or Flush. So a Query still open here, but for COPY data or one
+        // of those, is one pgcat answered itself: its span ends, unexported.
+        // The batch the client sent before it still waits for its Sync.
+        if let Some(query) = &self.query {
+            let copying = query.at_server
+                && matches!(message.first(), Some(b'd' | b'c' | b'f' | b'S' | b'H'));
+            if !copying {
+                self.query = None;
+            }
+        }
         if self.sealed
             && matches!(
                 message.first(),
@@ -636,18 +789,20 @@ impl ClientTraces {
         }
         match message.first() {
             Some(b'Q') => {
-                self.sealed = true;
-                if let Some(parent) = message
+                let span = message
                     .get(5..)
                     .and_then(traceparent)
                     .filter(|parent| keeps(ratio, parent))
-                {
-                    self.pending.push(Pending {
+                    .map(|parent| Pending {
                         parent,
                         start: now,
                         protocol: "simple",
+                        caller: caller(),
                     });
-                }
+                self.query = Some(Query {
+                    span,
+                    ..Query::default()
+                });
             }
             Some(b'P') => {
                 let Some((name, text)) = parse_fields(message) else {
@@ -690,6 +845,7 @@ impl ClientTraces {
                             parent,
                             start: now,
                             protocol: "extended",
+                            caller: caller(),
                         });
                     }
                 }
@@ -720,13 +876,26 @@ impl ClientTraces {
         }
     }
 
-    /// The batch's outcome when this reply ends it.
+    /// A server's reply: the open simple Query's if there is one, else the
+    /// batch's. Its ReadyForQuery ends those spans, returned if any.
     fn server_replied(
         &mut self,
         reply: &[u8],
         error: bool,
         ready_for_query: bool,
-    ) -> Option<Outcome> {
+    ) -> Option<Ended> {
+        if let Some(query) = self.query.as_mut() {
+            query.at_server = true;
+            if error && !query.outcome.failed {
+                query.outcome.failed = true;
+                query.outcome.sqlstate = sqlstate(reply);
+            }
+            if !ready_for_query {
+                return None;
+            }
+            return self.query.take().and_then(Query::ended);
+        }
+        self.batch_at_server = !ready_for_query;
         if error || ready_for_query {
             self.end_batch(error);
         }
@@ -737,25 +906,92 @@ impl ClientTraces {
             self.outcome.failed = true;
             self.outcome.sqlstate = sqlstate(reply);
         }
-        ready_for_query.then(|| std::mem::take(&mut self.outcome))
+        if !ready_for_query {
+            return None;
+        }
+        let outcome = std::mem::take(&mut self.outcome);
+        Some(self.batch_ended(outcome))
     }
 
-    fn server_failed(&mut self, error_type: &'static str) -> Option<Outcome> {
+    /// See [`server_detached`].
+    fn server_detached(&mut self) {
+        if self.query.as_ref().is_some_and(|query| query.at_server) {
+            self.query = None;
+        }
+        if self.batch_at_server {
+            self.end_batch(false);
+            self.discard();
+        }
+    }
+
+    /// The server failed: the open simple Query's span ends failed if there is
+    /// one, else the batch's spans do. A batch waiting for its Sync never
+    /// reached the server, and the session ends.
+    fn server_failed(&mut self, error_type: &'static str) -> Option<Ended> {
+        let failure = Outcome {
+            failed: true,
+            error_type: Some(error_type),
+            ..Outcome::default()
+        };
+        if let Some(mut query) = self.query.take() {
+            if !query.outcome.failed {
+                query.outcome = failure;
+            }
+            return query.ended();
+        }
         if self.pending.is_empty() {
             return None;
         }
         let mut outcome = std::mem::take(&mut self.outcome);
         if !outcome.failed {
-            outcome = Outcome {
-                failed: true,
-                sqlstate: None,
-                error_type: Some(error_type),
-            };
+            outcome = failure;
         }
-        Some(outcome)
+        Some(self.batch_ended(outcome))
+    }
+
+    /// The batch's spans, refused with `error` (see [`refusal`]), unless the
+    /// server failed them first, or replied to the batch: it's the server's
+    /// to end (see [`batch_refused`]).
+    fn refused(&mut self, error: &str) -> Option<Ended> {
+        if self.pending.is_empty() || self.batch_at_server {
+            return None;
+        }
+        let mut outcome = std::mem::take(&mut self.outcome);
+        if !outcome.failed {
+            outcome = refusal(error);
+        }
+        Some(self.batch_ended(outcome))
+    }
+
+    /// The open simple Query's span, refused with `error` as with
+    /// [`ClientTraces::refused`]. The batch the client sent before it goes on.
+    fn query_refused(&mut self, error: &str) -> Option<Ended> {
+        let mut query = self.query.take()?;
+        if !query.outcome.failed {
+            query.outcome = refusal(error);
+        }
+        query.ended()
+    }
+
+    /// Ends the batch's spans with `outcome`.
+    fn batch_ended(&mut self, outcome: Outcome) -> Ended {
+        let spans = std::mem::take(&mut self.pending);
+        self.discard();
+        Ended { spans, outcome }
+    }
+
+    /// pgcat answered the whole batch itself: like a server's ReadyForQuery,
+    /// it ends the batch's spans, here unexported, and what the batch parsed
+    /// and bound stays traced.
+    fn batch_answered(&mut self) {
+        self.end_batch(false);
+        self.discard();
     }
 
     fn batch_dropped(&mut self) {
+        if self.batch_at_server {
+            return;
+        }
         self.end_batch(true);
         self.discard();
     }
@@ -784,41 +1020,85 @@ impl ClientTraces {
         self.batch_overflowed = false;
     }
 
+    /// Ends the batch's spans unexported.
     fn discard(&mut self) {
         self.pending.clear();
         self.sealed = false;
         self.outcome = Outcome::default();
-    }
-
-    fn export(&mut self, outcome: Outcome, address: &Address) {
-        let end = SystemTime::now();
-        let exporter = EXPORTER.load();
-        if let Some(exporter) = exporter.as_deref() {
-            for pending in &self.pending {
-                export(exporter, pending, &outcome, address, end);
-            }
-        }
-        self.discard();
+        self.batch_at_server = false;
     }
 }
 
-fn export(
-    exporter: &Exporter,
-    pending: &Pending,
-    outcome: &Outcome,
-    address: &Address,
-    end: SystemTime,
-) {
-    let mut attributes = Vec::with_capacity(8);
+impl Query {
+    fn ended(self) -> Option<Ended> {
+        let span = self.span?;
+        Some(Ended {
+            spans: vec![span],
+            outcome: self.outcome,
+        })
+    }
+}
+
+fn export_ended(ended: &Ended, ending: Ending<'_>) {
+    let end = SystemTime::now();
+    if let Some(exporter) = EXPORTER.load().as_deref() {
+        for pending in &ended.spans {
+            export(exporter, pending, &ended.outcome, ending, end);
+        }
+    }
+}
+
+/// pgcat's refusal with `error`: only its SQLSTATE is read, and only if it's
+/// five of `[0-9A-Z]`.
+fn refusal(error: &str) -> Outcome {
+    // pgcat sends an error without one as 58000 (`messages::error_message`).
+    let code = sqlstate_of(error).0.unwrap_or("58000").as_bytes();
+    Outcome {
+        failed: true,
+        sqlstate: <[u8; 5]>::try_from(code)
+            .ok()
+            .filter(|code| code.iter().all(|byte| is_sqlstate_byte(*byte))),
+        error_type: None,
+        refused: true,
+    }
+}
+
+/// A span's attributes: each from the config, a fixed set, a SQLSTATE, or a
+/// configured client name.
+fn attributes(pending: &Pending, outcome: &Outcome, ending: Ending<'_>) -> Vec<KeyValue> {
+    let mut attributes = Vec::with_capacity(12);
     attributes.push(KeyValue::new("db.system.name", "postgresql"));
-    attributes.push(KeyValue::new("pgcat.pool.name", address.pool_name.clone()));
-    attributes.push(KeyValue::new("pgcat.pool.user", address.username.clone()));
-    attributes.push(KeyValue::new("pgcat.server.role", address.role.as_str()));
-    attributes.push(KeyValue::new("pgcat.shard", address.shard as i64));
+    match ending {
+        Ending::Server(address) => {
+            attributes.push(KeyValue::new("pgcat.pool.name", address.pool_name.clone()));
+            attributes.push(KeyValue::new("pgcat.pool.user", address.username.clone()));
+            attributes.push(KeyValue::new("pgcat.server.role", address.role.as_str()));
+            attributes.push(KeyValue::new("pgcat.shard", address.shard as i64));
+        }
+        Ending::Refused { pool, user } => {
+            attributes.push(KeyValue::new("pgcat.pool.name", pool.to_string()));
+            attributes.push(KeyValue::new("pgcat.pool.user", user.to_string()));
+        }
+    }
     attributes.push(KeyValue::new("pgcat.protocol", pending.protocol));
+    let caller = &pending.caller;
+    attributes.push(KeyValue::new("pgcat.identity", caller.identity.as_str()));
+    attributes.push(KeyValue::new("pgcat.identity.verified", caller.verified));
+    attributes.push(KeyValue::new(
+        "pgcat.client",
+        match &caller.client {
+            Some(name) => Value::from(name.clone()),
+            None => Value::from(OTHER_LABEL),
+        },
+    ));
+    if outcome.refused {
+        attributes.push(KeyValue::new("pgcat.refused", true));
+    }
     if let Some(code) = outcome.sqlstate {
         let code = String::from_utf8_lossy(&code).into_owned();
-        attributes.push(KeyValue::new("db.response.status_code", code.clone()));
+        if !outcome.refused {
+            attributes.push(KeyValue::new("db.response.status_code", code.clone()));
+        }
         attributes.push(KeyValue::new("error.type", code));
     } else if outcome.failed {
         attributes.push(KeyValue::new(
@@ -826,13 +1106,23 @@ fn export(
             outcome.error_type.unwrap_or("_OTHER"),
         ));
     }
+    attributes
+}
+
+fn export(
+    exporter: &Exporter,
+    pending: &Pending,
+    outcome: &Outcome,
+    ending: Ending<'_>,
+    end: SystemTime,
+) {
     let parent = Context::new().with_remote_span_context(pending.parent.span_context());
     let mut span = exporter
         .tracer
         .span_builder(SPAN_NAME)
         .with_kind(SpanKind::Server)
         .with_start_time(pending.start)
-        .with_attributes(attributes)
+        .with_attributes(attributes(pending, outcome, ending))
         .start_with_context(&exporter.tracer, &parent);
     if outcome.failed {
         span.set_status(Status::error(""));
@@ -900,6 +1190,10 @@ fn sqlstate(reply: &[u8]) -> Option<[u8; 5]> {
     None
 }
 
+fn is_sqlstate_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || byte.is_ascii_uppercase()
+}
+
 fn error_code(mut fields: &[u8]) -> Option<[u8; 5]> {
     while let Some((&kind, more)) = fields.split_first() {
         if kind == 0 {
@@ -910,7 +1204,7 @@ fn error_code(mut fields: &[u8]) -> Option<[u8; 5]> {
             let code: [u8; 5] = more[..end].try_into().ok()?;
             return code
                 .iter()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+                .all(|byte| is_sqlstate_byte(*byte))
                 .then_some(code);
         }
         fields = &more[end + 1..];
@@ -1387,16 +1681,23 @@ mod tests {
         )
     }
 
-    fn run(traces: &mut ClientTraces, messages: &[Vec<u8>]) {
-        for message in messages {
-            traces.client_message(message, 1.0, SystemTime::UNIX_EPOCH);
+    fn anonymous() -> Caller {
+        Caller {
+            identity: IdentityState::Absent,
+            verified: false,
+            client: None,
         }
     }
 
-    fn traced(traces: &ClientTraces) -> Vec<(u128, &'static str)> {
-        traces
-            .pending
-            .iter()
+    fn run(traces: &mut ClientTraces, messages: &[Vec<u8>]) {
+        for message in messages {
+            traces.client_message(message, 1.0, SystemTime::UNIX_EPOCH, anonymous);
+        }
+    }
+
+    fn ids<'a>(spans: impl IntoIterator<Item = &'a Pending>) -> Vec<(u128, &'static str)> {
+        spans
+            .into_iter()
             .map(|pending| {
                 (
                     u128::from_be_bytes(pending.parent.trace_id.to_bytes()),
@@ -1406,13 +1707,19 @@ mod tests {
             .collect()
     }
 
-    /// The server's ReadyForQuery, ending the batch as `server_replied` does.
+    /// The pending spans: the batch's, then the open Query's.
+    fn traced(traces: &ClientTraces) -> Vec<(u128, &'static str)> {
+        let query = traces.query.as_ref().and_then(|query| query.span.as_ref());
+        ids(traces.pending.iter().chain(query))
+    }
+
+    /// The server's ReadyForQuery: the outcome of the spans it ends, if any.
     fn ready(traces: &mut ClientTraces) -> Option<Outcome> {
-        let outcome = traces.server_replied(&frame(b'Z', b"I"), false, true);
-        if outcome.is_some() {
-            traces.discard();
-        }
-        outcome
+        ready_ended(traces).map(|ended| ended.outcome)
+    }
+
+    fn ready_ended(traces: &mut ClientTraces) -> Option<Ended> {
+        traces.server_replied(&frame(b'Z', b"I"), false, true)
     }
 
     #[test]
@@ -1593,16 +1900,6 @@ mod tests {
         // one without an Execute, such as a driver's prepare step.
         run(&mut traces, &[parse("", "SELECT 1"), frame(b'H', b"")]);
         assert_eq!(traced(&traces), []);
-        // COPY data belongs to the batch it follows.
-        run(
-            &mut traces,
-            &[
-                query(&sampled_sql(4)),
-                frame(b'd', b"1\n"),
-                frame(b'c', b""),
-            ],
-        );
-        assert_eq!(traced(&traces), [(4, "simple")]);
     }
 
     #[test]
@@ -1655,18 +1952,576 @@ mod tests {
             Some(Outcome {
                 failed: true,
                 sqlstate: Some(*b"22012"),
-                error_type: None,
+                ..Outcome::default()
             })
         );
 
+        let timeout = Outcome {
+            failed: true,
+            error_type: Some("statement_timeout"),
+            ..Outcome::default()
+        };
         run(&mut traces, &[query(&sampled_sql(1))]);
         assert_eq!(
-            traces.server_failed("statement_timeout"),
-            Some(Outcome {
-                failed: true,
-                sqlstate: None,
-                error_type: Some("statement_timeout"),
+            traces
+                .server_failed("statement_timeout")
+                .map(|ended| ended.outcome),
+            Some(timeout)
+        );
+        run(&mut traces, &execute_traced(2));
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(
+            traces
+                .server_failed("statement_timeout")
+                .map(|ended| ended.outcome),
+            Some(timeout)
+        );
+        assert_eq!(traced(&traces), []);
+    }
+
+    /// A Parse, Bind and Execute of a statement traced as `trace_id`.
+    fn execute_traced(trace_id: u128) -> [Vec<u8>; 3] {
+        [parse("", &sampled_sql(trace_id)), bind("", ""), execute("")]
+    }
+
+    #[test]
+    fn reads_the_caller_only_for_traced_statements() {
+        let mut traces = ClientTraces::default();
+        let calls = std::cell::Cell::new(0);
+        let send = |traces: &mut ClientTraces, message: &[u8]| {
+            traces.client_message(message, 1.0, SystemTime::UNIX_EPOCH, || {
+                calls.set(calls.get() + 1);
+                Caller {
+                    identity: IdentityState::Present,
+                    verified: true,
+                    client: Some("api".into()),
+                }
             })
+        };
+        send(&mut traces, &query("SELECT 1"));
+        send(&mut traces, &parse("s", &sampled_sql(1)));
+        send(&mut traces, &bind("", "s"));
+        assert_eq!(calls.get(), 0);
+        send(&mut traces, &execute(""));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(traces.pending[0].caller.client.as_deref(), Some("api"));
+        send(&mut traces, &frame(b'S', b""));
+        assert!(ready(&mut traces).is_some());
+        send(&mut traces, &query(&sampled_sql(2)));
+        assert_eq!(calls.get(), 2);
+    }
+
+    fn refused(code: &str, message: &str) -> String {
+        crate::messages::with_sqlstate(code, message)
+    }
+
+    #[test]
+    fn a_refusal_ends_the_batch_with_its_sqlstate() {
+        let mut traces = ClientTraces::default();
+        assert_eq!(traces.refused(&refused("28000", "refused")), None);
+
+        run(&mut traces, &execute_traced(1));
+        run(&mut traces, &[frame(b'S', b"")]);
+        let ended = traces
+            .refused(&refused("28000", "PGCAT_IDENTITY refused: tok"))
+            .unwrap();
+        assert_eq!(ids(&ended.spans), [(1, "extended")]);
+        assert_eq!(
+            ended.outcome,
+            Outcome {
+                failed: true,
+                sqlstate: Some(*b"28000"),
+                error_type: None,
+                refused: true,
+            }
+        );
+        assert_eq!(traced(&traces), []);
+
+        // An error pgcat sends without a SQLSTATE goes out as 58000.
+        run(&mut traces, &execute_traced(1));
+        let outcome = traces.refused("no code").unwrap().outcome;
+        assert_eq!(outcome.sqlstate, Some(*b"58000"));
+
+        // Never anything but five of [0-9A-Z].
+        run(&mut traces, &[query(&sampled_sql(1))]);
+        let outcome = traces
+            .query_refused(&refused("28o00", "odd"))
+            .unwrap()
+            .outcome;
+        assert_eq!((outcome.refused, outcome.sqlstate), (true, None));
+
+        // The server's error comes first.
+        run(&mut traces, &[query(&sampled_sql(1))]);
+        traces.server_replied(&error_response("22012"), true, false);
+        let outcome = traces
+            .query_refused(&refused("28000", "refused"))
+            .unwrap()
+            .outcome;
+        assert_eq!(
+            (outcome.refused, outcome.sqlstate),
+            (false, Some(*b"22012"))
+        );
+    }
+
+    #[test]
+    fn a_refused_query_ends_only_its_span() {
+        let mut traces = ClientTraces::default();
+        // Executes waiting for their Sync, then a Query pgcat refuses.
+        run(
+            &mut traces,
+            &[
+                parse("", &sampled_sql(1)),
+                bind("", ""),
+                execute(""),
+                query(&sampled_sql(2)),
+            ],
+        );
+        let ended = traces.query_refused(&refused("28000", "refused")).unwrap();
+        assert_eq!(ids(&ended.spans), [(2, "simple")]);
+        assert!(ended.outcome.refused);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        // The batch goes on, and its Sync's ReadyForQuery ends the rest.
+        run(&mut traces, &[execute(""), frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(1, "extended"), (1, "extended")]);
+        assert_eq!(ready(&mut traces), Some(Outcome::default()));
+
+        // An untraced Query has no span to end: the batch goes on too.
+        run(
+            &mut traces,
+            &[
+                parse("", &sampled_sql(3)),
+                bind("", ""),
+                execute(""),
+                query("SELECT 1"),
+            ],
+        );
+        assert_eq!(traces.query_refused("refused"), None);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(3, "extended")]);
+        assert_eq!(ready(&mut traces), Some(Outcome::default()));
+
+        // A Query alone ends with its span, and the next batch starts afresh.
+        run(&mut traces, &[query(&sampled_sql(4))]);
+        assert_eq!(
+            traces
+                .query_refused("refused")
+                .map(|ended| ids(&ended.spans)),
+            Some(vec![(4, "simple")])
+        );
+        assert_eq!(traced(&traces), []);
+        run(&mut traces, &[query(&sampled_sql(5))]);
+        assert_eq!(traced(&traces), [(5, "simple")]);
+        assert_eq!(
+            refusal(&refused("28000", "PGCAT_IDENTITY refused: tok")),
+            Outcome {
+                failed: true,
+                sqlstate: Some(*b"28000"),
+                error_type: None,
+                refused: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_batch_pgcat_answered_ends_unexported() {
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s", &sampled_sql(1)),
+                bind("p", "s"),
+                execute("p"),
+                frame(b'S', b""),
+            ],
+        );
+        traces.batch_answered();
+        // A trailing Flush or Sync has nothing to end, even if it's refused.
+        run(&mut traces, &[frame(b'H', b"")]);
+        assert_eq!(traced(&traces), []);
+        assert!(!traces.sealed);
+        assert_eq!(traces.refused(&refused("53300", "no server")), None);
+        // What the batch parsed and bound stays traced, past a later batch
+        // pgcat drops too.
+        run(&mut traces, &[bind("q", "s"), frame(b'S', b"")]);
+        traces.batch_dropped();
+        run(&mut traces, &[execute("p"), frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+    }
+
+    #[test]
+    fn a_query_pgcat_answered_ends_alone() {
+        let mut traces = ClientTraces::default();
+        // An Execute waiting for its Sync, then a Query pgcat answered: the
+        // next message ends only the Query's span, and a Sync runs the rest.
+        let waiting = [
+            parse("", &sampled_sql(1)),
+            bind("", ""),
+            execute(""),
+            query(&sampled_sql(2)),
+        ];
+        run(&mut traces, &waiting);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        assert!(traces.sealed);
+        assert_eq!(ready(&mut traces), Some(Outcome::default()));
+        // A function call, another message of the batch, or COPY data no
+        // server asked for.
+        for next in [
+            frame(b'F', b"\0\0\0\0"),
+            parse("", "SELECT 1"),
+            frame(b'd', b"1\n"),
+        ] {
+            run(&mut traces, &waiting);
+            run(&mut traces, &[next]);
+            assert_eq!(traced(&traces), [(1, "extended")]);
+            assert!(!traces.sealed);
+            traces.discard();
+        }
+        // A Query alone leaves nothing to refuse.
+        run(&mut traces, &[query(&sampled_sql(4)), frame(b'S', b"")]);
+        assert_eq!(traced(&traces), []);
+        assert!(!traces.sealed);
+        assert_eq!(traces.refused(&refused("53300", "no server")), None);
+    }
+
+    #[test]
+    fn a_query_reply_ends_only_the_query() {
+        let division = Outcome {
+            failed: true,
+            sqlstate: Some(*b"22012"),
+            ..Outcome::default()
+        };
+        // Executes waiting for their Sync; a Query pgcat answers or refuses;
+        // then one a server runs, traced or not: its reply is its own.
+        for answered in [true, false] {
+            for traced_query in [true, false] {
+                let mut traces = ClientTraces::default();
+                run(&mut traces, &execute_traced(1));
+                run(&mut traces, &[query(&sampled_sql(2))]);
+                if !answered {
+                    assert!(traces.query_refused("refused").is_some());
+                }
+                let sql = if traced_query {
+                    sampled_sql(3)
+                } else {
+                    "SELECT 1/0".into()
+                };
+                run(&mut traces, &[query(&sql)]);
+                assert_eq!(
+                    traces.server_replied(&error_response("22012"), true, false),
+                    None
+                );
+                let ended = ready_ended(&mut traces);
+                if traced_query {
+                    let ended = ended.unwrap();
+                    assert_eq!(ids(&ended.spans), [(3, "simple")]);
+                    assert_eq!(ended.outcome, division);
+                } else {
+                    assert_eq!(ended, None);
+                }
+                // The Executes wait for their own Sync, as does what their
+                // batch parsed and bound.
+                assert_eq!(traced(&traces), [(1, "extended")]);
+                run(&mut traces, &[bind("", ""), execute(""), frame(b'S', b"")]);
+                let ended = ready_ended(&mut traces).unwrap();
+                assert_eq!(ids(&ended.spans), [(1, "extended"), (1, "extended")]);
+                assert_eq!(ended.outcome, Outcome::default());
+            }
+        }
+
+        // A server failing the Query ends only its span too: the session ends.
+        let mut traces = ClientTraces::default();
+        run(&mut traces, &execute_traced(1));
+        run(&mut traces, &[query(&sampled_sql(3))]);
+        let ended = traces.server_failed("statement_timeout").unwrap();
+        assert_eq!(ids(&ended.spans), [(3, "simple")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+    }
+
+    #[test]
+    fn copy_in_belongs_to_its_query() {
+        // The server ignores a Sync or Flush during COPY IN, so the Query's
+        // span stays open past them until its own ReadyForQuery.
+        for error in [None, Some("22P02")] {
+            let mut traces = ClientTraces::default();
+            run(&mut traces, &[query(&sampled_sql(4))]);
+            assert_eq!(
+                traces.server_replied(&frame(b'G', b"\0\0\0"), false, false),
+                None
+            );
+            run(
+                &mut traces,
+                &[
+                    frame(b'd', b"1\n"),
+                    frame(b'S', b""),
+                    frame(b'H', b""),
+                    frame(b'd', b"2\n"),
+                ],
+            );
+            if let Some(code) = error {
+                assert_eq!(
+                    traces.server_replied(&error_response(code), true, false),
+                    None
+                );
+            }
+            run(&mut traces, &[frame(b'c', b"")]);
+            assert_eq!(traced(&traces), [(4, "simple")]);
+            let ended = ready_ended(&mut traces).unwrap();
+            assert_eq!(ids(&ended.spans), [(4, "simple")]);
+            assert_eq!(
+                ended.outcome.sqlstate,
+                error.map(|code| code.as_bytes().try_into().unwrap())
+            );
+        }
+        // Anything else read before the Query's ReadyForQuery ends it.
+        let mut traces = ClientTraces::default();
+        run(&mut traces, &[query(&sampled_sql(4))]);
+        traces.server_replied(&frame(b'G', b"\0\0\0"), false, false);
+        run(&mut traces, &[parse("", "SELECT 1")]);
+        assert_eq!(traced(&traces), []);
+        assert_eq!(ready(&mut traces), None);
+    }
+
+    /// An unsynced Execute, then a COPY the server is reading data for, then
+    /// a Flush.
+    fn copying() -> Option<Box<ClientTraces>> {
+        let mut traces = ClientTraces::default();
+        run(&mut traces, &execute_traced(1));
+        run(&mut traces, &[query(&sampled_sql(4))]);
+        traces.server_replied(&frame(b'G', b"\0\0\0"), false, false);
+        run(&mut traces, &[frame(b'H', b"")]);
+        Some(Box::new(traces))
+    }
+
+    #[test]
+    fn a_batch_refusal_leaves_a_running_copy_its_span() {
+        // A Flush during COPY IN hands pgcat the batch the client buffered
+        // before the Query: refusing it ends only the batch's spans, and the
+        // COPY's ReadyForQuery ends its own.
+        let mut traces = copying();
+        batch_refused(&mut traces, &refused("0A000", "mixed"), "pool", "user");
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), [(4, "simple")]);
+        run(&mut traces, &[frame(b'd', b"1\n"), frame(b'c', b"")]);
+        let ended = ready_ended(&mut traces).unwrap();
+        assert_eq!(ids(&ended.spans), [(4, "simple")]);
+        assert_eq!(ended.outcome, Outcome::default());
+    }
+
+    #[test]
+    fn a_query_lives_only_while_its_server_is_attached() {
+        // Once pgcat lets go of the server running a COPY, its ReadyForQuery
+        // can't come: the COPY's span ends unexported. The batch's spans stay
+        // pending, and a later refusal ends only them.
+        let no_server = refused("53300", "no server");
+        let mut traces = copying();
+        server_detached(&mut traces);
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traces.query_refused(&no_server), None);
+        let ended = traces.refused(&no_server).unwrap();
+        assert_eq!(ids(&ended.spans), [(1, "extended")]);
+
+        // A Query no server replied to isn't the server's: pgcat can still
+        // refuse it as it ends the session.
+        let mut traces = Some(Box::new(ClientTraces::default()));
+        run(traces.as_deref_mut().unwrap(), &[query(&sampled_sql(4))]);
+        server_detached(&mut traces);
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), [(4, "simple")]);
+        let ended = traces.query_refused(&no_server).unwrap();
+        assert_eq!(ids(&ended.spans), [(4, "simple")]);
+        assert!(ended.outcome.refused);
+    }
+
+    #[test]
+    fn a_batch_lives_only_while_its_server_is_attached() {
+        // An extended-protocol COPY: the server answered the batch's Sync
+        // with CopyInResponse. Once pgcat lets go of the server, its
+        // ReadyForQuery can't come: the batch's spans end unexported, and what
+        // it parsed and bound stays traced, as the prepared-statement cache
+        // prepares the statement again on the next server.
+        let no_server = refused("53300", "no server");
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s", &sampled_sql(1)),
+                bind("p", "s"),
+                execute("p"),
+                frame(b'S', b""),
+            ],
+        );
+        for reply in [frame(b'1', b""), frame(b'2', b""), frame(b'G', b"\0\0\0")] {
+            assert_eq!(traces.server_replied(&reply, false, false), None);
+        }
+        let mut traces = Some(Box::new(traces));
+        server_detached(&mut traces);
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), []);
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traces.refused(&no_server), None);
+        run(&mut traces, &[bind("q", "s"), execute("q")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+
+        // A batch the server ended with its ReadyForQuery is done with it,
+        // spans or not: the next batch, still being sent, stays pending.
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[parse("s", &sampled_sql(2)), frame(b'S', b"")],
+        );
+        assert_eq!(traces.server_replied(&frame(b'1', b""), false, false), None);
+        assert_eq!(ready(&mut traces), None);
+        run(&mut traces, &[bind("p", "s"), execute("p")]);
+        let mut traces = Some(Box::new(traces));
+        server_detached(&mut traces);
+        let mut traces = traces.unwrap();
+        assert_eq!(traced(&traces), [(2, "extended")]);
+        let ended = traces.refused(&no_server).unwrap();
+        assert_eq!(ids(&ended.spans), [(2, "extended")]);
+    }
+
+    #[test]
+    fn a_refusal_leaves_a_batch_its_server_replied_to() {
+        // pgcat refusing a Sync the client sends during an extended-protocol
+        // COPY IN, and dropping it, ends nothing the batch traced: the COPY
+        // goes on, and its ReadyForQuery ends its spans with the server's
+        // outcome. What the batch parsed and bound stays traced.
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s", &sampled_sql(1)),
+                bind("p", "s"),
+                execute("p"),
+                frame(b'S', b""),
+            ],
+        );
+        for reply in [frame(b'1', b""), frame(b'2', b""), frame(b'G', b"\0\0\0")] {
+            assert_eq!(traces.server_replied(&reply, false, false), None);
+        }
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traces.refused(&refused("PH001", "unverified")), None);
+        traces.batch_dropped();
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        run(&mut traces, &[frame(b'd', b"1\n"), frame(b'c', b"")]);
+        let complete = frame(b'C', b"COPY 1\0");
+        assert_eq!(traces.server_replied(&complete, false, false), None);
+        let ended = ready_ended(&mut traces).unwrap();
+        assert_eq!(ids(&ended.spans), [(1, "extended")]);
+        assert_eq!(ended.outcome, Outcome::default());
+        run(&mut traces, &[bind("q", "s"), execute("q")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
+    }
+
+    fn attribute_map(attributes: Vec<KeyValue>) -> Vec<(String, String)> {
+        attributes
+            .into_iter()
+            .map(|kv| (kv.key.as_str().to_string(), kv.value.to_string()))
+            .collect()
+    }
+
+    fn pending(caller: Caller) -> Pending {
+        Pending {
+            parent: parent(1, true),
+            start: SystemTime::UNIX_EPOCH,
+            protocol: "simple",
+            caller,
+        }
+    }
+
+    #[test]
+    fn exports_the_caller_bounded() {
+        let address = Address {
+            pool_name: "pool".into(),
+            username: "user".into(),
+            role: crate::config::Role::Primary,
+            shard: 2,
+            ..Address::default()
+        };
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            attribute_map(attributes(
+                &pending(anonymous()),
+                &Outcome::default(),
+                Ending::Server(&address)
+            )),
+            pairs(&[
+                ("db.system.name", "postgresql"),
+                ("pgcat.pool.name", "pool"),
+                ("pgcat.pool.user", "user"),
+                ("pgcat.server.role", "primary"),
+                ("pgcat.shard", "2"),
+                ("pgcat.protocol", "simple"),
+                ("pgcat.identity", "absent"),
+                ("pgcat.identity.verified", "false"),
+                ("pgcat.client", "other"),
+            ])
+        );
+
+        let caller = Caller {
+            identity: IdentityState::Present,
+            verified: true,
+            client: Some("api".into()),
+        };
+        let failed = Outcome {
+            failed: true,
+            sqlstate: Some(*b"22012"),
+            ..Outcome::default()
+        };
+        assert_eq!(
+            attribute_map(attributes(
+                &pending(caller.clone()),
+                &failed,
+                Ending::Server(&address)
+            ))[6..],
+            pairs(&[
+                ("pgcat.identity", "present"),
+                ("pgcat.identity.verified", "true"),
+                ("pgcat.client", "api"),
+                ("db.response.status_code", "22012"),
+                ("error.type", "22012"),
+            ])[..]
+        );
+
+        // A refusal has no server: no role or shard, and only pgcat's code.
+        let refused = Outcome {
+            failed: true,
+            sqlstate: Some(*b"28000"),
+            error_type: None,
+            refused: true,
+        };
+        let ending = Ending::Refused {
+            pool: "pool",
+            user: "user",
+        };
+        assert_eq!(
+            attribute_map(attributes(&pending(caller.clone()), &refused, ending)),
+            pairs(&[
+                ("db.system.name", "postgresql"),
+                ("pgcat.pool.name", "pool"),
+                ("pgcat.pool.user", "user"),
+                ("pgcat.protocol", "simple"),
+                ("pgcat.identity", "present"),
+                ("pgcat.identity.verified", "true"),
+                ("pgcat.client", "api"),
+                ("pgcat.refused", "true"),
+                ("error.type", "28000"),
+            ])
+        );
+        let odd = Outcome {
+            sqlstate: None,
+            ..refused
+        };
+        assert_eq!(
+            attribute_map(attributes(&pending(caller), &odd, ending)).pop(),
+            Some(("error.type".to_string(), "_OTHER".to_string()))
         );
     }
 

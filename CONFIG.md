@@ -212,31 +212,74 @@ a child of a traceparent the client sent, and a statement without one isn't trac
 listed under Known gaps below.
 
 Each simple Query and each Execute gets one `pgcat.statement` span of kind server, a child of the
-caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for its
-batch, so the Executes of a pipelined batch all end at its Sync and share its outcome: if any of them
-fails, all carry the first error. Its attributes are `db.system.name` (`postgresql`),
-`pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`, `pgcat.shard` and `pgcat.protocol`
-(`simple` or `extended`); a failed statement has an error status, `error.type` and, when the server
-sent one, `db.response.status_code` (the SQLSTATE). Statement tracing never puts the statement, its
-comment or parameters in spans, and its own logs don't include them; other pgcat logging is
-unchanged. Batches pgcat answers itself normally have no span (see Known gaps), nor do replies a
-client disconnects before.
+caller's span. It starts when pgcat reads the statement and ends at the server's ReadyForQuery for
+it: a simple Query's own, and for an Execute, the one for its batch's Sync or Flush. The Executes of
+a pipelined batch all end there and share its outcome: if any of them fails, all carry the first
+error. A simple Query the client sends while extended-protocol messages wait for their Sync or
+Flush ends only its own span, whether a server runs it or pgcat answers or refuses it: those
+messages run at their Sync or Flush, and the server's reply to it ends theirs. A span's attributes
+are `db.system.name` (`postgresql`), `pgcat.pool.name`, `pgcat.pool.user`, `pgcat.server.role`,
+`pgcat.shard`, `pgcat.protocol` (`simple` or `extended`), and three about the caller, as the client
+was when pgcat read the statement:
+
+- `pgcat.identity`: the client's `PGCAT_IDENTITY` state, `present`, `absent`, `expired` or
+  `refused`, as the SQL observer labels it (see `sql_observer_enabled`).
+- `pgcat.identity.verified`: `true` if a plugin verified the identity's token. It is `false` whenever
+  the identity isn't `present`, and for any identity on a pool where nothing verifies identities,
+  since pgcat then keeps the token as the client sent it.
+- `pgcat.client`: the client's `application_name` if it is one of the pool's `sql_observer_clients`,
+  matched exactly, else `other`. The list is empty by default, so every span says `other` and none
+  carries a name the config doesn't list; it takes at most 33 values per pool and user, as the
+  counts' `client` label does.
+
+None of them comes from the identity's token, tenant or claims. A failed statement has an error
+status, `error.type` and, when the server sent one, `db.response.status_code` (the SQLSTATE).
+
+A statement pgcat answers with its own error, without a server running it, gets a span too. For
+example, one that a plugin, a hook timeout, the query parser, the identity verifier or the tenant
+guard refuses; one planned before a reload changed the pool's plugins; a COMMIT or ROLLBACK in a
+query whose results a plugin rewrites; one in a batch that mixes statements pgcat answers itself
+with ones for the server; an identity command pgcat can't run; one no server could be checked out
+for (`connect_timeout`), and what waits for a Sync when that ends the session
+(`checkout_failure_limit`); and the statement at which a reload ends the session, having changed the
+identity's verifier or, for a client holding a server, the pool's tenant guard or server-text
+withholding. Such a reload ends the session at the next message at which pgcat checks the reloaded
+settings, a Query, Parse, Bind, Execute, Sync or Flush, so in the extended protocol an Execute pgcat
+hasn't read by then gets no span. Nor does a statement whose pool a reload
+removed before a server was checked out for it: pgcat answers it with `58000` ("No pool configured")
+and ends the session. The span ends when pgcat sends the error. It has an error status,
+`pgcat.refused` (`true`) and, as `error.type`, the SQLSTATE of that error (`58000` if it has none,
+as the client sees it; `_OTHER` if it isn't five digits or capital letters). Nothing else from the
+error is read, and the span has no `pgcat.server.role`, `pgcat.shard` or `db.response.status_code`,
+since no server may have been checked out. When pgcat refuses the rest of a batch after the server
+failed one of its statements, the spans keep the server's error. A pipelined batch's statements
+share the refusal, as they share its outcome. A batch pgcat refuses at a Sync or Flush during COPY
+IN, a simple Query's or an extended-protocol one, doesn't refuse the COPY: while the server running
+it stays attached, the COPY goes on and ends at its own ReadyForQuery. In transaction mode, a Sync
+pgcat answers outside a transaction during a simple Query's COPY gives the server back to the pool,
+which closes it mid-COPY; inside one, pgcat fails the transaction on that server, and the session
+ends. Either COPY gets no span if pgcat lets go of its server before the COPY ends, as when the
+client stays idle in it past `idle_client_in_transaction_timeout`.
+
+Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
+don't include them; other pgcat logging is unchanged. Other statements pgcat answers itself, such
+as the identity commands it runs, have no span. Neither do those pgcat hasn't sent to a server when
+it sees the client disconnect, such as Executes still waiting for their Sync. A statement a server
+is already running gets a span only if pgcat receives the server's final reply before it sees the
+disconnect, so a COPY waiting for the client's data gets none.
 
 Known gaps:
 
-- When a batch pgcat answers itself ends with a Flush, and the client's next message is a lone Sync
-  that pgcat sends to the server to end a transaction it opened at an earlier Flush, that batch's spans
-  end at the Sync's reply, with its time and outcome.
 - A batch the server rejects forgets the prepared statements it traced, including ones the server
   created, so their later executions have no span until they're parsed again.
 - pgcat sees SQL `DEALLOCATE` and `DISCARD` only in a simple Query it successfully parses, and then
   forgets every traced statement. Run otherwise, or as a prepared statement, they leave a traced name
   in place: if SQL `PREPARE` then reuses the name, the new statement is traced under the old one's
   traceparent.
-- When a simple Query runs while extended-protocol messages wait for their Sync, its reply ends pgcat's
-  record of what those messages traced. If the server then rejects that batch, or pgcat drops it, a
-  statement name the batch reused keeps the batch's traceparent, and the statement still under that
-  name is traced with it.
+- After a reload that removes a name from `sql_observer_clients`, the client's next statement can
+  still carry that name in `pgcat.client`. A client holding a server checked out before the reload
+  keeps carrying it until that checkout ends, which in session mode is when the client disconnects,
+  or until a reload changes the pool's plugins; the statement after either can carry it too.
 
 Spans are exported over OTLP/HTTP (protobuf) by OpenTelemetry's batch processor: its queue is bounded
 and drops spans when full, so a slow or unreachable collector costs spans, never statement latency.
@@ -868,11 +911,12 @@ default: []
 ```
 
 The `application_name`s the SQL observer counts under their own `client` label (see
-`sql_observer_enabled`); every other client counts as `other`. At most 32 names, each 1 to 64
-bytes, distinct, without control characters or commas, and not `other`. A name keeps its counters across
-reloads for as long as the pool exists, even after it is removed from the list, so the counts stay
-monotonic; a pool takes at most 32 names over its lifetime, and a name added past that counts as
-`other`, with a warning.
+`sql_observer_enabled`); every other client counts as `other`. Statement spans take their
+`pgcat.client` from the same list, whether or not the pool observes (see `trace_sample_ratio`).
+At most 32 names, each 1 to 64 bytes, distinct, without control characters or commas, and not
+`other`. A name keeps its counters across reloads for as long as the pool exists, even after it is
+removed from the list, so the counts stay monotonic; a pool takes at most 32 names over its
+lifetime, and a name added past that counts as `other`, with a warning.
 
 ### primary_reads_enabled
 ```

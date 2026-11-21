@@ -29,7 +29,7 @@ use crate::config::{
     get_config, get_idle_client_in_transaction_timeout, Address, AuthType, PoolMode,
 };
 use crate::constants::*;
-use crate::identity_label::IdentityLapse;
+use crate::identity_label::{IdentityLapse, IdentityState};
 use crate::messages::*;
 use crate::plugins::diagnostics::withhold_server_text;
 use crate::plugins::hook_errors::Hook;
@@ -1437,7 +1437,14 @@ where
                 continue;
             }
 
-            trace_context::client_message(&mut self.traces, &message);
+            trace_context::client_message(&mut self.traces, &message, || {
+                span_caller(
+                    self.identity.as_ref(),
+                    &self.identity_lapse,
+                    &self.server_parameters,
+                    &query_router.pool_settings().sql_observer,
+                )
+            });
 
             // Plan statements with the pool's current settings. A reload since the
             // client's last transaction may have changed what the plugins cover,
@@ -1654,6 +1661,18 @@ where
                             }
                             self.reject_batch(&error, sync, None).await?;
                         }
+                        // Extended messages buffered before a simple Query
+                        // stay buffered: only the Query is refused.
+                        b'Q' => {
+                            trace_context::query_refused(
+                                &mut self.traces,
+                                &error,
+                                &self.pool_name,
+                                &self.username,
+                            );
+                            error_response(&mut self.write, &error).await?
+                        }
+                        // A function call, say, which has no span.
                         _ => error_response(&mut self.write, &error).await?,
                     }
 
@@ -1679,15 +1698,19 @@ where
                                 "Checkout failure limit reached ({} / {}) - disconnecting client",
                                 checkout_failure_count, limit
                             );
-                            fatal_response(
-                                &mut self.write,
-                                NO_SERVER_CONNECTION,
-                                &format!(
-                                    "checkout failure limit reached ({} / {})",
-                                    checkout_failure_count, limit
-                                ),
-                            )
-                            .await?;
+                            let error = format!(
+                                "checkout failure limit reached ({} / {})",
+                                checkout_failure_count, limit
+                            );
+                            // The session ends: extended messages still waiting
+                            // for their Sync never run.
+                            trace_context::refused(
+                                &mut self.traces,
+                                &with_sqlstate(NO_SERVER_CONNECTION, &error),
+                                &self.pool_name,
+                                &self.username,
+                            );
+                            fatal_response(&mut self.write, NO_SERVER_CONNECTION, &error).await?;
                             self.stats.disconnect();
                             return Ok(());
                         }
@@ -1774,7 +1797,14 @@ where
                         .await
                         {
                             Ok(Ok(message)) => {
-                                trace_context::client_message(&mut self.traces, &message);
+                                trace_context::client_message(&mut self.traces, &message, || {
+                                    span_caller(
+                                        self.identity.as_ref(),
+                                        &self.identity_lapse,
+                                        &self.server_parameters,
+                                        &query_router.pool_settings().sql_observer,
+                                    )
+                                });
                                 message
                             }
                             Ok(Err(err)) => {
@@ -1782,7 +1812,7 @@ where
                                 // Clean up the server and re-use it.
                                 self.stats.disconnect();
                                 server.checkin_cleanup().await?;
-                                self.detach_observer();
+                                self.detach_server();
 
                                 return Err(err);
                             }
@@ -1852,7 +1882,7 @@ where
                 {
                     let error = "the pool's plugin settings changed in a reload: connect again";
                     server.mark_bad(error);
-                    error_response_terminal(&mut self.write, &with_sqlstate(UNSUPPORTED, error))
+                    self.end_session_refused(&with_sqlstate(UNSUPPORTED, error))
                         .await?;
                     return Err(Error::ClientError(error.into()));
                 }
@@ -1962,7 +1992,7 @@ where
                     // Terminate
                     'X' => {
                         server.checkin_cleanup().await?;
-                        self.detach_observer();
+                        self.detach_server();
                         self.stats.disconnect();
                         self.release();
 
@@ -2425,7 +2455,7 @@ where
             debug!("Releasing server back into the pool");
 
             server.checkin_cleanup().await?;
-            self.detach_observer();
+            self.detach_server();
 
             server.stats().idle();
             self.connected_to_server = false;
@@ -2707,7 +2737,7 @@ where
                 if let Some(server) = server {
                     server.mark_bad(error);
                 }
-                error_response_terminal(&mut self.write, &with_sqlstate(UNSUPPORTED, error))
+                self.end_session_refused(&with_sqlstate(UNSUPPORTED, error))
                     .await?;
                 Err(Error::ClientError(error.into()))
             }
@@ -2728,6 +2758,9 @@ where
             IdentityCommand::Show => return Ok(IdentityAction::Show),
         };
 
+        // 0 when nothing on the pool verifies identities: `verify_identity`
+        // then keeps any token as sent. `recheck_identity` reads it alike.
+        let by_plugin = query_router.verifier_key() != 0;
         let verified =
             query_router
                 .verify_identity(&token)
@@ -2740,7 +2773,8 @@ where
                 });
 
         match verified {
-            Ok(verified) => Ok(IdentityAction::Set(Identity::new(token, verified))),
+            Ok(verified) if by_plugin => Ok(IdentityAction::Set(Identity::new(token, verified))),
+            Ok(_) => Ok(IdentityAction::Set(Identity::unverified(token))),
             Err(error) => {
                 debug!("Caller identity refused ({})", token);
                 self.set_identity(None);
@@ -2843,11 +2877,14 @@ where
         }
     }
 
-    /// The server goes back to the pool: its portals are gone.
-    fn detach_observer(&mut self) {
+    /// The server goes back to the pool: its portals are gone, and a simple
+    /// Query or batch it was running, such as a COPY whose data it was still
+    /// reading, gets no ReadyForQuery from it. Every check-in goes through here.
+    fn detach_server(&mut self) {
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.server_released();
         }
+        trace_context::server_detached(&mut self.traces);
     }
 
     /// Keep the client's observer state only while the pool observes.
@@ -3976,6 +4013,7 @@ where
         if let Some(bound) = self.bound_since_reload.as_mut() {
             bound.answered_locally();
         }
+        trace_context::batch_answered(&mut self.traces);
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.accept_local_batch();
         }
@@ -4012,6 +4050,7 @@ where
         sync: bool,
         server: Option<&mut Server>,
     ) -> Result<(), Error> {
+        trace_context::batch_refused(&mut self.traces, error, &self.pool_name, &self.username);
         self.reset_buffered_state();
         let status = self.fail_transaction(server).await?;
 
@@ -4023,12 +4062,24 @@ where
         }
     }
 
-    /// Answer a simple Query pgcat refused.
+    /// End the session at a statement pgcat refuses, before it runs: its
+    /// spans end as refused, then the client gets `error` and nothing more.
+    /// A server the client holds, which the caller marked bad, goes with the
+    /// session, and so does a COPY it was reading data for.
+    async fn end_session_refused(&mut self, error: &str) -> Result<(), Error> {
+        trace_context::server_detached(&mut self.traces);
+        trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
+        error_response_terminal(&mut self.write, error).await
+    }
+
+    /// Answer a simple Query pgcat refused. Extended messages the client sent
+    /// before it, waiting for their Sync, aren't: they run at that Sync.
     async fn refuse_query(
         &mut self,
         error: &str,
         server: Option<&mut Server>,
     ) -> Result<(), Error> {
+        trace_context::query_refused(&mut self.traces, error, &self.pool_name, &self.username);
         let status = self.fail_transaction(server).await?;
         error_response_with_status(&mut self.write, error, status).await
     }
@@ -5064,6 +5115,31 @@ fn caller_of<'a>(
             .get("application_name")
             .unwrap_or_default(),
         address: Some(addr),
+    }
+}
+
+/// Who sent a statement, for its span: the identity's state and whether a
+/// plugin verified it, and the client's `application_name` only if the pool
+/// labels it as itself (`sql_observer_clients`). An identity whose token has
+/// expired is `expired`, as `expire_identity` makes it before the statement
+/// runs.
+fn span_caller(
+    identity: Option<&Identity>,
+    lapse: &IdentityLapse,
+    server_parameters: &ServerParameters,
+    observer: &SqlObserver,
+) -> trace_context::Caller {
+    let (identity, verified) = match identity {
+        Some(identity) if identity.expired(SystemTime::now()) => (IdentityState::Expired, false),
+        Some(identity) => (IdentityState::Present, identity.verified_by_plugin()),
+        None => (lapse.state(false), false),
+    };
+    trace_context::Caller {
+        identity,
+        verified,
+        client: server_parameters
+            .get("application_name")
+            .and_then(|name| observer.client_label(name)),
     }
 }
 
