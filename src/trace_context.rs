@@ -541,8 +541,10 @@ pub struct ClientTraces {
     outcome: Outcome,
     /// A server replied to the batch and hasn't ended it with its
     /// ReadyForQuery, as during an extended-protocol COPY IN, when pgcat reads
-    /// the client again first. Like an open Query's, the batch is valid only
-    /// while that server stays attached (`server_detached`).
+    /// the client again first. The batch is that server's then: refusing or
+    /// dropping what the client sent since leaves it alone, and like an open
+    /// Query's, it's valid only while that server stays attached
+    /// (`server_detached`).
     batch_at_server: bool,
     /// The simple Query being answered, from when pgcat reads it until its
     /// ReadyForQuery. pgcat sends it to the server on its own, while the batch
@@ -692,8 +694,10 @@ pub fn refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, 
 
 /// pgcat refused the client's buffered batch with `error`, and the session
 /// goes on: only the batch's spans end, refused as with [`refused`]. Call
-/// before the batch is dropped. A simple Query a server is still running, as
-/// during COPY IN, goes on too, and its own ReadyForQuery ends its span.
+/// before the batch is dropped. What a server is still running goes on, and
+/// its own ReadyForQuery ends its spans: a simple Query, as during COPY IN,
+/// or a batch the server replied to, as during an extended-protocol COPY IN,
+/// where only the client's Sync or Flush is refused.
 pub fn batch_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: &str, user: &str) {
     if let Some(traces) = traces.as_deref_mut() {
         if let Some(ended) = traces.refused(error) {
@@ -705,10 +709,12 @@ pub fn batch_refused(traces: &mut Option<Box<ClientTraces>>, error: &str, pool: 
 /// pgcat let go of the client's server: it checked the server in, or closes
 /// it with the session. What the server replied to but hasn't ended gets no
 /// ReadyForQuery now, and its spans end unexported: a simple Query, or a
-/// batch, whose statements and portals are forgotten too. Either can be a
-/// COPY whose data the server was reading. A Query or batch no server has
-/// replied to isn't the server's: it stays pending, and a refusal can still
-/// end it.
+/// batch. Either can be a COPY whose data the server was reading. What the
+/// batch parsed and bound stays traced, as at a ReadyForQuery: the
+/// prepared-statement cache prepares the client's statements again on its
+/// next server, and what went with the server fails there, in its span. A
+/// Query or batch no server has replied to isn't the server's: it stays
+/// pending, and a refusal can still end it.
 pub fn server_detached(traces: &mut Option<Box<ClientTraces>>) {
     if let Some(traces) = traces.as_deref_mut() {
         traces.server_detached();
@@ -737,7 +743,8 @@ pub fn batch_answered(traces: &mut Option<Box<ClientTraces>>) {
 }
 
 /// pgcat dropped the client's buffered batch without sending it: what it
-/// parsed and bound doesn't exist, and no reply will end its spans.
+/// parsed and bound doesn't exist, and no reply will end its spans. A batch a
+/// server replied to goes on, as with [`batch_refused`].
 pub fn batch_dropped(traces: &mut Option<Box<ClientTraces>>) {
     if let Some(traces) = traces.as_deref_mut() {
         traces.batch_dropped();
@@ -912,7 +919,7 @@ impl ClientTraces {
             self.query = None;
         }
         if self.batch_at_server {
-            self.end_batch(true);
+            self.end_batch(false);
             self.discard();
         }
     }
@@ -943,9 +950,10 @@ impl ClientTraces {
     }
 
     /// The batch's spans, refused with `error` (see [`refusal`]), unless the
-    /// server failed them first.
+    /// server failed them first, or replied to the batch: it's the server's
+    /// to end (see [`batch_refused`]).
     fn refused(&mut self, error: &str) -> Option<Ended> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() || self.batch_at_server {
             return None;
         }
         let mut outcome = std::mem::take(&mut self.outcome);
@@ -981,6 +989,9 @@ impl ClientTraces {
     }
 
     fn batch_dropped(&mut self) {
+        if self.batch_at_server {
+            return;
+        }
         self.end_batch(true);
         self.discard();
     }
@@ -2329,7 +2340,8 @@ mod tests {
         // An extended-protocol COPY: the server answered the batch's Sync
         // with CopyInResponse. Once pgcat lets go of the server, its
         // ReadyForQuery can't come: the batch's spans end unexported, and what
-        // it parsed and bound is forgotten.
+        // it parsed and bound stays traced, as the prepared-statement cache
+        // prepares the statement again on the next server.
         let no_server = refused("53300", "no server");
         let mut traces = ClientTraces::default();
         run(
@@ -2351,7 +2363,7 @@ mod tests {
         run(&mut traces, &[frame(b'S', b"")]);
         assert_eq!(traces.refused(&no_server), None);
         run(&mut traces, &[bind("q", "s"), execute("q")]);
-        assert_eq!(traced(&traces), []);
+        assert_eq!(traced(&traces), [(1, "extended")]);
 
         // A batch the server ended with its ReadyForQuery is done with it,
         // spans or not: the next batch, still being sent, stays pending.
@@ -2369,6 +2381,39 @@ mod tests {
         assert_eq!(traced(&traces), [(2, "extended")]);
         let ended = traces.refused(&no_server).unwrap();
         assert_eq!(ids(&ended.spans), [(2, "extended")]);
+    }
+
+    #[test]
+    fn a_refusal_leaves_a_batch_its_server_replied_to() {
+        // pgcat refusing a Sync the client sends during an extended-protocol
+        // COPY IN, and dropping it, ends nothing the batch traced: the COPY
+        // goes on, and its ReadyForQuery ends its spans with the server's
+        // outcome. What the batch parsed and bound stays traced.
+        let mut traces = ClientTraces::default();
+        run(
+            &mut traces,
+            &[
+                parse("s", &sampled_sql(1)),
+                bind("p", "s"),
+                execute("p"),
+                frame(b'S', b""),
+            ],
+        );
+        for reply in [frame(b'1', b""), frame(b'2', b""), frame(b'G', b"\0\0\0")] {
+            assert_eq!(traces.server_replied(&reply, false, false), None);
+        }
+        run(&mut traces, &[frame(b'S', b"")]);
+        assert_eq!(traces.refused(&refused("PH001", "unverified")), None);
+        traces.batch_dropped();
+        assert_eq!(traced(&traces), [(1, "extended")]);
+        run(&mut traces, &[frame(b'd', b"1\n"), frame(b'c', b"")]);
+        let complete = frame(b'C', b"COPY 1\0");
+        assert_eq!(traces.server_replied(&complete, false, false), None);
+        let ended = ready_ended(&mut traces).unwrap();
+        assert_eq!(ids(&ended.spans), [(1, "extended")]);
+        assert_eq!(ended.outcome, Outcome::default());
+        run(&mut traces, &[bind("q", "s"), execute("q")]);
+        assert_eq!(traced(&traces), [(1, "extended")]);
     }
 
     fn attribute_map(attributes: Vec<KeyValue>) -> Vec<(String, String)> {

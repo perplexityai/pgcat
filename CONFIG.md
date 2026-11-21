@@ -253,13 +253,13 @@ as the client sees it; `_OTHER` if it isn't five digits or capital letters). Not
 error is read, and the span has no `pgcat.server.role`, `pgcat.shard` or `db.response.status_code`,
 since no server may have been checked out. When pgcat refuses the rest of a batch after the server
 failed one of its statements, the spans keep the server's error. A pipelined batch's statements
-share the refusal, as they share its outcome. A batch pgcat refuses at a Sync or Flush during a
-simple Query's COPY IN doesn't refuse the COPY: while the server running it stays attached, the COPY
-goes on and ends at its own ReadyForQuery. In transaction mode, a Sync pgcat answers outside a
-transaction gives the server back to the pool, which closes it mid-COPY; inside one, pgcat fails the
-transaction on that server, and the session ends. Any COPY, a simple Query's or an extended-protocol
-one, gets no span if pgcat lets go of its server before the COPY ends, as when the client stays idle
-in it past `idle_client_in_transaction_timeout`.
+share the refusal, as they share its outcome. A batch pgcat refuses at a Sync or Flush during COPY
+IN, a simple Query's or an extended-protocol one, doesn't refuse the COPY: while the server running
+it stays attached, the COPY goes on and ends at its own ReadyForQuery. In transaction mode, a Sync
+pgcat answers outside a transaction during a simple Query's COPY gives the server back to the pool,
+which closes it mid-COPY; inside one, pgcat fails the transaction on that server, and the session
+ends. Either COPY gets no span if pgcat lets go of its server before the COPY ends, as when the
+client stays idle in it past `idle_client_in_transaction_timeout`.
 
 Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
 don't include them; other pgcat logging is unchanged. Other statements pgcat answers itself, such

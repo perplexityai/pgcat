@@ -1707,6 +1707,61 @@ def test_a_verifier_unavailable_after_a_reload_fails_statements_fast(extended):
         process.stop()
 
 
+MID_COPY_RECHECK_PORT = 6483
+
+
+@pytest.mark.parametrize("end", [b"S", b"H"])
+def test_a_sync_or_flush_refused_during_an_extended_copy_leaves_the_copy_its_span(end):
+    """A Sync or Flush the client sends during an extended-protocol COPY IN,
+    refused with PH001 as the verifier hangs after a reload, refuses only
+    itself: the COPY goes on, and its span, ended by the server's
+    ReadyForQuery, isn't refused."""
+    port = MID_COPY_RECHECK_PORT
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(identity_config(port), collector), port, binary=BINARY, env=ENV
+    )
+    table = f"copied_{new_trace()[:12]}"
+    try:
+        process.start()
+        with psycopg.connect(process.dsn("plain"), autocommit=True) as connection:
+            connection.execute(f"CREATE TABLE {table} (n int)")
+        session = RawSession(port, False)
+        session.ok("SET PGCAT_IDENTITY = 'synthetic:acme'")
+        copy = new_trace()
+        sql = f"{comment(copy)} COPY {table} FROM STDIN"
+        session.sock.sendall(parse(b"", sql) + bind(b"", b"") + execute(b"") + SYNC)
+        assert [session.message()[0] for _ in range(3)] == [b"1", b"2", b"G"]
+
+        process.write_config(traced(identity_config(port, "hang = true\n"), collector))
+        utils.admin_reload(port)
+        session.sock.sendall(utils.frontend(end, b""))
+        received = [bounded(session.message)]
+        if end == b"S":
+            received.append(session.message())
+        assert [code for code, _ in received] == ([b"E", b"Z"] if end == b"S" else [b"E"]), received
+        assert error_of(received)[0] == "PH001"
+
+        received = session.replies(utils.frontend(b"d", b"41\n") + utils.frontend(b"c", b"") + SYNC)
+        assert received == [(b"C", b"COPY 1\0"), (b"Z", b"I")], received
+        session.close()
+
+        marker = new_trace()
+        with psycopg.connect(process.dsn("plain"), autocommit=True) as connection:
+            connection.execute(f"{comment(marker)} SELECT 1", prepare=False)
+            assert connection.execute(f"SELECT n FROM {table}").fetchall() == [(41,)]
+            connection.execute(f"DROP TABLE {table}")
+        spans = collector.spans_until(marker)
+    finally:
+        process.stop()
+        collector.close()
+    span = only(spans, copy)
+    assert span["status"] == 0, span
+    assert span["attributes"]["pgcat.protocol"] == "extended"
+    assert span["attributes"]["pgcat.server.role"] == "primary"
+    assert "pgcat.refused" not in span["attributes"]
+
+
 REFUSED_RECHECK_PORT = 6480
 REFUSED_RECHECK_METRICS_PORT = 9963
 

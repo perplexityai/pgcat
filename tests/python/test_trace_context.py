@@ -1110,6 +1110,54 @@ def test_an_extended_copy_whose_server_pgcat_let_go_gets_no_span(collector):
     assert [span for span in spans if span["trace_id"] == copy] == []
 
 
+def test_a_statement_parsed_with_an_extended_copy_pgcat_let_go_stays_traced(collector):
+    # The batch that started the COPY parsed a named statement. Once pgcat
+    # lets the server go mid-COPY, the prepared-statement cache prepares the
+    # statement again on the next server, and its later Executes get spans.
+    pgcat = utils.PgcatProcess(
+        config(1, collector.endpoint, general="idle_client_in_transaction_timeout = 500", pool_size=1),
+        PORT,
+        env=ENV,
+    ).start()
+    table = f"copied_{new_trace()[:12]}"
+    try:
+        run(pgcat, f"CREATE TABLE {table} (n int)")
+        selected, copy = new_trace(), new_trace()
+        sql = f"{comment(selected)} SELECT 41".encode()
+        execute_named = (
+            utils.frontend(b"B", b"\0named\0" + struct.pack("!hhh", 0, 0, 0))
+            + utils.frontend(b"E", b"\0" + struct.pack("!i", 0))
+        )
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+        try:
+            sock.sendall(
+                utils.frontend(b"P", b"named\0" + sql + b"\0" + struct.pack("!h", 0))
+                + execute_named
+                + unsynced_execute(f"{comment(copy)} COPY {table} FROM STDIN")
+                + utils.frontend(b"S", b"")
+            )
+            replies = [message()[0] for _ in range(7)]
+            assert replies == [b"1", b"2", b"D", b"C", b"1", b"2", b"G"], replies
+            (code, _), ready = until_ready(message)
+            assert (code, ready[0]) == (b"E", b"Z")
+
+            sock.sendall(execute_named + utils.frontend(b"S", b""))
+            replies = until_ready(message)
+            assert [code for code, _ in replies] == [b"2", b"D", b"C", b"Z"], replies
+            assert replies[1][1].endswith(b"41"), replies
+        finally:
+            sock.close()
+        spans = spans_after(pgcat, collector)
+        run(pgcat, f"DROP TABLE {table}")
+    finally:
+        pgcat.stop()
+    span = only(spans, selected)
+    assert span["status"] == 0
+    assert span["attributes"]["pgcat.protocol"] == "extended"
+    assert span["attributes"]["pgcat.server.role"] == "primary"
+    assert [span for span in spans if span["trace_id"] == copy] == []
+
+
 PLUGINS = """
 [pools.shard0.plugins.testing]
 enabled = true
