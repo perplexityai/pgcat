@@ -840,7 +840,7 @@ Both counted metrics label the client's `PGCAT_IDENTITY` state as `identity`:
 The state only labels the counts: authorization and plugins see the client as having no identity
 whenever it isn't `present`. The first time a relation is counted for a pool and user with an
 identity other than `present`, pgcat logs one info line on the `pgcat::sql_observer::callers` log
-target with the pool, user, relation, identity state, `application_name` and client address
+target with the pool, user, relation, identity state, `application_name` (cut as below) and client address
 (at most once per relation and state, so at most 3,000 lines per pool and user); the relation and
 `application_name` are in double quotes. In this line and the overflow warning, client-chosen text
 (table names, `application_name`) is escaped: `\`, `"`, control characters (such as a newline,
