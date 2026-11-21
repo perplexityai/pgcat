@@ -1750,7 +1750,7 @@ where
                                 // Clean up the server and re-use it.
                                 self.stats.disconnect();
                                 server.checkin_cleanup().await?;
-                                self.detach_observer();
+                                self.detach_server();
 
                                 return Err(err);
                             }
@@ -1930,7 +1930,7 @@ where
                     // Terminate
                     'X' => {
                         server.checkin_cleanup().await?;
-                        self.detach_observer();
+                        self.detach_server();
                         self.stats.disconnect();
                         self.release();
 
@@ -2393,7 +2393,7 @@ where
             debug!("Releasing server back into the pool");
 
             server.checkin_cleanup().await?;
-            self.detach_observer();
+            self.detach_server();
 
             server.stats().idle();
             self.connected_to_server = false;
@@ -2815,11 +2815,14 @@ where
         }
     }
 
-    /// The server goes back to the pool: its portals are gone.
-    fn detach_observer(&mut self) {
+    /// The server goes back to the pool: its portals are gone, and a simple
+    /// Query it was running, a COPY whose data it was still reading, gets no
+    /// ReadyForQuery from it. Every check-in goes through here.
+    fn detach_server(&mut self) {
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.server_released();
         }
+        trace_context::server_detached(&mut self.traces);
     }
 
     /// Keep the client's observer state only while the pool observes.
@@ -3999,7 +4002,10 @@ where
 
     /// End the session at a statement pgcat refuses, before it runs: its
     /// spans end as refused, then the client gets `error` and nothing more.
+    /// A server the client holds, which the caller marked bad, goes with the
+    /// session, and so does a COPY it was reading data for.
     async fn end_session_refused(&mut self, error: &str) -> Result<(), Error> {
+        trace_context::server_detached(&mut self.traces);
         trace_context::refused(&mut self.traces, error, &self.pool_name, &self.username);
         error_response_terminal(&mut self.write, error).await
     }

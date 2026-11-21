@@ -254,14 +254,18 @@ error is read, and the span has no `pgcat.server.role`, `pgcat.shard` or `db.res
 since no server may have been checked out. When pgcat refuses the rest of a batch after the server
 failed one of its statements, the spans keep the server's error. A pipelined batch's statements
 share the refusal, as they share its outcome. A batch pgcat refuses at a Sync or Flush during a
-simple Query's COPY IN doesn't refuse the COPY, which goes on and ends at its own ReadyForQuery.
+simple Query's COPY IN doesn't refuse the COPY: while the server running it stays attached, the COPY
+goes on and ends at its own ReadyForQuery. A COPY whose server pgcat lets go of first gets no span.
+In transaction mode, a Sync pgcat answers outside a transaction gives the server back to the pool,
+which closes it mid-COPY; inside one, pgcat fails the transaction on that server, and the session
+ends.
 
 Statement tracing never puts the statement, its comment or parameters in spans, and its own logs
 don't include them; other pgcat logging is unchanged. Other statements pgcat answers itself, such
 as the identity commands it runs, have no span. Neither do those pgcat hasn't sent to a server when
 it sees the client disconnect, such as Executes still waiting for their Sync. A statement a server
-is already running still ends at the server's reply, even if the client has closed its socket by
-then.
+is already running gets a span only if pgcat receives the server's final reply before it sees the
+disconnect, so a COPY waiting for the client's data gets none.
 
 Known gaps:
 

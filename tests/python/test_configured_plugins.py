@@ -1366,6 +1366,49 @@ def test_a_reload_that_changes_withholding_ends_held_sessions(extended, turns_on
         collector.close()
 
 
+WITHHOLD_COPY_PORT = 6482
+
+
+def test_a_reload_that_ends_a_session_mid_copy_leaves_the_copy_no_span():
+    """A reload that changes withholding ends a session holding a server
+    mid-COPY at its next Sync. The session's end closes the server before the
+    COPY's ReadyForQuery, and pgcat didn't refuse the COPY: it has no span."""
+    port = WITHHOLD_COPY_PORT
+    collector = Collector()
+    process = utils.PgcatProcess(
+        traced(withholding(port, False), collector), port, binary=BINARY, env=ENV
+    )
+    try:
+        process.start()
+        sock, message = bounded(lambda: utils.raw_connection(port, "configured"))
+        sock.settimeout(10)
+        copy = new_trace()
+        sock.sendall(
+            query(f"{comment(copy)} CREATE TEMP TABLE copied (n int) ON COMMIT DROP; COPY copied FROM STDIN")
+        )
+        assert [message()[0], message()[0]] == [b"C", b"G"]
+
+        process.write_config(traced(withholding(port, True), collector))
+        utils.admin_reload(port)
+
+        sock.sendall(utils.frontend(b"d", b"41\n") + SYNC)
+        code, body = message()
+        assert code == b"E", body
+        assert error_of([(code, body)]) == ("0A000", HELD_SETTINGS_CHANGED)
+        with pytest.raises(ConnectionError):
+            message()
+        sock.close()
+
+        marker = new_trace()
+        with psycopg.connect(process.dsn("configured"), autocommit=True) as connection:
+            connection.execute(f"{comment(marker)} SELECT 1", prepare=False)
+        spans = collector.spans_until(marker)
+        assert [span for span in spans if span["trace_id"] == copy] == []
+    finally:
+        process.stop()
+        collector.close()
+
+
 WITHHOLD_WAIT_PORT = 6481
 
 

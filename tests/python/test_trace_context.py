@@ -1003,6 +1003,63 @@ def test_a_batch_refused_during_a_copy_leaves_the_copy_its_span(pgcat, collector
         assert span["status"] == STATUS_ERROR
         assert (attributes["error.type"], attributes["db.response.status_code"]) == ("22P02", "22P02")
 
+
+def test_a_copy_whose_server_pgcat_let_go_gets_no_span(collector):
+    # In transaction mode, a Sync pgcat answers itself outside a transaction
+    # gives the server back to the pool, which closes it mid-COPY. The COPY's
+    # ReadyForQuery never comes, and a later refusal mustn't end its span.
+    pgcat = utils.PgcatProcess(
+        config(
+            1,
+            collector.endpoint,
+            pool="checkout_failure_limit = 1",
+            general="connect_timeout = 300",
+            pool_size=1,
+        ),
+        PORT,
+        env=ENV,
+    ).start()
+    try:
+        executed, copy = new_trace(), new_trace()
+        sock, message = utils.raw_connection(PORT, "shard0", timeout=10)
+        try:
+            sock.sendall(
+                unsynced_execute(f"{comment(executed)} SELECT 41")
+                + unsynced_execute("SHOW PGCAT_IDENTITY")
+                + simple_query(
+                    f"{comment(copy)} CREATE TEMP TABLE copied (n int) ON COMMIT DROP; COPY copied FROM STDIN"
+                )
+            )
+            assert [message()[0], message()[0]] == [b"C", b"G"]
+            sock.sendall(utils.frontend(b"S", b""))
+            (code, body), ready = until_ready(message)
+            assert (code, utils.error_fields(body)["C"]) == (b"E", "0A000"), body
+            assert ready == (b"Z", b"I")
+            before = spans_after(pgcat, collector)
+            attributes = only(before, executed)["attributes"]
+            assert (attributes["pgcat.refused"], attributes["error.type"]) == (True, "0A000")
+            assert [span for span in before if span["trace_id"] == copy] == []
+
+            # With the only server held, the next Sync ends the session.
+            holder = held(pgcat)
+            try:
+                sock.sendall(utils.frontend(b"S", b""))
+                replies = [message() for _ in range(3)]
+                assert [code for code, _ in replies] == [b"E", b"Z", b"E"], replies
+                assert utils.error_fields(replies[0][1])["C"] == "53300", replies
+                assert utils.error_fields(replies[2][1])["S"] == "FATAL", replies
+                assert utils.closed(sock)
+            finally:
+                holder.close()
+        finally:
+            sock.close()
+        spans = spans_after(pgcat, collector)
+    finally:
+        pgcat.stop()
+    assert only(spans, executed)["attributes"]["error.type"] == "0A000"
+    assert [span for span in spans if span["trace_id"] == copy] == []
+
+
 PLUGINS = """
 [pools.shard0.plugins.testing]
 enabled = true
