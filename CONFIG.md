@@ -301,6 +301,8 @@ Read when `trace_sample_ratio` first goes above 0; changing it later takes effec
 
 pgcat sends only `Host` (from the endpoint) and `Content-Type: application/x-protobuf`; it doesn't
 forward headers from `OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS`.
+Compression settings from `OTEL_EXPORTER_OTLP_COMPRESSION` / `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`
+are ignored; spans are sent uncompressed.
 
 ### tcp_keepalives_idle
 ```
